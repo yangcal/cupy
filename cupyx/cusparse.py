@@ -537,8 +537,11 @@ def _cupy_csrgeam_int64(a, b, alpha, beta):
     This is O(nnz log nnz) but correct and GPU-accelerated.
     """
     idx_dtype = _numpy.result_type(a.indices.dtype, b.indices.dtype)
-    a_data = a.data * _numpy.array(alpha, dtype=a.dtype) if alpha != 1 else a.data
-    b_data = b.data * _numpy.array(beta, dtype=b.dtype) if beta != 1 else b.data
+    # Use dtype.type() to get a numpy scalar (not a 0-d array) so that CuPy's
+    # ufunc accepts it as a broadcast scalar.  _numpy.array(...).ctypes is
+    # correct for passing to C but gives a 0-d ndarray that __mul__ rejects.
+    a_data = a.data * a.dtype.type(alpha) if alpha != 1 else a.data
+    b_data = b.data * b.dtype.type(beta) if beta != 1 else b.data
 
     if a.nnz > 0:
         a_rows = _cupy.searchsorted(

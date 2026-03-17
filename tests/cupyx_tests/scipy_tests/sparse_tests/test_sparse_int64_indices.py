@@ -5,6 +5,7 @@ import pytest
 
 import cupy
 from cupy import testing
+from cupyx import cusparse
 from cupyx.scipy import sparse
 
 
@@ -252,3 +253,179 @@ class TestInt64Sort:
         assert m.has_sorted_indices
         testing.assert_array_equal(m.indices, cupy.array([0, 1, 2]))
         testing.assert_array_equal(m.data, cupy.array([2.0, 3.0, 1.0]))
+
+
+class TestInt64ArithmeticFallback:
+    """Sparse addition with int64 indices — pure-CuPy fallback.
+
+    csrgeam2 routes int64 inputs to _cupy_csrgeam_int64 *before* checking
+    cuSPARSE availability, so the path works on any CUDA version.
+
+    The fallback: expand indptr→row via searchsorted, concatenate COO entries
+    from both matrices, call sum_duplicates() to merge overlapping positions,
+    then convert back to CSR.  Index dtype is
+    numpy.result_type(a.indices.dtype, b.indices.dtype) throughout.
+
+    Note: cusparseSpGEAM (the Generic API path) is absent from all public
+    cuSPARSE releases through 12.7.9, so the pure-CuPy fallback is always
+    active on current installations.
+    """
+
+    # Shape has _LARGE+2 columns so a column index of _LARGE is valid and
+    # forces int64.  Only 2 rows, so indptr has 3 elements (cheap).
+    _shape = (2, _LARGE + 2)
+
+    def _make_int64_csr(self, col, value=1.0):
+        """Single-entry CSR: row 0 has one nonzero at (0, col)."""
+        data = cupy.array([value])
+        indices = cupy.array([col], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        return sparse.csr_matrix((data, indices, indptr), shape=self._shape)
+
+    def test_add_int64_preserves_dtype(self):
+        # Both operands have int64 indices; the result must too.
+        # (If the fallback accidentally truncated to int32, int(indices[1])
+        # would silently wrap and give the wrong column.)
+        a = self._make_int64_csr(0)
+        b = self._make_int64_csr(_LARGE)
+        c = a + b
+        assert c.indices.dtype == cupy.int64
+        assert c.indptr.dtype == cupy.int64
+        assert c.nnz == 2
+
+    def test_add_int64_values_correct(self):
+        # Values at column positions 0 and _LARGE are preserved after addition.
+        # After sort_indices(), col 0 is always at position 0 and col _LARGE
+        # at position 1, so direct array access is safe.
+        a = self._make_int64_csr(0, value=3.0)
+        b = self._make_int64_csr(_LARGE, value=7.0)
+        c = (a + b)
+        c.sort_indices()
+        assert c.nnz == 2
+        assert int(c.indices[0]) == 0
+        assert int(c.indices[1]) == _LARGE
+        assert float(c.data[0]) == pytest.approx(3.0)
+        assert float(c.data[1]) == pytest.approx(7.0)
+
+    def test_add_int64_overlapping_entries_summed(self):
+        # When A and B share a (row, col) position, the fallback concatenates
+        # both entries into a COO and relies on sum_duplicates() to merge them.
+        a = self._make_int64_csr(_LARGE, value=2.0)
+        b = self._make_int64_csr(_LARGE, value=5.0)
+        c = a + b
+        assert c.nnz == 1
+        assert c.indices.dtype == cupy.int64
+        assert int(c.indices[0]) == _LARGE
+        assert float(c.data[0]) == pytest.approx(7.0)
+
+    def test_add_int64_alpha_beta_scaling(self):
+        # _cupy_csrgeam_int64 scales a.data by alpha and b.data by beta before
+        # concatenation.  Verify through the direct cusparse.csrgeam2 interface
+        # since the __add__ operator always uses alpha=1, beta=1.
+        # (This test caught a bug where _numpy.array(alpha, ...) returned a
+        # 0-d ndarray that CuPy's __mul__ rejected with TypeError.)
+        a = self._make_int64_csr(0, value=1.0)
+        b = self._make_int64_csr(_LARGE, value=1.0)
+        c = cusparse.csrgeam2(a, b, alpha=3.0, beta=4.0)
+        c.sort_indices()
+        assert c.nnz == 2
+        # col 0 → alpha*1.0 = 3.0;  col _LARGE → beta*1.0 = 4.0.
+        assert float(c.data[0]) == pytest.approx(3.0)
+        assert float(c.data[1]) == pytest.approx(4.0)
+
+    def test_spgeam_int64_fallback(self):
+        # cusparse.spgeam() routes int64 directly to _cupy_csrgeam_int64 when
+        # cusparseSpGEAM is unavailable (absent from all public releases ≤12.7.9).
+        a = self._make_int64_csr(0, value=1.0)
+        b = self._make_int64_csr(_LARGE, value=2.0)
+        c = cusparse.spgeam(a, b)
+        assert c.indices.dtype == cupy.int64
+        assert c.nnz == 2
+
+    def test_add_int64_multirow(self):
+        # The searchsorted(indptr[1:], arange(nnz)) expansion must assign
+        # each nonzero to the correct row.  a has entries in both rows;
+        # b has an entry only in row 0 that overlaps a's row-0 entry.
+        a = sparse.csr_matrix(
+            (cupy.array([1.0, 2.0]),
+             cupy.array([0, _LARGE], dtype=cupy.int64),
+             cupy.array([0, 1, 2], dtype=cupy.int64)),   # 1 nnz per row
+            shape=self._shape)
+        b = self._make_int64_csr(_LARGE, value=3.0)   # row 0 → col _LARGE
+        c = a + b
+        c.sort_indices()
+        assert c.nnz == 3
+        # Row 0: cols 0 and _LARGE (2 entries).  Row 1: col _LARGE (1 entry).
+        assert int(c.indptr[1]) == 2
+        assert int(c.indptr[2]) == 3
+        # Row 1's entry must retain the exact int64 column value.
+        assert int(c.indices[2]) == _LARGE
+        assert float(c.data[2]) == pytest.approx(2.0)
+
+    def test_add_mixed_dtype_int32_plus_int64_promotes(self):
+        # idx_dtype = numpy.result_type(int32, int64) == int64.
+        # The int32 matrix has small column values; the int64 matrix has _LARGE.
+        # The result must use int64 to represent _LARGE.
+        data = cupy.array([1.0])
+        a = sparse.csr_matrix(
+            (data, cupy.array([5], dtype=cupy.int32),
+             cupy.array([0, 1, 1], dtype=cupy.int32)),
+            shape=self._shape)
+        b = self._make_int64_csr(_LARGE, value=2.0)
+        c = a + b
+        assert c.indices.dtype == cupy.int64
+        assert c.nnz == 2
+
+    def test_add_int64_empty_operand(self):
+        # When one matrix has nnz=0, _cupy_csrgeam_int64 enters the
+        # `a_rows = cupy.empty(0, idx_dtype)` branch.  The result equals
+        # the non-empty matrix.
+        a = self._make_int64_csr(_LARGE)
+        b = sparse.csr_matrix(
+            (cupy.empty(0, cupy.float64),
+             cupy.empty(0, cupy.int64),
+             cupy.zeros(3, cupy.int64)),
+            shape=self._shape)
+        c = a + b
+        assert c.indices.dtype == cupy.int64
+        assert c.nnz == 1
+        assert int(c.indices[0]) == _LARGE
+
+    def test_add_int32_regression(self):
+        # int32 + int32 must continue to use the cuSPARSE (csrgeam2) path and
+        # return int32 indices with correct values.
+        data = cupy.array([1.0, 2.0])
+        a = sparse.csr_matrix(
+            (data[:1], cupy.array([0], dtype=cupy.int32),
+             cupy.array([0, 1, 1], dtype=cupy.int32)),
+            shape=(2, 4))
+        b = sparse.csr_matrix(
+            (data[1:], cupy.array([3], dtype=cupy.int32),
+             cupy.array([0, 0, 1], dtype=cupy.int32)),
+            shape=(2, 4))
+        c = a + b
+        assert c.indices.dtype == cupy.int32
+        assert c.nnz == 2
+        testing.assert_array_equal(c.toarray(), a.toarray() + b.toarray())
+
+
+class TestInt64SpGEMM:
+    """int64-related fixes to spgemm.
+
+    spgemm previously hardcoded 'i' (int32) for the c_indices allocation.
+    We updated this to numpy.result_type(a.indices, b.indices).
+
+    Note: cuSPARSE spgemm does not support int64 inputs on current releases
+    (all int64 tests xfail), so only the int32 regression is verified here.
+    """
+
+    def test_spgemm_int32_result_dtype_preserved(self):
+        # result_type(int32, int32) == int32: int64 work must not
+        # regress the int32 path.
+        if not cusparse.check_availability('spgemm'):
+            pytest.skip('spgemm is not available')
+        a = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        b = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        c = a @ b
+        assert c.indices.dtype == cupy.int32
+        testing.assert_array_almost_equal(c.toarray(), cupy.eye(3))
