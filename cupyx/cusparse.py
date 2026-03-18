@@ -1168,8 +1168,14 @@ def coo2csr(x):
         _cusparse.xcoo2csr(
             handle, x.row.data.ptr, nnz, m,
             indptr.data.ptr, _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    return cupyx.scipy.sparse.csr_matrix(
-        (x.data, x.col, indptr), shape=x.shape)
+    # Bypass the tuple-3 constructor's check_contents=True downcast.
+    # x.col (column indices) may be int64; creating via shape-only
+    # constructor and overwriting preserves the dtype.
+    A = cupyx.scipy.sparse.csr_matrix(x.shape, dtype=x.dtype)
+    A.data = x.data
+    A.indices = x.col
+    A.indptr = indptr
+    return A
 
 
 def coo2csc(x):
@@ -1192,8 +1198,14 @@ def coo2csc(x):
         _cusparse.xcoo2csr(
             handle, x.col.data.ptr, nnz, n,
             indptr.data.ptr, _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    return cupyx.scipy.sparse.csc_matrix(
-        (x.data, x.row, indptr), shape=x.shape)
+    # Bypass the tuple-3 constructor's check_contents=True downcast.
+    # x.row (row indices) may be int64; creating via shape-only
+    # constructor and overwriting preserves the dtype.
+    A = cupyx.scipy.sparse.csc_matrix(x.shape, dtype=x.dtype)
+    A.data = x.data
+    A.indices = x.row
+    A.indptr = indptr
+    return A
 
 
 def csr2coo(x, data, indices):

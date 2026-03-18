@@ -119,12 +119,18 @@ def _compressed_sparse_stack(blocks, axis):
         sum_dim += b.shape[axis]
         last_indptr += b.indptr[-1]
     indptr[-1] = last_indptr
+    # Bypass the tuple-3 constructor's check_contents=True downcast.
+    # The shape-only constructor initialises _descr and _shape; we then
+    # overwrite data/indices/indptr directly, preserving the idx_dtype
+    # computed above (which respects int64 inputs via check_contents=False).
     if axis == 0:
-        return _csr.csr_matrix((data, indices, indptr),
-                               shape=(sum_dim, constant_dim))
+        A = _csr.csr_matrix((sum_dim, constant_dim))
     else:
-        return _csc.csc_matrix((data, indices, indptr),
-                               shape=(constant_dim, sum_dim))
+        A = _csc.csc_matrix((constant_dim, sum_dim))
+    A.data = data
+    A.indices = indices
+    A.indptr = indptr
+    return A
 
 
 def hstack(blocks, format=None, dtype=None):
@@ -303,7 +309,12 @@ def bmat(blocks, format=None, dtype=None):
     shape = (row_offsets[-1], col_offsets[-1])
 
     data = cupy.empty(nnz, dtype=dtype)
-    idx_dtype = _sputils.get_index_dtype(maxval=max(shape))
+    # Use the flat-index product as the maxval heuristic: if nrows*ncols >
+    # INT32_MAX, the matrix is "large" and we upgrade to int64 indices to
+    # avoid overflow in downstream operations (e.g. tocsr indptr arithmetic).
+    # Python int arithmetic avoids numpy int32 overflow in the multiplication.
+    idx_dtype = _sputils.get_index_dtype(
+        maxval=int(shape[0]) * int(shape[1]) - 1)
     row = cupy.empty(nnz, dtype=idx_dtype)
     col = cupy.empty(nnz, dtype=idx_dtype)
 
@@ -317,7 +328,16 @@ def bmat(blocks, format=None, dtype=None):
         col[idx] = B.col + col_offsets[j]
         nnz += B.nnz
 
-    return _coo.coo_matrix((data, (row, col)), shape=shape).asformat(format)
+    # Bypass the COO constructor's check_contents=True downcast: the
+    # constructor would re-evaluate idx_dtype with maxval=max(shape) and
+    # downcast int64 arrays whose values fit in int32.  Instead, build via
+    # the shape-only constructor and assign arrays directly.
+    A = _coo.coo_matrix(shape, dtype=dtype)
+    A.data = data
+    A.row = row
+    A.col = col
+    A.has_canonical_format = False
+    return A.asformat(format)
 
 
 def random(m, n, density=0.01, format='coo', dtype=None,

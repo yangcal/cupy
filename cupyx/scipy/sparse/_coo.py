@@ -188,14 +188,15 @@ class coo_matrix(sparse_data._data_matrix):
         but with different data.  By default the index arrays
         (i.e. .row and .col) are copied.
         """
-        if copy:
-            return coo_matrix(
-                (data, (self.row.copy(), self.col.copy())),
-                shape=self.shape, dtype=data.dtype)
-        else:
-            return coo_matrix(
-                (data, (self.row, self.col)), shape=self.shape,
-                dtype=data.dtype)
+        # Use shape-only constructor + direct assignment to avoid the
+        # tuple-2 constructor's check_contents=True, which would silently
+        # downcast int64 indices to int32 when values fit in int32.
+        A = coo_matrix(self.shape, dtype=data.dtype)
+        A.data = data
+        A.row = self.row.copy() if copy else self.row
+        A.col = self.col.copy() if copy else self.col
+        A.has_canonical_format = self.has_canonical_format
+        return A
 
     def diagonal(self, k=0):
         """Returns the k-th diagonal of the matrix.
