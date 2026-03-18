@@ -2378,6 +2378,12 @@ def spgemm(a, b, alpha=1):
     if a.shape[1] != b.shape[0]:
         raise ValueError('mismatched shape')
 
+    if a.indices.dtype == _cupy.int64 or b.indices.dtype == _cupy.int64:
+        raise ValueError(
+            'spgemm does not support int64 indices '
+            '(cuSPARSE spGEMM is int32-only at runtime even via the Generic API). '
+            'A pure-CuPy int64 fallback is planned for future work.')
+
     m, k = a.shape
     _, n = b.shape
     idx_dtype = _numpy.result_type(a.indices.dtype, b.indices.dtype)

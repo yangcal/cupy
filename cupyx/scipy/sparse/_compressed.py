@@ -30,14 +30,13 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
                                 _index.IndexMixin):
 
     _max_min_reduction_code = r'''
-        extern "C" __global__
-        void ${func}(double* data, int* x, int* y, int length,
-                           double* z) {
+        template<typename TI> __global__
+        void ${func}(double* data, TI* x, TI* y, TI length, double* z) {
             // Get the index of the block
             int tid = blockIdx.x * blockDim.x + threadIdx.x;
 
             // Calculate the block length
-            int block_length = y[tid] - x[tid];
+            TI block_length = y[tid] - x[tid];
 
             // Select initial value based on the block density
             double running_value = 0;
@@ -48,7 +47,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             }
 
             // Iterate over the block and update
-            for (int entry = x[tid]; entry < y[tid]; entry++){
+            for (TI entry = x[tid]; entry < y[tid]; entry++){
                 if (data[entry] != data[entry]){
                     // Check for NaN
                     running_value = nan("");
@@ -65,25 +64,27 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             z[tid] = running_value;
         }'''
 
-    _max_reduction_kern = _core.RawKernel(
-        string.Template(_max_min_reduction_code).substitute(
+    _max_reduction_mod = _core.RawModule(
+        code=string.Template(_max_min_reduction_code).substitute(
             func='max_reduction', op='>', cond='block_length == length'),
-        'max_reduction')
+        name_expressions=['max_reduction<int>', 'max_reduction<long long>'])
 
-    _max_nonzero_reduction_kern = _core.RawKernel(
-        string.Template(_max_min_reduction_code).substitute(
+    _max_nonzero_reduction_mod = _core.RawModule(
+        code=string.Template(_max_min_reduction_code).substitute(
             func='max_nonzero_reduction', op='>', cond='block_length > 0'),
-        'max_nonzero_reduction')
+        name_expressions=[
+            'max_nonzero_reduction<int>', 'max_nonzero_reduction<long long>'])
 
-    _min_reduction_kern = _core.RawKernel(
-        string.Template(_max_min_reduction_code).substitute(
+    _min_reduction_mod = _core.RawModule(
+        code=string.Template(_max_min_reduction_code).substitute(
             func='min_reduction', op='<', cond='block_length == length'),
-        'min_reduction')
+        name_expressions=['min_reduction<int>', 'min_reduction<long long>'])
 
-    _min_nonzero_reduction_kern = _core.RawKernel(
-        string.Template(_max_min_reduction_code).substitute(
+    _min_nonzero_reduction_mod = _core.RawModule(
+        code=string.Template(_max_min_reduction_code).substitute(
             func='min_nonzero_reduction', op='<', cond='block_length > 0'),
-        'min_nonzero_reduction')
+        name_expressions=[
+            'min_nonzero_reduction<int>', 'min_nonzero_reduction<long long>'])
 
     # For _max_arg_reduction_mod and _min_arg_reduction_mod below, we pick
     # the right template specialization according to input dtypes at runtime.
@@ -1038,20 +1039,24 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         """
         out_shape = self.shape[1 - axis]
-        # Call to the appropriate kernel function
+        # TI (index type) must match self.indptr.dtype for correct int64 indptr.
+        idx_dtype = self.indptr.dtype
+        tname = _scalar.get_typename(idx_dtype)
         out = cupy.zeros(out_shape).astype(cupy.float64)
-        if nonzero:
-            kerns = {cupy.amax: self._max_nonzero_reduction_kern,
-                     cupy.amin: self._min_nonzero_reduction_kern}
-        else:
-            kerns = {cupy.amax: self._max_reduction_kern,
-                     cupy.amin: self._min_reduction_kern}
-
-        kerns[ufunc]((out_shape,), (1,),
-                     (self.data.astype(cupy.float64),
-                      self.indptr[:len(self.indptr) - 1],
-                      self.indptr[1:], cupy.int64(self.shape[axis]),
-                      out))
+        mod, fname = {
+            (cupy.amax, False): (self._max_reduction_mod, 'max_reduction'),
+            (cupy.amin, False): (self._min_reduction_mod, 'min_reduction'),
+            (cupy.amax, True): (self._max_nonzero_reduction_mod,
+                                'max_nonzero_reduction'),
+            (cupy.amin, True): (self._min_nonzero_reduction_mod,
+                                'min_nonzero_reduction'),
+        }[(ufunc, nonzero)]
+        ker = mod.get_function('{}<{}>'.format(fname, tname))
+        ker((out_shape,), (1,),
+            (self.data.astype(cupy.float64),
+             self.indptr[:-1], self.indptr[1:],
+             idx_dtype.type(self.shape[axis]),
+             out))
 
         return out
 

@@ -266,13 +266,47 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
             return cupy.empty(0, dtype=self.dtype)
         self.sum_duplicates()
         y = cupy.empty(ylen, dtype=self.dtype)
-        _cupy_csr_diagonal()(k, rows, cols, self.data, self.indptr,
-                             self.indices, y)
+        idx_dtype = self.indptr.dtype
+        _cupy_csr_diagonal()(k, idx_dtype.type(rows), idx_dtype.type(cols),
+                             self.data, self.indptr, self.indices, y)
         return y
 
     def eliminate_zeros(self):
         """Removes zero entories in place."""
         from cupyx import cusparse
+
+        if self.indices.dtype == cupy.int64:
+            # csr2csr_compress is int32-only (Legacy API).
+            # Use boolean masking + searchsorted for int64 matrices.
+            mask = self.data != 0
+            if mask.all():
+                return
+            new_data = self.data[mask]
+            new_indices = self.indices[mask]
+            new_nnz = int(mask.sum())
+            nrows = self.shape[0]
+            idx_dtype = self.indptr.dtype
+            if new_nnz == 0:
+                self.data = new_data
+                self.indices = new_indices
+                self.indptr = cupy.zeros(nrows + 1, dtype=idx_dtype)
+                return
+            # Expand indptr → per-nnz row assignment via searchsorted.
+            # cupy.repeat(arange, diff(indptr)) fails for CuPy ndarray repeats.
+            nnz_range = cupy.arange(self.nnz, dtype=idx_dtype)
+            row_of_each = cupy.searchsorted(
+                self.indptr[1:], nnz_range, side='right').astype(idx_dtype)
+            kept_rows = row_of_each[mask]
+            # Build new indptr via unique+scatter (avoids bincount OOM for
+            # large nrows; cupy.add.at is int32-only).
+            new_indptr = cupy.zeros(nrows + 1, dtype=idx_dtype)
+            unique_rows, row_counts = cupy.unique(kept_rows, return_counts=True)
+            new_indptr[unique_rows + 1] = row_counts.astype(idx_dtype)
+            cupy.cumsum(new_indptr, out=new_indptr)
+            self.data = new_data
+            self.indices = new_indices
+            self.indptr = new_indptr
+            return
 
         compress = cusparse.csr2csr_compress(self, 0)
         self.data = compress.data
@@ -619,15 +653,19 @@ def multiply_by_dense(sp, dn):
             indptr *= n
 
     # out = sp * dn
-    cupy_multiply_by_dense()(sp.data, sp.indptr, sp.indices, sp_m, sp_n,
-                             dn, dn_m, dn_n, indptr, m, n, data, indices)
+    idx_dtype = sp.indptr.dtype
+    it = idx_dtype.type
+    cupy_multiply_by_dense()(sp.data, sp.indptr, sp.indices, it(sp_m), it(sp_n),
+                             dn, it(dn_m), it(dn_n), indptr, it(m), it(n),
+                             data, indices)
 
     return csr_matrix((data, indices, indptr), shape=(m, n))
 
 
 _GET_ROW_ID_ = '''
-__device__ inline int get_row_id(int i, int min, int max, const int *indptr) {
-    int row = (min + max) / 2;
+template<typename I>
+__device__ inline I get_row_id(I i, I min, I max, const I *indptr) {
+    I row = (min + max) / 2;
     while (min < max) {
         if (i < indptr[row]) {
             max = row - 1;
@@ -640,16 +678,26 @@ __device__ inline int get_row_id(int i, int min, int max, const int *indptr) {
     }
     return row;
 }
+// Helper: atomicAdd for I=int or I=long long (CUDA has no signed-int64 atomicAdd).
+template<typename I>
+__device__ inline void _atomic_add_one(I* addr) {
+    atomicAdd(addr, (I)1);
+}
+template<>
+__device__ inline void _atomic_add_one<long long>(long long* addr) {
+    atomicAdd((unsigned long long int*)addr, (unsigned long long int)1);
+}
 '''
 
 _FIND_INDEX_HOLDING_COL_IN_ROW_ = '''
-__device__ inline int find_index_holding_col_in_row(
-        int row, int col, const int *indptr, const int *indices) {
-    int j_min = indptr[row];
-    int j_max = indptr[row+1] - 1;
+template<typename I>
+__device__ inline I find_index_holding_col_in_row(
+        I row, I col, const I *indptr, const I *indices) {
+    I j_min = indptr[row];
+    I j_max = indptr[row+1] - 1;
     while (j_min <= j_max) {
-        int j = (j_min + j_max) / 2;
-        int j_col = indices[j];
+        I j = (j_min + j_max) / 2;
+        I j_col = indices[j];
         if (j_col == col) {
             return j;
         } else if (j_col < col) {
@@ -658,7 +706,7 @@ __device__ inline int find_index_holding_col_in_row(
             j_max = j - 1;
         }
     }
-    return -1;
+    return (I)(-1);
 }
 '''
 
@@ -668,32 +716,32 @@ def cupy_multiply_by_dense():
     return cupy.ElementwiseKernel(
         '''
         raw S SP_DATA, raw I SP_INDPTR, raw I SP_INDICES,
-        int32 SP_M, int32 SP_N,
-        raw D DN_DATA, int32 DN_M, int32 DN_N,
-        raw I OUT_INDPTR, int32 OUT_M, int32 OUT_N
+        I SP_M, I SP_N,
+        raw D DN_DATA, I DN_M, I DN_N,
+        raw I OUT_INDPTR, I OUT_M, I OUT_N
         ''',
         'O OUT_DATA, I OUT_INDICES',
         '''
-        int i_out = i;
-        int m_out = get_row_id(i_out, 0, OUT_M - 1, &(OUT_INDPTR[0]));
-        int i_sp = i_out;
+        I i_out = (I)i;
+        I m_out = get_row_id(i_out, (I)0, OUT_M - 1, &(OUT_INDPTR[0]));
+        I i_sp = i_out;
         if (OUT_M > SP_M && SP_M == 1) {
             i_sp -= OUT_INDPTR[m_out];
         }
         if (OUT_N > SP_N && SP_N == 1) {
             i_sp /= OUT_N;
         }
-        int n_out = SP_INDICES[i_sp];
+        I n_out = SP_INDICES[i_sp];
         if (OUT_N > SP_N && SP_N == 1) {
             n_out = i_out - OUT_INDPTR[m_out];
         }
-        int m_dn = m_out;
+        I m_dn = m_out;
         if (OUT_M > DN_M && DN_M == 1) {
-            m_dn = 0;
+            m_dn = (I)0;
         }
-        int n_dn = n_out;
+        I n_dn = n_out;
         if (OUT_N > DN_N && DN_N == 1) {
-            n_dn = 0;
+            n_dn = (I)0;
         }
         OUT_DATA = (O)(SP_DATA[i_sp] * DN_DATA[n_dn + (DN_N * m_dn)]);
         OUT_INDICES = n_out;
@@ -741,10 +789,11 @@ def multiply_by_csr(a, b):
     nnz_each_row = cupy.zeros(m+1, dtype=a.indptr.dtype)
 
     # compute c = a * b where necessary and get sparsity pattern of matrix d
+    it = a.indptr.dtype.type
     cupy_multiply_by_csr_step1()(
-        a.data, a.indptr, a.indices, a_m, a_n,
-        b.data, b.indptr, b.indices, b_m, b_n,
-        c_indptr, m, n, c_data, c_indices, flags, nnz_each_row)
+        a.data, a.indptr, a.indices, it(a_m), it(a_n),
+        b.data, b.indptr, b.indices, it(b_m), it(b_n),
+        c_indptr, it(m), it(n), c_data, c_indices, flags, nnz_each_row)
 
     flags = cupy.cumsum(flags, dtype=a.indptr.dtype)
     d_indptr = cupy.cumsum(nnz_each_row, dtype=a.indptr.dtype)
@@ -762,38 +811,38 @@ def multiply_by_csr(a, b):
 def cupy_multiply_by_csr_step1():
     return cupy.ElementwiseKernel(
         '''
-        raw A A_DATA, raw I A_INDPTR, raw I A_INDICES, int32 A_M, int32 A_N,
-        raw B B_DATA, raw I B_INDPTR, raw I B_INDICES, int32 B_M, int32 B_N,
-        raw I C_INDPTR, int32 C_M, int32 C_N
+        raw A A_DATA, raw I A_INDPTR, raw I A_INDICES, I A_M, I A_N,
+        raw B B_DATA, raw I B_INDPTR, raw I B_INDICES, I B_M, I B_N,
+        raw I C_INDPTR, I C_M, I C_N
         ''',
         'C C_DATA, I C_INDICES, raw I FLAGS, raw I NNZ_EACH_ROW',
         '''
-        int i_c = i;
-        int m_c = get_row_id(i_c, 0, C_M - 1, &(C_INDPTR[0]));
+        I i_c = (I)i;
+        I m_c = get_row_id(i_c, (I)0, C_M - 1, &(C_INDPTR[0]));
 
-        int i_a = i;
+        I i_a = (I)i;
         if (C_M > A_M && A_M == 1) {
             i_a -= C_INDPTR[m_c];
         }
         if (C_N > A_N && A_N == 1) {
             i_a /= C_N;
         }
-        int n_c = A_INDICES[i_a];
+        I n_c = A_INDICES[i_a];
         if (C_N > A_N && A_N == 1) {
-            n_c = i % C_N;
+            n_c = (I)i % C_N;
         }
-        int m_b = m_c;
+        I m_b = m_c;
         if (C_M > B_M && B_M == 1) {
-            m_b = 0;
+            m_b = (I)0;
         }
-        int n_b = n_c;
+        I n_b = n_c;
         if (C_N > B_N && B_N == 1) {
-            n_b = 0;
+            n_b = (I)0;
         }
-        int i_b = find_index_holding_col_in_row(m_b, n_b,
+        I i_b = find_index_holding_col_in_row(m_b, n_b,
             &(B_INDPTR[0]), &(B_INDICES[0]));
-        if (i_b >= 0) {
-            atomicAdd(&(NNZ_EACH_ROW[m_c+1]), 1);
+        if (i_b >= (I)0) {
+            _atomic_add_one(&(NNZ_EACH_ROW[m_c+1]));
             FLAGS[i+1] = 1;
             C_DATA = (C)(A_DATA[i_a] * B_DATA[i_b]);
             C_INDICES = n_c;
@@ -810,7 +859,7 @@ def cupy_multiply_by_csr_step2():
         'T C_DATA, I C_INDICES, raw I FLAGS',
         'raw D D_DATA, raw I D_INDICES',
         '''
-        int j = FLAGS[i];
+        I j = FLAGS[i];
         if (j < FLAGS[i+1]) {
             D_DATA[j] = (D)(C_DATA);
             D_INDICES[j] = C_INDICES;
@@ -1115,8 +1164,10 @@ def cupy_binopt_csr_step2(op_name):
 def csr2dense(a, order):
     out = cupy.zeros(a.shape, dtype=a.dtype, order=order)
     m, n = a.shape
+    idx_dtype = a.indptr.dtype
     kern = _cupy_csr2dense(a.dtype)
-    kern(m, n, a.indptr, a.indices, a.data, (order == 'C'), out)
+    kern(idx_dtype.type(m), idx_dtype.type(n),
+         a.indptr, a.indices, a.data, (order == 'C'), out)
     return out
 
 
@@ -1128,12 +1179,12 @@ def _cupy_csr2dense(dtype):
         op = "atomicAdd(&OUT[index], DATA);"
 
     return cupy.ElementwiseKernel(
-        'int32 M, int32 N, raw I INDPTR, I INDICES, T DATA, bool C_ORDER',
+        'I M, I N, raw I INDPTR, I INDICES, T DATA, bool C_ORDER',
         'raw T OUT',
         '''
-        int row = get_row_id(i, 0, M - 1, &(INDPTR[0]));
-        int col = INDICES;
-        int index = C_ORDER ? col + N * row : row + M * col;
+        I row = get_row_id((I)i, (I)0, M - 1, &(INDPTR[0]));
+        I col = INDICES;
+        I index = C_ORDER ? col + N * row : row + M * col;
         ''' + op,
         'cupyx_scipy_sparse_csr2dense',
         preamble=_GET_ROW_ID_
@@ -1198,18 +1249,18 @@ def cupy_dense2csr_step2():
 @cupy._util.memoize(for_each_device=True)
 def _cupy_csr_diagonal():
     return cupy.ElementwiseKernel(
-        'int32 k, int32 rows, int32 cols, '
+        'int32 k, I rows, I cols, '
         'raw T data, raw I indptr, raw I indices',
         'T y',
         '''
-        int row = i;
-        int col = i;
-        if (k < 0) row -= k;
-        if (k > 0) col += k;
+        I row = (I)i;
+        I col = (I)i;
+        if (k < 0) row -= (I)k;
+        if (k > 0) col += (I)k;
         if (row >= rows || col >= cols) return;
-        int j = find_index_holding_col_in_row(row, col,
+        I j = find_index_holding_col_in_row(row, col,
             &(indptr[0]), &(indices[0]));
-        if (j >= 0) {
+        if (j >= (I)0) {
             y = data[j];
         } else {
             y = static_cast<T>(0);

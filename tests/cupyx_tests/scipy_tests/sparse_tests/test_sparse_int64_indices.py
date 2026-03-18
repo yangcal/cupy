@@ -686,6 +686,147 @@ class TestInt64Argmax:
         assert int(result[1, 0]) == _LARGE + 1  # max(0.5, 3.0) → col _LARGE+1
 
 
+class TestInt64EliminateZeros:
+    """eliminate_zeros with int64 indices uses a pure-CuPy fallback.
+
+    csr2csr_compress is int32-only (Legacy API). For int64 matrices we use
+    boolean masking + searchsorted + unique/scatter.
+    """
+
+    def test_eliminate_zeros_removes_explicit_zeros(self):
+        # Row 0: [1.0@0, 0.0@_LARGE, 2.0@_LARGE+1]; after: [1.0@0, 2.0@_LARGE+1]
+        data = cupy.array([1.0, 0.0, 2.0])
+        indices = cupy.array([0, _LARGE, _LARGE + 1], dtype=cupy.int64)
+        indptr = cupy.array([0, 3, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, _LARGE + 2))
+        m.eliminate_zeros()
+        assert m.nnz == 2
+        assert m.indices.dtype == cupy.int64
+        testing.assert_array_equal(m.indices, cupy.array([0, _LARGE + 1],
+                                                         dtype=cupy.int64))
+        testing.assert_array_equal(m.data, cupy.array([1.0, 2.0]))
+        testing.assert_array_equal(m.indptr,
+                                   cupy.array([0, 2, 2], dtype=cupy.int64))
+
+    def test_eliminate_zeros_all_nonzero_is_noop(self):
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(1, _LARGE + 1))
+        m.eliminate_zeros()
+        assert m.nnz == 2
+        assert m.indices.dtype == cupy.int64
+
+    def test_eliminate_zeros_all_zero(self):
+        data = cupy.array([0.0, 0.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(1, _LARGE + 1))
+        m.eliminate_zeros()
+        assert m.nnz == 0
+        assert m.indices.dtype == cupy.int64
+        testing.assert_array_equal(m.indptr,
+                                   cupy.array([0, 0], dtype=cupy.int64))
+
+    def test_eliminate_zeros_int32_regression(self):
+        # int32 path (csr2csr_compress) must still work.
+        data = cupy.array([1.0, 0.0, 2.0])
+        indices = cupy.array([0, 3, 5], dtype=cupy.int32)
+        indptr = cupy.array([0, 3, 3], dtype=cupy.int32)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, 10))
+        m.eliminate_zeros()
+        assert m.nnz == 2
+        assert m.indices.dtype == cupy.int32
+
+
+class TestInt64Multiply:
+    """Element-wise multiply for int64 matrices.
+
+    cupy_multiply_by_dense and cupy_multiply_by_csr_step1/step2 previously
+    had int32 shape parameters; they now use I (long long for int64 matrices).
+    """
+
+    def test_multiply_dense_broadcast_int64(self):
+        # (1, _LARGE+1) sparse * (1, 1) dense — broadcasting.
+        data = cupy.array([2.0, 3.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 2], dtype=cupy.int64)
+        sp = sparse.csr_matrix((data, indices, indptr), shape=(1, _LARGE + 1))
+        dn = cupy.full((1, 1), 4.0)
+        result = sp.multiply(dn)
+        assert result.nnz == 2
+        assert result.indices.dtype == cupy.int64
+        assert abs(float(result[0, 0]) - 8.0) < 1e-9
+        assert abs(float(result[0, _LARGE]) - 12.0) < 1e-9
+
+    def test_multiply_csr_int64(self):
+        # element-wise sparse * sparse, same sparsity pattern.
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 2], dtype=cupy.int64)
+        a = sparse.csr_matrix(
+            (cupy.array([2.0, 3.0]), indices, indptr),
+            shape=(1, _LARGE + 1))
+        b = sparse.csr_matrix(
+            (cupy.array([4.0, 5.0]), indices.copy(), indptr.copy()),
+            shape=(1, _LARGE + 1))
+        result = a.multiply(b)
+        assert result.nnz == 2
+        assert result.indices.dtype == cupy.int64
+        assert abs(float(result[0, 0]) - 8.0) < 1e-9
+        assert abs(float(result[0, _LARGE]) - 15.0) < 1e-9
+
+    def test_multiply_dense_int32_regression(self):
+        # int32 matrix must still work (int32 shape params, no overflow risk).
+        sp = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        dn = cupy.full((3, 3), 2.0)
+        result = sp.multiply(dn)
+        testing.assert_array_almost_equal(result.toarray(),
+                                          2.0 * cupy.eye(3))
+
+    def test_multiply_csr_int32_regression(self):
+        # int32 × int32 sparse element-wise.
+        a = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        b = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        result = a.multiply(b)
+        assert result.indices.dtype == cupy.int32
+        testing.assert_array_almost_equal(result.toarray(), cupy.eye(3))
+
+
+class TestInt64Diagonal:
+    """diagonal() for int64 matrices.
+
+    _cupy_csr_diagonal previously had int32 rows/cols; now uses I.
+    For a matrix with shape (few_rows, large_cols), diagonal() is practical
+    (output has few_rows elements, no OOM).
+    """
+
+    def test_diagonal_int64_large_cols(self):
+        # (2, _LARGE+1) matrix — diagonal is 2 elements.
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, 1], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, _LARGE + 1))
+        d = m.diagonal()
+        assert d.shape == (2,)
+        testing.assert_array_almost_equal(d, cupy.array([1.0, 2.0]))
+
+    def test_diagonal_int64_absent_returns_zero(self):
+        # Diagonal element at (1,1) is absent → 0.0.
+        data = cupy.array([1.0])
+        indices = cupy.array([0], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, _LARGE + 1))
+        d = m.diagonal()
+        assert abs(float(d[0]) - 1.0) < 1e-9
+        assert abs(float(d[1]) - 0.0) < 1e-9
+
+    def test_diagonal_int32_regression(self):
+        # int32 path must still work.
+        m = sparse.csr_matrix(cupy.eye(4, dtype=cupy.float64))
+        d = m.diagonal()
+        testing.assert_array_almost_equal(d, cupy.ones(4))
+
+
 class TestInt64SpGEMM:
     """int64-related fixes to spgemm.
 
