@@ -985,3 +985,262 @@ class TestInt64SpGEMM:
         c = a @ b
         assert c.indices.dtype == cupy.int32
         testing.assert_array_almost_equal(c.toarray(), cupy.eye(3))
+
+
+class TestInt64DtypePreservation:
+    """_with_data and construction bypass preserve index dtype.
+
+    Before, five independent check_contents=True barriers silently
+    downcasted int64 indices to int32 when the index values happened to fit
+    in int32.  This affected copy(), abs(), neg(), scalar multiply, astype(),
+    vstack(), hstack(), bmat(), and tocsr() on COO matrices.
+
+    All tests here use int64 index arrays whose values fit in int32, which
+    is the scenario that was broken.  This is distinct from large-value int64
+    (> INT32_MAX) which was already working.
+    """
+
+    def test_csr_copy_preserves_int64_small_values(self):
+        # _with_data bypass: copy() must not downcast int64 indices
+        # whose values happen to fit in int32.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 3))
+        # Force int64 by constructing without check_contents downcast.
+        m.indices = indices
+        m.indptr = indptr
+        c = m.copy()
+        assert c.indices.dtype == cupy.int64
+        assert c.indptr.dtype == cupy.int64
+        testing.assert_array_almost_equal(c.toarray(), m.toarray())
+
+    def test_csr_abs_preserves_int64_small_values(self):
+        # _with_data bypass: abs() must not downcast int64 indices.
+        data = cupy.array([-1.0, 2.0, -3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 3))
+        m.indices = indices
+        m.indptr = indptr
+        result = abs(m)
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.array([[1.0, 0.0, 0.0],
+                                [0.0, 2.0, 0.0],
+                                [0.0, 0.0, 3.0]])
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_csr_neg_preserves_int64_small_values(self):
+        # _with_data bypass: negation must not downcast int64 indices.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 3))
+        m.indices = indices
+        m.indptr = indptr
+        result = -m
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.array([[-1.0, 0.0, 0.0],
+                                [0.0, -2.0, 0.0],
+                                [0.0, 0.0, -3.0]])
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_csr_scalar_multiply_preserves_int64_small_values(self):
+        # _with_data bypass: scalar multiply must not downcast int64 indices.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 3))
+        m.indices = indices
+        m.indptr = indptr
+        result = m * 2.0
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.array([[2.0, 0.0, 0.0],
+                                [0.0, 4.0, 0.0],
+                                [0.0, 0.0, 6.0]])
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_csr_astype_preserves_int64_small_values(self):
+        # _with_data bypass: astype() must not downcast int64 indices.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 3))
+        m.indices = indices
+        m.indptr = indptr
+        result = m.astype(cupy.float32)
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        assert result.data.dtype == cupy.float32
+
+    def test_csc_copy_preserves_int64_small_values(self):
+        # _with_data bypass applies to CSC via self.__class__: copy() must
+        # not downcast int64 indices for CSC matrices.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csc_matrix((data, indices, indptr), shape=(3, 3))
+        m.indices = indices
+        m.indptr = indptr
+        c = m.copy()
+        assert c.indices.dtype == cupy.int64
+        assert c.indptr.dtype == cupy.int64
+        testing.assert_array_almost_equal(c.toarray(), m.toarray())
+
+    def test_coo_copy_preserves_int64_small_values(self):
+        # COO _with_data bypass: copy() must not downcast int64 row/col
+        # arrays whose values fit in int32.
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix((data, (row, col)), shape=(3, 3))
+        # Overwrite with explicit int64 arrays (constructor may downcast).
+        m.row = row
+        m.col = col
+        c = m.copy()
+        assert c.row.dtype == cupy.int64
+        assert c.col.dtype == cupy.int64
+        testing.assert_array_almost_equal(c.toarray(), m.toarray())
+
+    def test_coo_has_canonical_format_preserved_by_copy(self):
+        # COO _with_data must propagate has_canonical_format because it is
+        # a structural property of the (row, col) pattern, not of data values.
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix((data, (row, col)), shape=(3, 3))
+        m.row = row
+        m.col = col
+        m.has_canonical_format = True
+        c = m.copy()
+        assert c.has_canonical_format is True
+
+        m2 = sparse.coo_matrix((data, (row, col)), shape=(3, 3))
+        m2.row = row
+        m2.col = col
+        m2.has_canonical_format = False
+        c2 = m2.copy()
+        assert c2.has_canonical_format is False
+
+    def test_vstack_preserves_explicitly_set_int64(self):
+        # _compressed_sparse_stack bypass: vstack must not downcast int64
+        # indices set explicitly on input matrices.
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, 1], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, 2))
+        m.indices = indices
+        m.indptr = indptr
+        result = sparse.vstack([m, m])
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.array([[1.0, 0.0],
+                                [0.0, 2.0],
+                                [1.0, 0.0],
+                                [0.0, 2.0]])
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_hstack_flat_index_product_heuristic(self):
+        # bmat flat-index heuristic: a matrix with shape (33000, 66000) has
+        # nrows*ncols = 2,178,000,000 > INT32_MAX, so bmat must use int64.
+        # Note: scipy uses maxval=max(shape) and would return int32 here.
+        # This test defines CuPy-specific aspirational behaviour.
+        #
+        # Use CSR inputs with format='csr': hstack of CSC+format=None uses the
+        # _compressed_sparse_stack fast path (which doesn't apply the product
+        # heuristic).  CSR inputs force the slow bmat path where the heuristic
+        # is applied.  Matrices must be non-empty: COO.tocsr() with nnz==0 has
+        # a pre-existing early-return that also ignores the index dtype (out of
+        # scope for current commit).
+        nrows = 33000
+        ncols = 66000
+        half = ncols // 2
+        assert nrows * ncols > numpy.iinfo(numpy.int32).max
+        # Each block has one non-zero entry so tocsr() does not hit the nnz==0
+        # early-return path.
+        a = sparse.csr_matrix(
+            (cupy.array([1.0]), cupy.array([0]), cupy.array([0, 1])),
+            shape=(1, half))
+        # Pad to full nrows using vstack (fast path preserves dtype)
+        a = sparse.vstack([a, sparse.csr_matrix((nrows - 1, half))])
+        b = sparse.csr_matrix(
+            (cupy.array([2.0]), cupy.array([0]), cupy.array([0, 1])),
+            shape=(1, half))
+        b = sparse.vstack([b, sparse.csr_matrix((nrows - 1, half))])
+        result = sparse.hstack([a, b], format='csr')
+        assert result.shape == (nrows, ncols)
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+
+    def test_coo2csr_preserves_int64(self):
+        # cusparse.coo2csr must preserve int64 row/col dtype even when
+        # values fit in int32.
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix((data, (row, col)), shape=(3, 3))
+        m.row = row
+        m.col = col
+        result = cusparse.coo2csr(m)
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.diag(cupy.array([1.0, 2.0, 3.0]))
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_coo2csc_preserves_int64(self):
+        # cusparse.coo2csc must preserve int64 row/col dtype even when
+        # values fit in int32.
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix((data, (row, col)), shape=(3, 3))
+        m.row = row
+        m.col = col
+        result = cusparse.coo2csc(m)
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.diag(cupy.array([1.0, 2.0, 3.0]))
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_tocsr_on_int64_coo_preserves_dtype(self):
+        # Full chain: COO.tocsr() must preserve int64 through coo2csr.
+        # This exercises the path: _coo.tocsr() → cusparse.coo2csr() →
+        # csr_matrix bypass.
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix((data, (row, col)), shape=(3, 3))
+        m.row = row
+        m.col = col
+        result = m.tocsr()
+        assert result.indices.dtype == cupy.int64
+        assert result.indptr.dtype == cupy.int64
+        expected = cupy.diag(cupy.array([1.0, 2.0, 3.0]))
+        testing.assert_array_almost_equal(result.toarray(), expected)
+
+    def test_int32_copy_regression(self):
+        # Regression guard: copy() on an int32 CSR matrix must still
+        # produce int32 indices after the _with_data bypass.
+        m = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        assert m.indices.dtype == cupy.int32
+        assert m.indptr.dtype == cupy.int32
+        c = m.copy()
+        assert c.indices.dtype == cupy.int32
+        assert c.indptr.dtype == cupy.int32
+        testing.assert_array_almost_equal(c.toarray(), cupy.eye(3))
+
+    def test_vstack_int32_regression(self):
+        # Regression guard: vstack on int32 matrices must still produce
+        # int32 indices after the _compressed_sparse_stack bypass.
+        m = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))
+        assert m.indices.dtype == cupy.int32
+        result = sparse.vstack([m, m])
+        assert result.indices.dtype == cupy.int32
+        assert result.indptr.dtype == cupy.int32
+        expected = cupy.zeros((6, 3))
+        expected[:3, :3] = cupy.eye(3)
+        expected[3:, :3] = cupy.eye(3)
+        testing.assert_array_almost_equal(result.toarray(), expected)
