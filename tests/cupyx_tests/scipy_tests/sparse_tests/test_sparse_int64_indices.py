@@ -409,6 +409,283 @@ class TestInt64ArithmeticFallback:
         testing.assert_array_equal(c.toarray(), a.toarray() + b.toarray())
 
 
+class TestInt64ScalarIndex:
+    """Scalar index m[i, j] with int64 column/row > INT32_MAX.
+
+    _compress_getitem_kern previously typed 'minor' as int32, silently
+    truncating large column values so the equality check always failed and
+    the lookup returned 0.  The fix changes int32 minor to S minor, matching
+    the dtype of the ind (column/row index) array.
+    """
+
+    def _make_int64_csr(self, col=_LARGE, value=5.0):
+        """Single nonzero at (row=0, col=col)."""
+        data = cupy.array([value])
+        indices = cupy.array([col], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        return sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 1))
+
+    def test_csr_scalar_index_large_col_returns_value(self):
+        # m[0, _LARGE] must return the stored value, not 0.
+        # Previously, int32 minor truncated _LARGE to a negative int32,
+        # ind == minor was always False, and m[0, _LARGE] silently returned 0.
+        m = self._make_int64_csr()
+        result = m[0, _LARGE]
+        assert float(result) == pytest.approx(5.0)
+
+    def test_csr_scalar_index_absent_large_col_returns_zero(self):
+        # Absence (structural zero) at a large column must return 0.
+        m = self._make_int64_csr(col=_LARGE - 1)  # stored at _LARGE-1, not _LARGE
+        result = m[0, _LARGE]
+        assert float(result) == pytest.approx(0.0)
+
+    def test_csr_scalar_index_small_col_int32_regression(self):
+        # int32 matrix: scalar index must remain correct.
+        data = cupy.array([7.0])
+        indices = cupy.array([3], dtype=cupy.int32)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int32)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, 10))
+        assert float(m[0, 3]) == pytest.approx(7.0)
+        assert float(m[0, 4]) == pytest.approx(0.0)
+
+    def test_csc_scalar_index_large_row_returns_value(self):
+        # CSC m[row, col] uses the same kernel with minor = target row.
+        # Verify the fix works for CSC too.
+        data = cupy.array([3.0])
+        indices = cupy.array([_LARGE], dtype=cupy.int64)  # row index
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)  # 1 nnz in col 0
+        m = sparse.csc_matrix(
+            (data, indices, indptr), shape=(_LARGE + 1, 2))
+        assert float(m[_LARGE, 0]) == pytest.approx(3.0)
+        assert float(m[_LARGE - 1, 0]) == pytest.approx(0.0)
+
+    def test_csr_complex_scalar_index_large_col(self):
+        # Complex variant uses _compress_getitem_complex_kern, same int32 fix.
+        data = cupy.array([2.0 + 3.0j])
+        indices = cupy.array([_LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 1))
+        result = complex(m[0, _LARGE])
+        assert result.real == pytest.approx(2.0)
+        assert result.imag == pytest.approx(3.0)
+
+    def test_csr_scalar_index_multiple_rows(self):
+        # Matrix with one nonzero per row; index into both rows.
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 1))
+        assert float(m[0, 0]) == pytest.approx(1.0)
+        assert float(m[1, _LARGE]) == pytest.approx(2.0)
+        assert float(m[0, _LARGE]) == pytest.approx(0.0)
+        assert float(m[1, 0]) == pytest.approx(0.0)
+
+
+class TestInt64FancyRowIndex:
+    """Fancy row index m[[r1, r2], :] with int64 column indices > INT32_MAX.
+
+    Two int64 fixes work together here:
+    - _csr_row_index_ker: all int32 parameters changed to I so int64 column
+      values are not truncated in the output matrix.
+    - _csr_indptr_to_coo_rows: xcsr2coo is int32-only; int64 path uses
+      searchsorted to expand indptr to per-nnz row assignments.
+    """
+
+    _shape = (4, _LARGE + 2)
+
+    def _make_int64_csr(self):
+        """4-row CSR: row 0 → col 0 (val=1), row 2 → col _LARGE (val=2),
+        rows 1 and 3 are empty."""
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1, 2, 2], dtype=cupy.int64)
+        return sparse.csr_matrix(
+            (data, indices, indptr), shape=self._shape)
+
+    def test_fancy_row_result_has_int64_indices(self):
+        m = self._make_int64_csr()
+        sub = m[[0, 2], :]
+        assert sub.indices.dtype == cupy.int64
+        assert sub.indptr.dtype == cupy.int64
+
+    def test_fancy_row_large_col_preserved(self):
+        # Previously, _csr_row_index_ker wrote Bj as int32, truncating
+        # _LARGE to its low 32 bits (wrong negative int).
+        m = self._make_int64_csr()
+        sub = m[[0, 2], :]
+        assert sub.nnz == 2
+        assert int(sub.indices[0]) == 0
+        assert int(sub.indices[1]) == _LARGE
+
+    def test_fancy_row_values_correct(self):
+        m = self._make_int64_csr()
+        sub = m[[0, 2], :]
+        assert float(sub.data[0]) == pytest.approx(1.0)
+        assert float(sub.data[1]) == pytest.approx(2.0)
+
+    def test_fancy_row_reverse_order(self):
+        # Rows requested in reverse order: result should have reversed rows.
+        m = self._make_int64_csr()
+        sub = m[[2, 0], :]
+        assert sub.nnz == 2
+        assert int(sub.indices[0]) == _LARGE
+        assert int(sub.indices[1]) == 0
+        assert float(sub.data[0]) == pytest.approx(2.0)
+        assert float(sub.data[1]) == pytest.approx(1.0)
+
+    def test_fancy_row_single_row(self):
+        m = self._make_int64_csr()
+        sub = m[[2], :]
+        assert sub.nnz == 1
+        assert int(sub.indices[0]) == _LARGE
+        assert sub.indices.dtype == cupy.int64
+
+    def test_fancy_row_empty_rows_selected(self):
+        # Selecting only empty rows should produce an empty matrix with
+        # correct int64 dtypes.
+        m = self._make_int64_csr()
+        sub = m[[1, 3], :]
+        assert sub.nnz == 0
+        assert sub.indices.dtype == cupy.int64
+        assert sub.indptr.dtype == cupy.int64
+
+    def test_fancy_row_indptr_correct(self):
+        # indptr[r+1] - indptr[r] must equal the nnz for each selected row.
+        m = self._make_int64_csr()
+        sub = m[[0, 1, 2, 3], :]  # all rows
+        assert int(sub.indptr[0]) == 0
+        assert int(sub.indptr[1]) == 1   # row 0 has 1 nnz
+        assert int(sub.indptr[2]) == 1   # row 1 has 0 nnz
+        assert int(sub.indptr[3]) == 2   # row 2 has 1 nnz
+        assert int(sub.indptr[4]) == 2   # row 3 has 0 nnz
+
+    def test_fancy_row_int32_regression(self):
+        # int32 path must remain correct.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 2, 1], dtype=cupy.int32)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int32)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 5))
+        sub = m[[2, 0], :]
+        assert sub.indices.dtype == cupy.int32
+        assert int(sub.indices[0]) == 1  # row 2 has col 1
+        assert int(sub.indices[1]) == 0  # row 0 has col 0
+        assert float(sub.data[0]) == pytest.approx(3.0)
+        assert float(sub.data[1]) == pytest.approx(1.0)
+
+    def test_fancy_row_dtype_not_demoted_when_values_small(self):
+        # int64 dtype is preserved even when all values fit in int32.
+        # The dtype is a property of the matrix, not the values.
+        data = cupy.array([1.0])
+        indices = cupy.array([5], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, _LARGE + 1))
+        sub = m[[0], :]
+        assert sub.indices.dtype == cupy.int64
+
+
+class TestInt64Argmax:
+    """argmax/argmin along an axis with int64 column indices > INT32_MAX.
+
+    _argmax_argmin_code previously used int* for the indices and indptr
+    slice arrays, silently truncating int64 column values.  We added a
+    TI template parameter so all index-typed values use the correct dtype.
+    """
+
+    def _make_int64_csr(self, nrows=3):
+        """CSR matrix with one nonzero per row:
+          row 0 → (col=0, val=1.0)
+          row 1 → (col=_LARGE, val=2.0)   ← argmax column for float comparison
+          row 2 → (col=_LARGE//2, val=1.5)
+        """
+        data = cupy.array([1.0, 2.0, 1.5])[:nrows]
+        cols = [0, _LARGE, _LARGE // 2]
+        indices = cupy.array(cols[:nrows], dtype=cupy.int64)
+        indptr = cupy.arange(nrows + 1, dtype=cupy.int64)
+        return sparse.csr_matrix(
+            (data, indices, indptr), shape=(nrows, _LARGE + 1))
+
+    def test_csr_argmax_axis1_large_col(self):
+        # argmax(axis=1) must return the correct int64 column index.
+        # Previously, int* indices truncated _LARGE, returning wrong col.
+        m = self._make_int64_csr()
+        result = m.argmax(axis=1)
+        # Row 0: max at col 0.  Row 1: max at col _LARGE.  Row 2: max at col _LARGE//2.
+        assert int(result[1, 0]) == _LARGE
+        assert int(result[0, 0]) == 0
+
+    def test_csr_argmin_axis1_large_col(self):
+        # argmin(axis=1) where the minimum is a negative value at a large column.
+        # Row has two nonzeros: col 1 → 1.0, col _LARGE → -3.0.
+        # Implicit zeros at other cols are 0.0; -3.0 is the global min.
+        data = cupy.array([1.0, -3.0])
+        indices = cupy.array([1, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(1, _LARGE + 1))
+        result = m.argmin(axis=1)
+        assert int(result[0, 0]) == _LARGE
+
+    def test_csr_argmax_axis1_result_dtype(self):
+        # Result dtype is int (default out dtype), not affected by index dtype.
+        m = self._make_int64_csr()
+        result = m.argmax(axis=1)
+        assert result.dtype in (cupy.int32, cupy.int64, cupy.intp)
+
+    def test_csc_argmax_axis0_large_row(self):
+        # CSC argmax(axis=0) finds the row of the max per column.
+        # With a large row index, TI=int64 must be used.
+        data = cupy.array([3.0, 1.0])
+        indices = cupy.array([_LARGE, 0], dtype=cupy.int64)  # row indices
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)     # 1 nnz per col
+        m = sparse.csc_matrix(
+            (data, indices, indptr), shape=(_LARGE + 1, 2))
+        result = m.argmax(axis=0)
+        # Col 0: max is at row _LARGE.  Col 1: max is at row 0.
+        assert int(result[0, 0]) == _LARGE
+        assert int(result[0, 1]) == 0
+
+    def test_csr_argmax_no_axis_flat_index(self):
+        # argmax() with no axis returns a flat index.  This path goes through
+        # COO conversion (int64-aware), not _arg_minor_reduce — so it worked
+        # before too.  Include as a regression guard.
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)
+        ncols = _LARGE + 1
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, ncols))
+        flat = int(m.argmax())
+        r = flat // ncols
+        c = flat % ncols
+        assert r == 1
+        assert c == _LARGE
+
+    def test_csr_argmax_axis1_int32_regression(self):
+        # int32 matrix: argmax must remain correct.
+        data = cupy.array([1.0, 5.0, 3.0])
+        indices = cupy.array([0, 2, 1], dtype=cupy.int32)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int32)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(3, 5))
+        result = m.argmax(axis=1)
+        assert int(result[0, 0]) == 0   # row 0: only col 0
+        assert int(result[1, 0]) == 2   # row 1: only col 2
+        assert int(result[2, 0]) == 1   # row 2: only col 1
+
+    def test_csr_argmax_axis1_multiple_large_cols(self):
+        # Multiple rows, each with the argmax at a large col.
+        # Both rows have a nonzero at a large column.
+        data = cupy.array([1.0, 2.0, 0.5, 3.0])
+        indices = cupy.array([0, _LARGE, 0, _LARGE + 1], dtype=cupy.int64)
+        indptr = cupy.array([0, 2, 4], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 2))
+        result = m.argmax(axis=1)
+        assert int(result[0, 0]) == _LARGE     # max(1.0, 2.0) → col _LARGE
+        assert int(result[1, 0]) == _LARGE + 1  # max(0.5, 3.0) → col _LARGE+1
+
+
 class TestInt64SpGEMM:
     """int64-related fixes to spgemm.
 
