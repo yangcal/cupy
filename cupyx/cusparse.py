@@ -587,7 +587,7 @@ def csrgeam2(a, b, alpha=1, beta=1):
 
     # Route int64 BEFORE the availability check: the pure-CuPy fallback
     # requires no cuSPARSE and must work even on old CUDA where csrgeam2 is
-    # absent. (Same pattern as csrsort/coosort/csr2coo in Phase 2.)
+    # absent.
     if a.indices.dtype == _cupy.int64 or b.indices.dtype == _cupy.int64:
         if check_availability('spgeam'):
             return spgeam(a, b, alpha, beta)
