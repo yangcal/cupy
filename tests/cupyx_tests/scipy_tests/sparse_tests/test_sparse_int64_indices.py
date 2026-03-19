@@ -1244,3 +1244,185 @@ class TestInt64DtypePreservation:
         expected[:3, :3] = cupy.eye(3)
         expected[3:, :3] = cupy.eye(3)
         testing.assert_array_almost_equal(result.toarray(), expected)
+
+
+class TestInt64FancyMinorIndex:
+    """Fancy minor-axis indexing via _minor_index_fancy_sorted for int64.
+
+    Previously, _minor_index_fancy() used a histogram kernel that
+    allocated O(N) memory (col_counts = zeros(N)).  For int64 matrices N can
+    exceed INT32_MAX, causing OOM (e.g. N = 2**32 → 16 GB).  The kernels also
+    used const int* parameters, silently truncating index values > INT32_MAX.
+
+    The new _minor_index_fancy_sorted routes int64 matrices through
+    argsort + searchsorted instead of the histogram, with O(nnz + n_idx)
+    space (no N-sized buffer).
+
+    For CSR: the minor axis is columns → `m[:, [col1, col2]]`.
+    For CSC: the minor axis is rows    → `m[[row1, row2], :]`.
+    """
+
+    def _make_int64_csr_2row(self):
+        """2-row CSR: row 0 → col 0 (val=1.0), row 1 → col _LARGE (val=2.0)."""
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)
+        return sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 1))
+
+    def test_csr_fancy_col_large_index_selects_correct_row(self):
+        # Selecting col 0 from a 2-row matrix where row 1 has a large col
+        # index.  Before the fix, the histogram kernel would OOM (O(N)
+        # allocation for N = _LARGE+1 cols) or truncate the int64 index.
+        # The source matrix must have int64 indices (the routing condition).
+        m = self._make_int64_csr_2row()
+        assert m.indices.dtype == cupy.int64
+        sub = m[:, [0]]
+        assert sub.nnz == 1
+        # indptr must show row 0 has the entry, row 1 does not.
+        assert int(sub.indptr[1]) == 1
+        assert int(sub.indptr[2]) == 1
+        assert float(sub.data[0]) == pytest.approx(1.0)
+
+    def test_csr_fancy_col_value_at_large_index(self):
+        # Selecting col _LARGE — previously the histogram kernel silently
+        # truncated _LARGE to its low 32 bits, producing a wrong column match
+        # and returning 0.0 instead of the stored value.
+        m = self._make_int64_csr_2row()
+        sub = m[:, [_LARGE]]
+        assert sub.nnz == 1
+        # Row 1 has the entry at col _LARGE; row 0 does not.
+        assert int(sub.indptr[1]) == 0
+        assert int(sub.indptr[2]) == 1
+        assert float(sub.data[0]) == pytest.approx(2.0)
+
+    def test_csr_fancy_col_multiple_columns(self):
+        # Select three columns spanning small and large index space.
+        # Row 0: col 0→1.0, col _LARGE→2.0; Row 1: col 5→3.0.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, _LARGE, 5], dtype=cupy.int64)
+        indptr = cupy.array([0, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 1))
+        sub = m[:, [0, 5, _LARGE]]
+        # Output shape (2, 3), nnz=3.
+        assert sub.shape == (2, 3)
+        assert sub.nnz == 3
+        # Row 0: two entries (cols 0 and _LARGE → output positions 0 and 2).
+        assert int(sub.indptr[1]) == 2
+        # Row 1: one entry (col 5 → output position 1).
+        assert int(sub.indptr[2]) == 3
+        # Sort-based path always returns has_sorted_indices=True.
+        assert sub.has_sorted_indices
+
+    def test_csr_fancy_col_duplicate_request(self):
+        # Request the same large column twice: row 1 must appear twice in
+        # output.  The histogram approach would have OOM; the sorted approach
+        # handles duplicates via the lo/hi searchsorted range.
+        # Matrix: row 0→col 0, row 1→col _LARGE.
+        m = self._make_int64_csr_2row()
+        sub = m[:, [_LARGE, _LARGE]]
+        # Output shape (2, 2): two copies of col _LARGE.
+        assert sub.shape == (2, 2)
+        # Row 0 has no entry at _LARGE → 0 nnz; row 1 has it twice.
+        assert int(sub.indptr[1]) == 0
+        assert int(sub.indptr[2]) == 2
+        assert sub.nnz == 2
+        assert float(sub.data[0]) == pytest.approx(2.0)
+        assert float(sub.data[1]) == pytest.approx(2.0)
+
+    def test_csr_fancy_col_absent_column(self):
+        # Requesting a column that has no stored entries → empty output.
+        # The sort-based path reaches total_nnz==0 and returns an empty matrix.
+        m = self._make_int64_csr_2row()
+        assert m.indices.dtype == cupy.int64
+        sub = m[:, [_LARGE - 1]]
+        assert sub.nnz == 0
+        assert sub.shape == (2, 1)
+
+    def test_csc_fancy_row_large_index(self):
+        # CSC: minor axis is rows.  m[[_LARGE], :] triggers the same
+        # _minor_index_fancy_sorted path.
+        # CSC shape (_LARGE+1, 2): col 0→row 0 (val=1.0), col 1→row _LARGE.
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, _LARGE], dtype=cupy.int64)  # row indices
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int64)     # 1 nnz per col
+        m = sparse.csc_matrix(
+            (data, indices, indptr), shape=(_LARGE + 1, 2))
+        sub = m[[_LARGE], :]
+        assert sub.shape == (1, 2)
+        assert sub.nnz == 1
+        assert float(sub.data[0]) == pytest.approx(2.0)
+
+    def test_csr_fancy_col_complex_data(self):
+        # Complex128 values flow through the same code path; verify real/imag.
+        data = cupy.array([1.0 + 2.0j], dtype=cupy.complex128)
+        indices = cupy.array([_LARGE], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(2, _LARGE + 1))
+        sub = m[:, [_LARGE]]
+        assert sub.nnz == 1
+        val = complex(sub.data[0])
+        assert val.real == pytest.approx(1.0)
+        assert val.imag == pytest.approx(2.0)
+
+    def test_csr_fancy_col_matches_int32_kernel(self):
+        # Verify sort-based path agrees with the int32 histogram kernel.
+        # Use shape (3, 10) so toarray() is safe.  Build an int64 matrix with
+        # small-value indices by constructing via the bypass pattern
+        # (set .indices/.indptr directly to prevent check_contents downcast).
+        data = cupy.array([1.0, 2.0, 3.0, 4.0])
+        indices32 = cupy.array([0, 3, 5, 9], dtype=cupy.int32)
+        indptr32 = cupy.array([0, 1, 3, 4], dtype=cupy.int32)
+        m32 = sparse.csr_matrix(
+            (data, indices32, indptr32), shape=(3, 10))
+        assert m32.indices.dtype == cupy.int32
+
+        # Force int64 by bypassing the constructor downcast.
+        m64 = sparse.csr_matrix((3, 10), dtype=cupy.float64)
+        m64.data = data.copy()
+        m64.indices = cupy.array([0, 3, 5, 9], dtype=cupy.int64)
+        m64.indptr = cupy.array([0, 1, 3, 4], dtype=cupy.int64)
+        assert m64.indices.dtype == cupy.int64
+
+        cols = [0, 5, 9]
+        sub32 = m32[:, cols]
+        sub64 = m64[:, cols]
+        # Both must produce identical dense output.
+        assert numpy.allclose(sub32.toarray().get(), sub64.toarray().get())
+
+    def test_csr_fancy_col_unsorted_source(self):
+        # Source matrix has unsorted indices within a row.  The sort-based
+        # path must still produce correct results with has_sorted_indices=True
+        # on the output, regardless of the source order.
+        # Row 0: col _LARGE→1.0 then col 0→2.0 (deliberately reversed order).
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([_LARGE, 0], dtype=cupy.int64)
+        indptr = cupy.array([0, 2], dtype=cupy.int64)
+        m = sparse.csr_matrix(
+            (data, indices, indptr), shape=(1, _LARGE + 1))
+        assert not m.has_sorted_indices
+
+        sub = m[:, [0, _LARGE]]
+        assert sub.has_sorted_indices
+        assert sub.nnz == 2
+        # Output col 0 → output index 0 → value 2.0.
+        assert int(sub.indices[0]) == 0
+        assert float(sub.data[0]) == pytest.approx(2.0)
+        # Output col _LARGE → output index 1 → value 1.0.
+        assert int(sub.indices[1]) == 1
+        assert float(sub.data[1]) == pytest.approx(1.0)
+
+    def test_csr_fancy_col_int32_regression(self):
+        # int32 matrix must NOT take the sort-based path; it uses the
+        # histogram kernel and retains int32 indices.  Values must be correct.
+        data = cupy.array([5.0, 7.0])
+        indices = cupy.array([0, 3], dtype=cupy.int32)
+        indptr = cupy.array([0, 1, 2], dtype=cupy.int32)
+        m = sparse.csr_matrix((data, indices, indptr), shape=(2, 5))
+        sub = m[:, [0, 3]]
+        assert sub.indices.dtype == cupy.int32
+        assert sub.nnz == 2
+        expected = cupy.array([[5.0, 0.0], [0.0, 7.0]])
+        testing.assert_array_equal(sub.toarray(), expected)
