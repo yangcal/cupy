@@ -1663,3 +1663,49 @@ class TestInt64ConversionPreservation:
         assert rt.indices.dtype == cupy.int64
         assert rt.indptr.dtype == cupy.int64
         testing.assert_array_almost_equal(rt.toarray(), m.toarray())
+
+    def test_csc_from_csr_has_canonical_format(self):
+        # _cupy_csr2csc_int64 uses object.__new__ and leaves
+        # _has_canonical_format unset.  The property getter must compute it
+        # lazily via kernel rather than raising AttributeError.  The lexsort
+        # in _cupy_csr2csc_int64 produces sorted, duplicate-free output, so
+        # the result should be canonical.
+        m = self._make_csr_int64([1.0, 2.0], [0, 1], [2, 0], (3, 3))
+        csc = m.tocsc()
+        assert csc.has_canonical_format
+        assert csc.has_sorted_indices
+
+    def test_csc_from_csr_copy_preserves_int64(self):
+        # copy() on an object.__new__-constructed CSC must preserve int64
+        # dtype.  The sparse-from-sparse constructor path uses
+        # idx_dtype = indices.dtype (no check_contents), so this works.
+        m = self._make_csr_int64([5.0], [1], [2], (3, 3))
+        csc = m.tocsc()
+        csc_copy = csc.copy()
+        assert csc_copy.indices.dtype == cupy.int64
+        assert csc_copy.indptr.dtype == cupy.int64
+        testing.assert_array_almost_equal(csc_copy.toarray(), csc.toarray())
+
+    def test_csc_tocoo_after_csr2csc_preserves_int64(self):
+        # Converting an int64 CSC (returned by _cupy_csr2csc_int64) back to
+        # COO via csc2coo must preserve int64 row/col dtype.
+        m = self._make_csr_int64([3.0, 7.0], [0, 2], [1, 0], (3, 3))
+        coo = m.tocsc().tocoo()
+        assert coo.row.dtype == cupy.int64
+        assert coo.col.dtype == cupy.int64
+        testing.assert_array_almost_equal(coo.toarray(), m.toarray())
+
+    def test_empty_coo_tocsc_tocsr_chain_preserves_int64(self):
+        # Empty COO with int64 row/col → tocsc (Pattern B) → tocsr
+        # (_cupy_csc2csr_int64 nnz=0, Pattern C).  Both conversions must
+        # preserve int64 index dtype.
+        c = sparse.coo_matrix((3, 3), dtype=cupy.float64)
+        c.row = c.row.astype(cupy.int64)
+        c.col = c.col.astype(cupy.int64)
+        csc = c.tocsc()
+        assert csc.indices.dtype == cupy.int64
+        assert csc.indptr.dtype == cupy.int64
+        csr = csc.tocsr()
+        assert csr.indices.dtype == cupy.int64
+        assert csr.indptr.dtype == cupy.int64
+        assert csr.nnz == 0
