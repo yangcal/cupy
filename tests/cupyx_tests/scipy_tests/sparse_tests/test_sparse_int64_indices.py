@@ -952,32 +952,65 @@ class TestInt64Toarray:
 
 
 class TestInt64SpGEMM:
-    """int64-related fixes to spgemm.
+    """int64 sparse matrix multiplication via the pure-CuPy fallback.
 
-    spgemm previously hardcoded 'i' (int32) for the c_indices allocation.
-    We updated this to numpy.result_type(a.indices, b.indices).
-
-    cuSPARSE spgemm does not support int64 inputs on current releases; calling
-    it with int64 previously gave a cryptic CUSPARSE_STATUS_NOT_SUPPORTED.
-    We added an explicit ValueError guard (checked before format/shape checks)
-    so callers get a clear error message.
+    cuSPARSE spgemm returns CUSPARSE_STATUS_NOT_SUPPORTED for int64 index
+    matrices despite advertising int64 support via the Generic API.
+    The pure-CuPy fallback (product-expansion + sum_duplicates) is invoked
+    automatically when either input has int64 indices.  The int32 cuSPARSE
+    path is completely unchanged.
     """
 
-    def test_spgemm_rejects_int64(self):
-        # The int64 guard fires before the has_canonical_format assert and the
-        # shape-compatibility check, so any int64 CSR matrix suffices here.
-        if not cusparse.check_availability('spgemm'):
-            pytest.skip('spgemm is not available')
+    def test_spgemm_int64_large_col_value(self):
+        # A(2,1) @ B(1, 2^32) = C(2, 2^32) with one nnz at col _LARGE.
         data = cupy.array([1.0])
-        indices = cupy.array([0], dtype=cupy.int64)
-        indptr = cupy.array([0, 1], dtype=cupy.int64)
-        a = sparse.csr_matrix((data, indices, indptr), shape=(1, _LARGE + 1))
-        with pytest.raises(ValueError, match='int64'):
-            cusparse.spgemm(a, a)
+        a_indices = cupy.array([0], dtype=cupy.int64)
+        b_indices = cupy.array([_LARGE], dtype=cupy.int64)
+        a_indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        b_indptr = cupy.array([0, 1], dtype=cupy.int64)
+        a = sparse.csr_matrix(
+            (data, a_indices, a_indptr), shape=(2, 1))
+        b = sparse.csr_matrix(
+            (data, b_indices, b_indptr), shape=(1, _LARGE + 1))
+        c = a @ b
+        assert c.indices.dtype == cupy.int64
+        assert c.nnz == 1
+        assert int(c.indices[0]) == _LARGE
+        assert float(c.data[0]) == pytest.approx(1.0)
 
-    def test_spgemm_int32_result_dtype_preserved(self):
-        # result_type(int32, int32) == int32: int64 work must not
-        # regress the int32 path.
+    def test_spgemm_int64_sum_duplicate_products(self):
+        # Two A entries in the same row → same output col → values summed.
+        a_data = cupy.array([2.0, 3.0])
+        a_indices = cupy.array([0, 1], dtype=cupy.int64)
+        a_indptr = cupy.array([0, 2], dtype=cupy.int64)
+        a = sparse.csr_matrix((a_data, a_indices, a_indptr), shape=(1, 2))
+        b_data = cupy.array([5.0, 7.0])
+        b_indices = cupy.array([_LARGE, _LARGE], dtype=cupy.int64)
+        b_indptr = cupy.array([0, 1, 2], dtype=cupy.int64)
+        b = sparse.csr_matrix(
+            (b_data, b_indices, b_indptr), shape=(2, _LARGE + 1))
+        c = a @ b
+        # c[0, _LARGE] = 2*5 + 3*7 = 31
+        assert c.nnz == 1
+        assert float(c.data[0]) == pytest.approx(31.0)
+
+    def test_spgemm_int64_zero_products(self):
+        # A nonzero at col 0, but B row 0 is empty → product is all-zeros.
+        a_data = cupy.array([1.0])
+        a_indices = cupy.array([0], dtype=cupy.int64)
+        a_indptr = cupy.array([0, 1, 1], dtype=cupy.int64)
+        a = sparse.csr_matrix((a_data, a_indices, a_indptr), shape=(2, 3))
+        b_data = cupy.array([1.0])
+        b_indices = cupy.array([_LARGE], dtype=cupy.int64)
+        b_indptr = cupy.array([0, 0, 1, 1], dtype=cupy.int64)  # row 0 empty
+        b = sparse.csr_matrix(
+            (b_data, b_indices, b_indptr), shape=(3, _LARGE + 1))
+        c = a @ b
+        assert c.nnz == 0
+        assert c.shape == (2, _LARGE + 1)
+
+    def test_spgemm_int32_regression(self):
+        # int32 path must still use cuSPARSE and return int32 indices.
         if not cusparse.check_availability('spgemm'):
             pytest.skip('spgemm is not available')
         a = sparse.csr_matrix(cupy.eye(3, dtype=cupy.float64))

@@ -56,6 +56,20 @@ def _cast_common_type(*xs):
             for x in xs]
 
 
+def _with_indices_dtype(m, dtype):
+    """Return a CSR/CSC matrix with indices and indptr cast to *dtype*.
+
+    Data array is shared (no copy).  Used to promote int32 index arrays to
+    int64 before calling a cuSPARSE function that requires uniform int64.
+    """
+    c = m.__class__(m.shape, dtype=m.dtype)
+    c.data = m.data
+    c.indices = m.indices.astype(dtype)
+    c.indptr = m.indptr.astype(dtype)
+    c.has_canonical_format = m.has_canonical_format
+    return c
+
+
 def _transpose_flag(trans):
     if trans:
         return _cusparse.CUSPARSE_OPERATION_TRANSPOSE
@@ -120,6 +134,12 @@ _available_cusparse_version = {
     # check_availability() returns False until SpGEAM actually ships; update
     # this once the shipping version is confirmed.
     'spgeam': (99000, None),
+    # spGEMM with int64 indices: dev source (12.5.8 internal) supports it when
+    # all matrices share the same index type (all int32 or all int64).  Not yet
+    # in any public release (latest public: 12.7.9 still returns NOT_SUPPORTED
+    # for any int64 descriptor).  Update this when the shipping version is
+    # confirmed.
+    'spgemm_int64': (99000, None),
 }
 
 
@@ -158,6 +178,7 @@ _available_hipsparse_version = {
     'spgemm': (_numpy.inf, None),
     'spsm': (50000000, None),
     'spgeam': (_numpy.inf, None),  # hipSPARSE has no SpGEAM equivalent
+    'spgemm_int64': (_numpy.inf, None),  # hipSPARSE spGEMM is int32-only
 }
 
 
@@ -2362,6 +2383,96 @@ def spsm(a, b, alpha=1.0, lower=True, unit_diag=False, transa=False):
         _cusparse.spSM_destroyDescr(spsm_descr)
 
 
+def _cupy_spgemm_int64(a, b, alpha):
+    """Pure-CuPy sort-merge SpGEMM for int64 indices: C = alpha * A * B.
+
+    TEMPORARY WORKAROUND: cuSPARSE spGEMM returns CUSPARSE_STATUS_NOT_SUPPORTED
+    for int64 index matrices despite advertising int64 support via the Generic API.
+
+    Algorithm: sort-merge SpGEMM (a.k.a. expansion-sort or product-sort).
+      Generate all partial products (i, j, a_ik * b_kj) as a flat COO array,
+      then merge by sorting on (row, col) and summing duplicates.  The
+      expansion uses cumsum + searchsorted in place of cupy.repeat (which
+      rejects CuPy-ndarray repeat-counts — see TEMPORARY WORKAROUND comments).
+
+      This differs from Gustavson's algorithm, which accumulates each output
+      row into a dense temporary workspace of size N (number of columns).
+      Gustavson is O(nnz_C) time and O(N) space per row; for int64 matrices
+      where N can exceed 2^31, a per-row dense workspace would require >16 GB
+      per row and is not feasible on GPU.  The sort-merge approach uses O(P)
+      workspace total, where P = total partial products before merging, which
+      is typically much smaller than N for sparse matrices.
+
+    Complexity:
+      P = sum_k  nnz_col_k(A) * nnz_row_k(B)  (total products before merge)
+      Time:  O(P log P)  dominated by sum_duplicates (lexsort)
+      Space: O(P + nnz_C)
+
+    Index dtype: both inputs are normalised to int64 at entry so all index
+    arithmetic is uniform int64 with no implicit type promotion.
+    """
+    # Normalise index arrays to int64 so the body is free of mixed-dtype
+    # arithmetic.  Share the existing array when it is already int64 (no copy).
+    a_indices = (a.indices if a.indices.dtype == _cupy.int64
+                 else a.indices.astype(_cupy.int64))
+    a_indptr = (a.indptr if a.indptr.dtype == _cupy.int64
+                else a.indptr.astype(_cupy.int64))
+    b_indices = (b.indices if b.indices.dtype == _cupy.int64
+                 else b.indices.astype(_cupy.int64))
+    b_indptr = (b.indptr if b.indptr.dtype == _cupy.int64
+                else b.indptr.astype(_cupy.int64))
+
+    idx_dtype = _cupy.int64
+    m = a.shape[0]
+    n = b.shape[1]
+
+    # Number of B-row-k entries accessible from each nonzero of A at column k.
+    b_row_len = _cupy.diff(b_indptr)              # shape (K,)
+    products_per_a = b_row_len[a_indices]         # shape (a.nnz,)
+    total_products = int(products_per_a.sum())
+
+    if total_products == 0:
+        # Bypass constructor to preserve idx_dtype.
+        c = cupyx.scipy.sparse.csr_matrix((m, n), dtype=a.dtype)
+        c.indices = _cupy.empty(0, idx_dtype)
+        c.indptr = _cupy.zeros(m + 1, idx_dtype)
+        return c
+
+    # Expand: for each of the total_products output entries, which A nonzero
+    # produced it, and what is its offset within the matching B row?
+    # TEMPORARY WORKAROUND: cupy.repeat(src, counts) fails when counts is a
+    # CuPy ndarray.  Use cumsum + searchsorted instead.
+    cum_prod = _cupy.zeros(a.nnz + 1, dtype=_cupy.int64)
+    _cupy.cumsum(products_per_a.astype(_cupy.int64), out=cum_prod[1:])
+    prod_pos = _cupy.arange(total_products, dtype=_cupy.int64)
+    a_src = _cupy.searchsorted(
+        cum_prod[1:], prod_pos, side='right').astype(_cupy.int64)
+    b_offset = prod_pos - cum_prod[a_src]   # offset within the B row
+    del prod_pos, cum_prod                  # free before peak-memory gather
+
+    # Expand A indptr → row index for each A nonzero.
+    # TEMPORARY WORKAROUND: same as above (cupy.repeat limitation).
+    a_rows = _cupy.searchsorted(
+        a_indptr[1:], _cupy.arange(a.nnz, dtype=_cupy.int64),
+        side='right').astype(_cupy.int64)
+
+    # Gather the (output_row, output_col, value) triple for each product.
+    a_col_k = a_indices[a_src]                       # column of A = row of B
+    b_row_start = b_indptr[a_col_k]                  # start pos in B arrays
+    b_col_pos = (b_row_start + b_offset).astype(_cupy.int64)
+    c_cols = b_indices[b_col_pos].astype(idx_dtype)
+    c_rows = a_rows[a_src].astype(idx_dtype)
+    c_vals = a.data[a_src] * b.data[b_col_pos]
+    del a_src, b_offset, b_col_pos, a_rows, a_col_k  # free P-sized temporaries
+    if alpha != 1:
+        c_vals = c_vals * a.dtype.type(alpha)
+
+    # Merge products with the same (row, col) position.
+    coo = cupyx.scipy.sparse.coo_matrix((c_vals, (c_rows, c_cols)), shape=(m, n))
+    coo.sum_duplicates()
+    return coo.tocsr()
+
+
 def spgemm(a, b, alpha=1):
     """Matrix-matrix product for CSR-matrix.
 
@@ -2377,19 +2488,37 @@ def spgemm(a, b, alpha=1):
         cupyx.scipy.sparse.csr_matrix
 
     """
-    if not check_availability('spgemm'):
-        raise RuntimeError('spgemm is not available.')
-
     assert a.ndim == b.ndim == 2
     if not isinstance(a, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(a)))
     if not isinstance(b, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(b)))
+
+    # Handle int64 index matrices BEFORE the availability check so that the
+    # pure-CuPy fallback works on all CUDA versions.
+    #
+    # cuSPARSE spGEMM requires all three matrices (A, B, C) to share the same
+    # index type.  The dev source (12.5.8 internal) supports uniform int64, but
+    # no public release has shipped that support yet (confirmed absent from
+    # 12.7.9).
     if a.indices.dtype == _cupy.int64 or b.indices.dtype == _cupy.int64:
-        raise ValueError(
-            'spgemm does not support int64 indices '
-            '(cuSPARSE spGEMM is int32-only at runtime even via the Generic API). '
-            'A pure-CuPy int64 fallback is planned for future work.')
+        if a.shape[1] != b.shape[0]:
+            raise ValueError('mismatched shape')
+        if check_availability('spgemm_int64'):
+            # Native int64 available: upcast any int32 index arrays to int64
+            # so cuSPARSE receives uniform int64 (required by the API), then
+            # fall through to the regular cuSPARSE path below.
+            if a.indices.dtype != _cupy.int64:
+                a = _with_indices_dtype(a, _cupy.int64)
+            if b.indices.dtype != _cupy.int64:
+                b = _with_indices_dtype(b, _cupy.int64)
+        else:
+            a, b = _cast_common_type(a, b)
+            return _cupy_spgemm_int64(a, b, alpha)
+
+    if not check_availability('spgemm'):
+        raise RuntimeError('spgemm is not available.')
+
     assert a.has_canonical_format
     assert b.has_canonical_format
     if a.shape[1] != b.shape[0]:
