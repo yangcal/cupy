@@ -1526,3 +1526,140 @@ class TestInt64FancyMinorIndex:
         assert sub.nnz == 2
         expected = cupy.array([[5.0, 0.0], [0.0, 7.0]])
         testing.assert_array_equal(sub.toarray(), expected)
+
+
+class TestInt64ConversionPreservation:
+    """Format conversions must preserve explicit int64 index dtype.
+
+    A second class of check_contents=True barriers existed in format-conversion
+    code paths: csr2coo, csc2coo, _cupy_csr2csc_int64, _cupy_csc2csr_int64,
+    _cupy_csrgeam_int64, and empty-matrix early-returns in coo.tocsr/tocsc.
+
+    All tests here use int64 index arrays whose values fit in int32 (the
+    "explicit precision" use case).  Large-value int64 matrices (> INT32_MAX)
+    are covered by sparse_tests/test_02_format_conversion.py.
+    """
+
+    def _make_csr_int64(self, data, row_ind, col_ind, shape):
+        """Build a CSR with int64 indices whose values fit in int32."""
+        d = cupy.array(data, dtype=cupy.float64)
+        r = cupy.array(row_ind, dtype=cupy.int32)
+        c = cupy.array(col_ind, dtype=cupy.int32)
+        m = sparse.csr_matrix((d, (r, c)), shape=shape)
+        m.indices = m.indices.astype(cupy.int64)
+        m.indptr = m.indptr.astype(cupy.int64)
+        return m
+
+    def test_csr_tocoo_small_values_preserves_int64(self):
+        # csr2coo must preserve int64 indices even when values fit in int32.
+        # Before the fix, the tuple-2 COO constructor applied
+        # check_contents=True and silently downcasted to int32.
+        m = self._make_csr_int64([1.0, 2.0], [0, 1], [1, 2], (3, 3))
+        coo = m.tocoo()
+        assert coo.row.dtype == cupy.int64
+        assert coo.col.dtype == cupy.int64
+        testing.assert_array_almost_equal(coo.toarray(), m.toarray())
+
+    def test_csc_tocoo_small_values_preserves_int64(self):
+        # csc2coo must preserve int64 indices even when values fit in int32.
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, 1], dtype=cupy.int32)
+        indptr = cupy.array([0, 1, 2, 2], dtype=cupy.int32)
+        mc = sparse.csc_matrix((data, indices, indptr), shape=(3, 3))
+        mc.indices = mc.indices.astype(cupy.int64)
+        mc.indptr = mc.indptr.astype(cupy.int64)
+        coo = mc.tocoo()
+        assert coo.row.dtype == cupy.int64
+        assert coo.col.dtype == cupy.int64
+
+    def test_coo_tocsr_empty_preserves_int64(self):
+        # Empty COO with int64 row/col → tocsr() must return int64 CSR.
+        # Before the fix, the early-return used csr_matrix(shape) which
+        # ignores self.row.dtype and uses get_index_dtype(maxval=...) → int32.
+        c = sparse.coo_matrix((3, 3), dtype=cupy.float64)
+        c.row = c.row.astype(cupy.int64)
+        c.col = c.col.astype(cupy.int64)
+        csr = c.tocsr()
+        assert csr.indices.dtype == cupy.int64
+        assert csr.indptr.dtype == cupy.int64
+        assert csr.nnz == 0
+
+    def test_coo_tocsc_empty_preserves_int64(self):
+        # Symmetric to test_coo_tocsr_empty_preserves_int64 for CSC.
+        c = sparse.coo_matrix((3, 3), dtype=cupy.float64)
+        c.row = c.row.astype(cupy.int64)
+        c.col = c.col.astype(cupy.int64)
+        csc = c.tocsc()
+        assert csc.indices.dtype == cupy.int64
+        assert csc.indptr.dtype == cupy.int64
+        assert csc.nnz == 0
+
+    def test_csr_sum_duplicates_preserves_int64(self):
+        # sum_duplicates on an int64 CSR must not silently downcast indices.
+        # Before the fix, sum_duplicates called tocoo() → csr2coo returned
+        # int32 COO → coo.asformat('csr') returned int32 CSR.
+        m = self._make_csr_int64([1.0, 2.0], [0, 1], [1, 2], (3, 3))
+        m.has_canonical_format = False
+        m.sum_duplicates()
+        assert m.indices.dtype == cupy.int64
+        assert m.indptr.dtype == cupy.int64
+
+    def test_csr_tocsc_small_values_preserves_int64(self):
+        # _cupy_csr2csc_int64 must return CSC with int64 indices even for
+        # small shapes and small index values (nnz > 0 path).
+        m = self._make_csr_int64([1.0, 2.0, 3.0], [0, 0, 2], [0, 2, 1], (3, 3))
+        csc = m.tocsc()
+        assert csc.indices.dtype == cupy.int64
+        assert csc.indptr.dtype == cupy.int64
+        testing.assert_array_almost_equal(csc.toarray(), m.toarray())
+
+    def test_csr_tocsc_empty_small_shape_preserves_int64(self):
+        # _cupy_csr2csc_int64 nnz=0 path must preserve int64 indices.
+        m = self._make_csr_int64([], [], [], (3, 3))
+        csc = m.tocsc()
+        assert csc.indices.dtype == cupy.int64
+        assert csc.indptr.dtype == cupy.int64
+        assert csc.nnz == 0
+
+    def test_csc_tocsr_empty_small_shape_preserves_int64(self):
+        # _cupy_csc2csr_int64 nnz=0 path must preserve int64 indices.
+        mc = sparse.csc_matrix((3, 3), dtype=cupy.float64)
+        mc.indices = mc.indices.astype(cupy.int64)
+        mc.indptr = mc.indptr.astype(cupy.int64)
+        csr = mc.tocsr()
+        assert csr.indices.dtype == cupy.int64
+        assert csr.indptr.dtype == cupy.int64
+        assert csr.nnz == 0
+
+    def test_csc_tocsr_small_values_preserves_int64(self):
+        # _cupy_csc2csr_int64 must return CSR with int64 indices (nnz > 0).
+        data = cupy.array([1.0, 2.0])
+        indices = cupy.array([0, 2], dtype=cupy.int32)
+        indptr = cupy.array([0, 1, 1, 2], dtype=cupy.int32)
+        mc = sparse.csc_matrix((data, indices, indptr), shape=(3, 3))
+        mc.indices = mc.indices.astype(cupy.int64)
+        mc.indptr = mc.indptr.astype(cupy.int64)
+        csr = mc.tocsr()
+        assert csr.indices.dtype == cupy.int64
+        assert csr.indptr.dtype == cupy.int64
+        testing.assert_array_almost_equal(csr.toarray(), mc.toarray())
+
+    def test_add_int64_small_values_preserves_dtype(self):
+        # csrgeam2 (sparse + sparse) result must have int64 indices when both
+        # inputs are int64.  Before the fix, the intermediate COO was
+        # downcasted to int32 by the tuple-2 constructor.
+        a = self._make_csr_int64([1.0], [0], [1], (3, 3))
+        b = self._make_csr_int64([2.0], [1], [2], (3, 3))
+        c = a + b
+        assert c.indices.dtype == cupy.int64
+        assert c.indptr.dtype == cupy.int64
+        expected = cupy.array([[0., 1., 0.], [0., 0., 2.], [0., 0., 0.]])
+        testing.assert_array_almost_equal(c.toarray(), expected)
+
+    def test_csr_round_trip_preserves_int64(self):
+        # CSR → CSC → CSR round-trip must preserve int64 throughout.
+        m = self._make_csr_int64([5.0, 3.0], [0, 2], [2, 0], (3, 3))
+        rt = m.tocsc().tocsr()
+        assert rt.indices.dtype == cupy.int64
+        assert rt.indptr.dtype == cupy.int64
+        testing.assert_array_almost_equal(rt.toarray(), m.toarray())

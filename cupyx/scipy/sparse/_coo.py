@@ -520,7 +520,11 @@ class coo_matrix(sparse_data._data_matrix):
         from cupyx import cusparse
 
         if self.nnz == 0:
-            return _csc.csc_matrix(self.shape, dtype=self.dtype)
+            A = _csc.csc_matrix(self.shape, dtype=self.dtype)
+            if self.col.dtype != A.indices.dtype:
+                A.indices = A.indices.astype(self.col.dtype)
+                A.indptr = A.indptr.astype(self.col.dtype)
+            return A
         # copy is silently ignored (in line with SciPy) because both
         # sum_duplicates and coosort change the underlying data
         x = self.copy()
@@ -545,7 +549,11 @@ class coo_matrix(sparse_data._data_matrix):
         from cupyx import cusparse
 
         if self.nnz == 0:
-            return _csr.csr_matrix(self.shape, dtype=self.dtype)
+            A = _csr.csr_matrix(self.shape, dtype=self.dtype)
+            if self.row.dtype != A.indices.dtype:
+                A.indices = A.indices.astype(self.row.dtype)
+                A.indptr = A.indptr.astype(self.row.dtype)
+            return A
         # copy is silently ignored (in line with SciPy) because both
         # sum_duplicates and coosort change the underlying data
         x = self.copy()

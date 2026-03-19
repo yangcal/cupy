@@ -580,7 +580,11 @@ def _cupy_csrgeam_int64(a, b, alpha, beta):
     rows = _cupy.concatenate([a_rows, b_rows])
     cols = _cupy.concatenate([a.indices, b.indices])
     data = _cupy.concatenate([a_data, b_data])
-    coo = cupyx.scipy.sparse.coo_matrix((data, (rows, cols)), shape=a.shape)
+    coo = cupyx.scipy.sparse.coo_matrix(a.shape, dtype=a.dtype)
+    coo.data = data
+    coo.row = rows
+    coo.col = cols
+    coo.has_canonical_format = False
     coo.sum_duplicates()
     return coo.tocsr()
 
@@ -1260,9 +1264,15 @@ def csr2coo(x, data, indices):
         _cusparse.xcsr2coo(
             handle, x.indptr.data.ptr, nnz, m, row.data.ptr,
             _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    # data and indices did not need to be copied already
-    return cupyx.scipy.sparse.coo_matrix(
-        (data, (row, indices)), shape=x.shape)
+    # Bypass the tuple-2 constructor (which uses check_contents=True and would
+    # downcast int64 arrays with small values to int32).  Direct attribute
+    # assignment preserves whatever dtype row/indices already carry.
+    A = cupyx.scipy.sparse.coo_matrix(x.shape, dtype=x.dtype)
+    A.data = data
+    A.row = row
+    A.col = indices
+    A.has_canonical_format = False
+    return A
 
 
 def _cupy_csr2csc_int64(x):
@@ -1283,9 +1293,17 @@ def _cupy_csr2csc_int64(x):
     idx_dtype = x.indices.dtype  # int64
 
     if nnz == 0:
-        return cupyx.scipy.sparse.csc_matrix(
-            (_cupy.empty(0, x.dtype), _cupy.empty(0, idx_dtype),
-             _cupy.zeros(n + 1, idx_dtype)), shape=x.shape)
+        # Bypass all constructors: the shape-only constructor allocates an
+        # n+1 element indptr (up to ~17 GB for large n), and the tuple-3
+        # constructor uses check_contents=True which downcasts int64 arrays
+        # with small values to int32.  Direct attribute assignment avoids both.
+        A = object.__new__(cupyx.scipy.sparse.csc_matrix)
+        A.data = _cupy.empty(0, x.dtype)
+        A.indices = _cupy.empty(0, idx_dtype)
+        A.indptr = _cupy.zeros(n + 1, idx_dtype)
+        A._shape = x.shape
+        A._descr = MatDescriptor.create()
+        return A
 
     # Build CSC indptr using unique+scatter to avoid two simultaneous large allocations.
     # (bincount would require both a col_counts array and csc_indptr in memory at once.)
@@ -1307,8 +1325,14 @@ def _cupy_csr2csc_int64(x):
     csc_indices = row[order]
     csc_data = x.data[order]
 
-    return cupyx.scipy.sparse.csc_matrix(
-        (csc_data, csc_indices, csc_indptr), shape=x.shape)
+    # Bypass all constructors — see nnz=0 path comment above.
+    A = object.__new__(cupyx.scipy.sparse.csc_matrix)
+    A.data = csc_data
+    A.indices = csc_indices
+    A.indptr = csc_indptr
+    A._shape = x.shape
+    A._descr = MatDescriptor.create()
+    return A
 
 
 def csr2csc(x):
@@ -1401,9 +1425,14 @@ def csc2coo(x, data, indices):
         _cusparse.xcsr2coo(
             handle, x.indptr.data.ptr, nnz, n, col.data.ptr,
             _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    # data and indices did not need to be copied already
-    return cupyx.scipy.sparse.coo_matrix(
-        (data, (indices, col)), shape=x.shape)
+    # Bypass the tuple-2 constructor (check_contents=True would downcast int64
+    # arrays with small values to int32).  Direct assignment preserves dtype.
+    A = cupyx.scipy.sparse.coo_matrix(x.shape, dtype=x.dtype)
+    A.data = data
+    A.row = indices
+    A.col = col
+    A.has_canonical_format = False
+    return A
 
 
 def _cupy_csc2csr_int64(x):
@@ -1424,9 +1453,17 @@ def _cupy_csc2csr_int64(x):
     idx_dtype = x.indices.dtype  # int64
 
     if nnz == 0:
-        return cupyx.scipy.sparse.csr_matrix(
-            (_cupy.empty(0, x.dtype), _cupy.empty(0, idx_dtype),
-             _cupy.zeros(m + 1, idx_dtype)), shape=x.shape)
+        # Bypass all constructors: the shape-only constructor allocates an
+        # m+1 element indptr (up to ~17 GB for large m), and the tuple-3
+        # constructor uses check_contents=True which downcasts int64 arrays
+        # with small values to int32.  Direct attribute assignment avoids both.
+        A = object.__new__(cupyx.scipy.sparse.csr_matrix)
+        A.data = _cupy.empty(0, x.dtype)
+        A.indices = _cupy.empty(0, idx_dtype)
+        A.indptr = _cupy.zeros(m + 1, idx_dtype)
+        A._shape = x.shape
+        A._descr = MatDescriptor.create()
+        return A
 
     # Build CSR indptr using unique+scatter to avoid two simultaneous large allocations.
     unique_rows, row_counts = _cupy.unique(x.indices, return_counts=True)
@@ -1444,8 +1481,14 @@ def _cupy_csc2csr_int64(x):
     csr_indices = col[order]
     csr_data = x.data[order]
 
-    return cupyx.scipy.sparse.csr_matrix(
-        (csr_data, csr_indices, csr_indptr), shape=x.shape)
+    # Bypass all constructors — see nnz=0 path comment above.
+    A = object.__new__(cupyx.scipy.sparse.csr_matrix)
+    A.data = csr_data
+    A.indices = csr_indices
+    A.indptr = csr_indptr
+    A._shape = x.shape
+    A._descr = MatDescriptor.create()
+    return A
 
 
 def csc2csr(x):
