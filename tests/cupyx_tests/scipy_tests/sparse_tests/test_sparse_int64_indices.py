@@ -112,7 +112,7 @@ class TestInt64FormatConversion:
             (data, indices, indptr), shape=(2, _LARGE + 1))
 
     def _make_int64_coo(self):
-        """2-entry COO: (row=0, col=0, val=1.0), (row=1, col=_LARGE, val=2.0)."""
+        """2-entry COO: (0,0,1.0) and (1,_LARGE,2.0)."""
         data = cupy.array([1.0, 2.0])
         row = cupy.array([0, 1], dtype=cupy.int64)
         col = cupy.array([0, _LARGE], dtype=cupy.int64)
@@ -120,8 +120,9 @@ class TestInt64FormatConversion:
             (data, (row, col)), shape=(2, _LARGE + 1))
 
     def test_csr_tocoo_int64(self):
-        # Earlier in development, xcsr2coo read int64 indptr as int32, producing
-        # silently wrong row indices (e.g. row=[1,0] instead of [0,1]).
+        # Earlier in development, xcsr2coo read int64 indptr
+        # as int32, producing silently wrong row indices
+        # (e.g. row=[1,0] instead of [0,1]).
         coo = self._make_int64_csr().tocoo()
         assert coo.row.dtype == cupy.int64
         assert coo.col.dtype == cupy.int64
@@ -228,8 +229,9 @@ class TestInt64Sort:
         assert float(m.data[1]) == 1.0
 
     def test_coo_sum_duplicates_int64(self):
-        # Previously, the ElementwiseKernel declared 'int32 src_col',
-        # silently truncating int64 col values > INT32_MAX to their low 32 bits.
+        # Previously, the ElementwiseKernel declared
+        # 'int32 src_col', silently truncating int64 col
+        # values > INT32_MAX to their low 32 bits.
         # Two duplicate entries: both at (row=0, col=_LARGE).
         data = cupy.array([2.0, 3.0])
         row = cupy.array([0, 0], dtype=cupy.int64)
@@ -334,8 +336,9 @@ class TestInt64ArithmeticFallback:
         assert float(c.data[1]) == pytest.approx(4.0)
 
     def test_spgeam_int64_fallback(self):
-        # cusparse.spgeam() routes int64 directly to _cupy_csrgeam_int64 when
-        # cusparseSpGEAM is unavailable (absent from all public releases ≤12.7.9).
+        # cusparse.spgeam() routes int64 directly to
+        # _cupy_csrgeam_int64 when cusparseSpGEAM is unavailable
+        # (absent from all public releases <=12.7.9).
         a = self._make_int64_csr(0, value=1.0)
         b = self._make_int64_csr(_LARGE, value=2.0)
         c = cusparse.spgeam(a, b)
@@ -364,7 +367,8 @@ class TestInt64ArithmeticFallback:
 
     def test_add_mixed_dtype_int32_plus_int64_promotes(self):
         # idx_dtype = numpy.result_type(int32, int64) == int64.
-        # The int32 matrix has small column values; the int64 matrix has _LARGE.
+        # The int32 matrix has small column values;
+        # the int64 matrix has _LARGE.
         # The result must use int64 to represent _LARGE.
         data = cupy.array([1.0])
         a = sparse.csr_matrix(
@@ -436,7 +440,8 @@ class TestInt64ScalarIndex:
 
     def test_csr_scalar_index_absent_large_col_returns_zero(self):
         # Absence (structural zero) at a large column must return 0.
-        m = self._make_int64_csr(col=_LARGE - 1)  # stored at _LARGE-1, not _LARGE
+        # stored at _LARGE-1, not _LARGE
+        m = self._make_int64_csr(col=_LARGE - 1)
         result = m[0, _LARGE]
         assert float(result) == pytest.approx(0.0)
 
@@ -612,12 +617,14 @@ class TestInt64Argmax:
         # Previously, int* indices truncated _LARGE, returning wrong col.
         m = self._make_int64_csr()
         result = m.argmax(axis=1)
-        # Row 0: max at col 0.  Row 1: max at col _LARGE.  Row 2: max at col _LARGE//2.
+        # Row 0: max at col 0.  Row 1: max at col _LARGE.
+        # Row 2: max at col _LARGE//2.
         assert int(result[1, 0]) == _LARGE
         assert int(result[0, 0]) == 0
 
     def test_csr_argmin_axis1_large_col(self):
-        # argmin(axis=1) where the minimum is a negative value at a large column.
+        # argmin(axis=1) where the minimum is a negative
+        # value at a large column.
         # Row has two nonzeros: col 1 → 1.0, col _LARGE → -3.0.
         # Implicit zeros at other cols are 0.0; -3.0 is the global min.
         data = cupy.array([1.0, -3.0])
@@ -694,7 +701,8 @@ class TestInt64EliminateZeros:
     """
 
     def test_eliminate_zeros_removes_explicit_zeros(self):
-        # Row 0: [1.0@0, 0.0@_LARGE, 2.0@_LARGE+1]; after: [1.0@0, 2.0@_LARGE+1]
+        # Row 0: [1.0@0, 0.0@_LARGE, 2.0@_LARGE+1];
+        # after: [1.0@0, 2.0@_LARGE+1]
         data = cupy.array([1.0, 0.0, 2.0])
         indices = cupy.array([0, _LARGE, _LARGE + 1], dtype=cupy.int64)
         indptr = cupy.array([0, 3, 3], dtype=cupy.int64)
@@ -901,10 +909,12 @@ class TestInt64MinMaxReduction:
 class TestInt64Toarray:
     """toarray() for int64 matrices.
 
-    _cupy_csr2dense previously had int32 M, N shape parameters; for matrices
-    where shape[1] > INT32_MAX, these caused OverflowError at the Python layer
-    before the kernel was launched (numpy.int32(N) overflows for N > INT32_MAX).
-    Now they use I (idx_dtype.type(N)), matching the index dtype.
+    _cupy_csr2dense previously had int32 M, N shape
+    parameters; for matrices where shape[1] > INT32_MAX,
+    these caused OverflowError at the Python layer before
+    the kernel was launched (numpy.int32(N) overflows for
+    N > INT32_MAX). Now they use I (idx_dtype.type(N)),
+    matching the index dtype.
 
     Practical constraint: a (1, _LARGE+1) dense output requires ~17 GB, so
     these tests use a try/except OOM guard and skip on 16 GB hardware.
@@ -1028,7 +1038,9 @@ class TestInt64SpGEMM:
         b_data = cupy.array([3.0])
         b_indices = cupy.array([_LARGE], dtype=cupy.int64)
         b_indptr = cupy.array([0, 1], dtype=cupy.int64)
-        b = sparse.csr_matrix((b_data, b_indices, b_indptr), shape=(1, _LARGE + 1))
+        b = sparse.csr_matrix(
+            (b_data, b_indices, b_indptr),
+            shape=(1, _LARGE + 1))
         c = cusparse.spgemm(a, b, alpha=5.0)
         # c[0, _LARGE] = 5.0 * 2.0 * 3.0 = 30.0
         assert c.nnz == 1
@@ -1046,7 +1058,9 @@ class TestInt64SpGEMM:
         b_data = cupy.array([6.0])
         b_indices = cupy.array([_LARGE], dtype=cupy.int64)
         b_indptr = cupy.array([0, 1], dtype=cupy.int64)
-        b = sparse.csr_matrix((b_data, b_indices, b_indptr), shape=(1, _LARGE + 1))
+        b = sparse.csr_matrix(
+            (b_data, b_indices, b_indptr),
+            shape=(1, _LARGE + 1))
         c = a @ b
         assert c.nnz == 1
         assert c.indices.dtype == cupy.int64
@@ -1061,7 +1075,9 @@ class TestInt64SpGEMM:
         b_data = cupy.array([3.0], dtype=cupy.float32)
         b_indices = cupy.array([_LARGE], dtype=cupy.int64)
         b_indptr = cupy.array([0, 1], dtype=cupy.int64)
-        b = sparse.csr_matrix((b_data, b_indices, b_indptr), shape=(1, _LARGE + 1))
+        b = sparse.csr_matrix(
+            (b_data, b_indices, b_indptr),
+            shape=(1, _LARGE + 1))
         c = a @ b
         assert c.dtype == cupy.float32
         assert c.nnz == 1
@@ -1078,7 +1094,9 @@ class TestInt64SpGEMM:
         b_data = cupy.array([10.0])
         b_indices = cupy.array([_LARGE], dtype=cupy.int64)
         b_indptr = cupy.array([0, 1], dtype=cupy.int64)
-        b = sparse.csr_matrix((b_data, b_indices, b_indptr), shape=(1, _LARGE + 1))
+        b = sparse.csr_matrix(
+            (b_data, b_indices, b_indptr),
+            shape=(1, _LARGE + 1))
         c = a @ b
         assert c.shape == (3, _LARGE + 1)
         assert c.nnz == 3

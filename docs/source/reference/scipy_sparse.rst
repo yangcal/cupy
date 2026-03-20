@@ -8,6 +8,28 @@ Sparse matrices (:mod:`cupyx.scipy.sparse`)
 CuPy supports sparse matrices using `cuSPARSE <https://developer.nvidia.com/cusparse>`_.
 These matrices have the same interfaces of `SciPy's sparse matrices <https://docs.scipy.org/doc/scipy/reference/sparse.html>`_.
 
+Index dtype (int32 / int64)
+---------------------------
+
+Like SciPy, CuPy sparse matrices automatically choose the index
+dtype (``indices``, ``indptr``, ``row``, ``col``) based on the
+matrix dimensions and index values:
+
+* **int32** when all index values and dimensions fit in a 32-bit
+  integer (the common case).
+* **int64** when any dimension or index value exceeds
+  ``2**31 - 1``.
+
+The dtype is chosen by :func:`~cupyx.scipy.sparse._sputils.get_index_dtype`
+(mirroring SciPy's logic) and is preserved through format
+conversions, arithmetic, and indexing.
+
+Operations that delegate to cuSPARSE use the native Generic API
+(``SpMatDescr``) for int64 where available, with pure-CuPy
+fallbacks for legacy int32-only APIs (e.g., ``csr2cscEx2``,
+``xcoo2csr``, ``csrgeam2``).  Some operations (``spsolve``,
+``csrilu02``) do not yet support int64 and raise ``ValueError``.
+
 Conversion to/from SciPy sparse matrices
 ----------------------------------------
 

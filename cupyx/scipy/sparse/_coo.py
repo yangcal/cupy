@@ -96,7 +96,8 @@ class coo_matrix(sparse_data._data_matrix):
 
         elif _scipy_available and scipy.sparse.issparse(arg1):
             # Convert scipy.sparse to cupyx.scipy.sparse.
-            # Preserve scipy's index dtype (scipy uses get_index_dtype internally).
+            # Preserve scipy's index dtype (scipy uses
+            # get_index_dtype internally).
             x = arg1.tocoo()
             data = cupy.array(x.data)
             row = cupy.array(x.row, dtype=x.row.dtype)
@@ -423,9 +424,10 @@ class coo_matrix(sparse_data._data_matrix):
             col = src_col
         else:
             # TODO(leofang): move the kernels outside this method
-            # Use the actual index dtype (int64 when indices are large).
-            # ElementwiseKernel silently casts to the declared type — using
-            # 'int32' here would silently truncate int64 index values > INT32_MAX.
+            # Use the actual index dtype (int64 when indices are
+            # large).  ElementwiseKernel silently casts to the
+            # declared type -- using 'int32' here would silently
+            # truncate int64 index values > INT32_MAX.
             idx_dtype = self.row.dtype
             index = cupy.cumsum(diff, dtype=idx_dtype)
             size = int(index[-1]) + 1

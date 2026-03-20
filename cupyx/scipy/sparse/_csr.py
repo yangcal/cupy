@@ -272,7 +272,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
         return y
 
     def eliminate_zeros(self):
-        """Removes zero entories in place."""
+        """Removes zero entries in place."""
         from cupyx import cusparse
 
         if self.indices.dtype == cupy.int64:
@@ -283,10 +283,9 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 return
             new_data = self.data[mask]
             new_indices = self.indices[mask]
-            new_nnz = int(mask.sum())
             nrows = self.shape[0]
             idx_dtype = self.indptr.dtype
-            if new_nnz == 0:
+            if len(new_data) == 0:
                 self.data = new_data
                 self.indices = new_indices
                 self.indptr = cupy.zeros(nrows + 1, dtype=idx_dtype)
@@ -657,9 +656,10 @@ def multiply_by_dense(sp, dn):
     # out = sp * dn
     idx_dtype = sp.indptr.dtype
     it = idx_dtype.type
-    cupy_multiply_by_dense()(sp.data, sp.indptr, sp.indices, it(sp_m), it(sp_n),
-                             dn, it(dn_m), it(dn_n), indptr, it(m), it(n),
-                             data, indices)
+    cupy_multiply_by_dense()(
+        sp.data, sp.indptr, sp.indices, it(sp_m), it(sp_n),
+        dn, it(dn_m), it(dn_n), indptr, it(m), it(n),
+        data, indices)
 
     return csr_matrix((data, indices, indptr), shape=(m, n))
 
@@ -680,7 +680,8 @@ __device__ inline I get_row_id(I i, I min, I max, const I *indptr) {
     }
     return row;
 }
-// Helper: atomicAdd for I=int or I=long long (CUDA has no signed-int64 atomicAdd).
+// Helper: atomicAdd for I=int or I=long long
+// (CUDA has no signed-int64 atomicAdd).
 template<typename I>
 __device__ inline void _atomic_add_one(I* addr) {
     atomicAdd(addr, (I)1);

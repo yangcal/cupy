@@ -67,6 +67,7 @@ def _with_indices_dtype(m, dtype):
     c.indices = m.indices.astype(dtype)
     c.indptr = m.indptr.astype(dtype)
     c.has_canonical_format = m.has_canonical_format
+    c.has_sorted_indices = m.has_sorted_indices
     return c
 
 
@@ -550,11 +551,10 @@ def csrgeam(a, b, alpha=1, beta=1):
 
 
 def _cupy_csrgeam_int64(a, b, alpha, beta):
-    """Pure-CuPy CSR matrix addition for int64 indices: C = alpha*A + beta*B.
+    """Pure-CuPy CSR addition for int64: C = alpha*A + beta*B.
 
-    TEMPORARY WORKAROUND: cusparseSpGEAM is not yet in public CUDA releases.
-    Uses searchsorted (indptr expansion) + COO concatenation + sum_duplicates.
-    This is O(nnz log nnz) but correct and GPU-accelerated.
+    SpGEAM is not yet in public CUDA releases.  Uses COO
+    concatenation + sum_duplicates.  O(nnz log nnz).
     """
     idx_dtype = _numpy.result_type(a.indices.dtype, b.indices.dtype)
     # Use dtype.type() to get a numpy scalar (not a 0-d array) so that CuPy's
@@ -615,8 +615,8 @@ def csrgeam2(a, b, alpha=1, beta=1):
     if a.indices.dtype == _cupy.int64 or b.indices.dtype == _cupy.int64:
         if check_availability('spgeam'):
             return spgeam(a, b, alpha, beta)
-        # Pure-CuPy fallback (works on all CUDA versions supporting CuPy):
-        # TEMPORARY WORKAROUND until cusparseSpGEAM is in a public CUDA release.
+        # Pure-CuPy fallback (works on all CUDA versions):
+        # WORKAROUND until cusparseSpGEAM ships in a public release.
         a, b = _cast_common_type(a, b)
         return _cupy_csrgeam_int64(a, b, alpha, beta)
 
@@ -1022,11 +1022,10 @@ def csrsort(x):
     m, n = x.shape
 
     if x.indices.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcsrsort is int32-only.
-        # Expand indptr → row array via searchsorted
-        # (cupy.repeat(arange, diff(indptr)) fails for CuPy ndarray repeats).
+        # xcsrsort is int32-only; use lexsort fallback.
         nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        row = _cupy.searchsorted(x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
+        row = _cupy.searchsorted(
+            x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
         order = _cupy.lexsort(_cupy.stack([x.indices, row]))
         x.indices[:] = x.indices[order]
         x.data[:] = x.data[order]
@@ -1071,11 +1070,10 @@ def cscsort(x):
     m, n = x.shape
 
     if x.indices.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcscsort is int32-only.
-        # Expand indptr → col array via searchsorted
-        # (cupy.repeat(arange, diff(indptr)) fails for CuPy ndarray repeats).
+        # xcscsort is int32-only; use lexsort fallback.
         nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        col = _cupy.searchsorted(x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
+        col = _cupy.searchsorted(
+            x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
         order = _cupy.lexsort(_cupy.stack([x.indices, col]))
         x.indices[:] = x.indices[order]
         x.data[:] = x.data[order]
@@ -1121,8 +1119,7 @@ def coosort(x, sort_by='r'):
     m, n = x.shape
 
     if x.row.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcoosort is int32-only.
-        # Use lexsort: last key is primary sort key.
+        # xcoosort is int32-only; use lexsort fallback.
         if sort_by == 'r':
             # Sort by (row, col): primary=row, secondary=col
             order = _cupy.lexsort(_cupy.stack([x.col, x.row]))
@@ -1180,12 +1177,10 @@ def coo2csr(x):
     if nnz == 0:
         indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
     elif idx_dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcoo2csr is int32-only.
-        # CUDA lacks atomicAdd(long long*,...), so reinterpret indptr[1:] as uint64.
-        # Two's-complement addition is bit-identical for non-negative values, and
-        # indptr counts are bounded by nnz which is far below 2^63.
+        # xcoo2csr is int32-only; use add.at(view(uint64)) fallback.
         indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
-        _cupy.add.at(indptr[1:].view(_cupy.uint64), x.row, _cupy.uint64(1))
+        _cupy.add.at(
+            indptr[1:].view(_cupy.uint64), x.row, _cupy.uint64(1))
         _cupy.cumsum(indptr, out=indptr)
     else:
         handle = _device.get_cusparse_handle()
@@ -1193,9 +1188,7 @@ def coo2csr(x):
         _cusparse.xcoo2csr(
             handle, x.row.data.ptr, nnz, m,
             indptr.data.ptr, _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    # Bypass the tuple-3 constructor's check_contents=True downcast.
-    # x.col (column indices) may be int64; creating via shape-only
-    # constructor and overwriting preserves the dtype.
+    # Bypass check_contents=True downcast; preserve int64 dtype.
     A = cupyx.scipy.sparse.csr_matrix(x.shape, dtype=x.dtype)
     A.data = x.data
     A.indices = x.col
@@ -1210,12 +1203,10 @@ def coo2csc(x):
     if nnz == 0:
         indptr = _cupy.zeros(n + 1, dtype=idx_dtype)
     elif idx_dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcoo2csr (used for cols) is int32-only.
-        # CUDA lacks atomicAdd(long long*,...), so reinterpret indptr[1:] as uint64.
-        # Two's-complement addition is bit-identical for non-negative values, and
-        # indptr counts are bounded by nnz which is far below 2^63.
+        # xcoo2csr is int32-only; use add.at(view(uint64)) fallback.
         indptr = _cupy.zeros(n + 1, dtype=idx_dtype)
-        _cupy.add.at(indptr[1:].view(_cupy.uint64), x.col, _cupy.uint64(1))
+        _cupy.add.at(
+            indptr[1:].view(_cupy.uint64), x.col, _cupy.uint64(1))
         _cupy.cumsum(indptr, out=indptr)
     else:
         handle = _device.get_cusparse_handle()
@@ -1223,9 +1214,7 @@ def coo2csc(x):
         _cusparse.xcoo2csr(
             handle, x.col.data.ptr, nnz, n,
             indptr.data.ptr, _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    # Bypass the tuple-3 constructor's check_contents=True downcast.
-    # x.row (row indices) may be int64; creating via shape-only
-    # constructor and overwriting preserves the dtype.
+    # Bypass check_contents=True downcast; preserve int64 dtype.
     A = cupyx.scipy.sparse.csc_matrix(x.shape, dtype=x.dtype)
     A.data = x.data
     A.indices = x.row
@@ -1250,12 +1239,11 @@ def csr2coo(x, data, indices):
     idx_dtype = x.indptr.dtype
 
     if idx_dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcsr2coo reads indptr as int32 (silent corruption).
-        # Use searchsorted to expand indptr → row array.
-        # cupy.repeat(arange, diff(indptr)) fails for CuPy ndarray repeats.
-        # No cuSPARSE needed, so availability guard is skipped for int64.
+        # xcsr2coo is int32-only; use searchsorted fallback.
         nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        row = _cupy.searchsorted(x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
+        row = _cupy.searchsorted(
+            x.indptr[1:], nnz_range,
+            side='right').astype(_cupy.int64)
     else:
         if not check_availability('csr2coo'):
             raise RuntimeError('csr2coo is not available.')
@@ -1264,9 +1252,7 @@ def csr2coo(x, data, indices):
         _cusparse.xcsr2coo(
             handle, x.indptr.data.ptr, nnz, m, row.data.ptr,
             _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    # Bypass the tuple-2 constructor (which uses check_contents=True and would
-    # downcast int64 arrays with small values to int32).  Direct attribute
-    # assignment preserves whatever dtype row/indices already carry.
+    # Bypass check_contents=True downcast; preserve int64 dtype.
     A = cupyx.scipy.sparse.coo_matrix(x.shape, dtype=x.dtype)
     A.data = data
     A.row = row
@@ -1278,25 +1264,18 @@ def csr2coo(x, data, indices):
 def _cupy_csr2csc_int64(x):
     """Pure-CuPy CSR→CSC for int64 indices.
 
-    TEMPORARY WORKAROUND: cusparseCsr2cscEx2 uses const int* (int32-only at the
-    CUDA API level).  No Generic API replacement exists as of CUDA 12.x.
-
-    Memory design: uses cupy.unique (nnz-sized output) + scatter-assign rather
-    than bincount (which would require TWO large indptr-sized allocations
-    simultaneously).  Only one large (n+1)-element allocation is needed.
-
-    Performance: O(nnz log nnz) due to lexsort — still GPU-accelerated.
-    Long-term: request a Generic API CSR↔CSC function from the cuSPARSE team.
+    csr2cscEx2 is int32-only.  Uses add.at(view(uint64)) for indptr
+    and lexsort for the transpose.  O(nnz log nnz) time.
     """
-    m, n = int(x.shape[0]), int(x.shape[1])
+    n = int(x.shape[1])
     nnz = x.nnz
     idx_dtype = x.indices.dtype  # int64
 
     if nnz == 0:
-        # Bypass all constructors: the shape-only constructor allocates an
-        # n+1 element indptr (up to ~17 GB for large n), and the tuple-3
-        # constructor uses check_contents=True which downcasts int64 arrays
-        # with small values to int32.  Direct attribute assignment avoids both.
+        # object.__new__ bypasses __init__: must set data, indices,
+        # indptr, _shape, _descr, has_sorted_indices manually.
+        # Needed because shape-only constructor OOMs for large n,
+        # and tuple-3 constructor downcasts int64 via check_contents.
         A = object.__new__(cupyx.scipy.sparse.csc_matrix)
         A.data = _cupy.empty(0, x.dtype)
         A.indices = _cupy.empty(0, idx_dtype)
@@ -1306,17 +1285,17 @@ def _cupy_csr2csc_int64(x):
         A.has_sorted_indices = True
         return A
 
-    # Build CSC indptr via uint64 reinterpret: CUDA lacks atomicAdd(long long*,...),
-    # but two's-complement addition is bit-identical for non-negative values, and
-    # indptr counts are bounded by nnz which is far below 2^63.
+    # Build CSC indptr via add.at(view(uint64)).
     csc_indptr = _cupy.zeros(n + 1, dtype=idx_dtype)
     _cupy.add.at(csc_indptr[1:].view(_cupy.uint64), x.indices, _cupy.uint64(1))
     _cupy.cumsum(csc_indptr, out=csc_indptr)
 
     # Build row array from CSR indptr using searchsorted.
-    # cupy.repeat(arange, diff(indptr)) fails when diff(indptr) is a CuPy ndarray.
+    # cupy.repeat(arange, diff(indptr)) fails when diff(indptr)
+    # is a CuPy ndarray.
     nnz_range = _cupy.arange(nnz, dtype=idx_dtype)
-    row = _cupy.searchsorted(x.indptr[1:], nnz_range, side='right').astype(idx_dtype)
+    row = _cupy.searchsorted(
+        x.indptr[1:], nnz_range, side='right').astype(idx_dtype)
 
     # Sort by (col, row) to get CSC column order.
     order = _cupy.lexsort(_cupy.stack([row, x.indices]))
@@ -1341,7 +1320,7 @@ def csr2csc(x):
         raise RuntimeError('csr2csc is not available.')
 
     if x.indices.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: csr2csc uses const int* (int32-only).
+        # csr2csc is int32-only.
         return _cupy_csr2csc_int64(x)
 
     handle = _device.get_cusparse_handle()
@@ -1369,7 +1348,7 @@ def csr2cscEx2(x):
         raise RuntimeError('csr2cscEx2 is not available.')
 
     if x.indices.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: csr2cscEx2 uses const int* (int32-only).
+        # csr2cscEx2 is int32-only.
         return _cupy_csr2csc_int64(x)
 
     handle = _device.get_cusparse_handle()
@@ -1415,19 +1394,18 @@ def csc2coo(x, data, indices):
     idx_dtype = x.indptr.dtype
 
     if idx_dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: xcsr2coo reads indptr as int32 (silent corruption).
-        # Use searchsorted to expand indptr → col array.
-        # cupy.repeat(arange, diff(indptr)) fails for CuPy ndarray repeats.
+        # xcsr2coo is int32-only; use searchsorted fallback.
         nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        col = _cupy.searchsorted(x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
+        col = _cupy.searchsorted(
+            x.indptr[1:], nnz_range,
+            side='right').astype(_cupy.int64)
     else:
         handle = _device.get_cusparse_handle()
         col = _cupy.empty(nnz, idx_dtype)
         _cusparse.xcsr2coo(
             handle, x.indptr.data.ptr, nnz, n, col.data.ptr,
             _cusparse.CUSPARSE_INDEX_BASE_ZERO)
-    # Bypass the tuple-2 constructor (check_contents=True would downcast int64
-    # arrays with small values to int32).  Direct assignment preserves dtype.
+    # Bypass check_contents=True downcast; preserve int64 dtype.
     A = cupyx.scipy.sparse.coo_matrix(x.shape, dtype=x.dtype)
     A.data = data
     A.row = indices
@@ -1439,25 +1417,16 @@ def csc2coo(x, data, indices):
 def _cupy_csc2csr_int64(x):
     """Pure-CuPy CSC→CSR for int64 indices.
 
-    TEMPORARY WORKAROUND: cusparseCsr2cscEx2 (used for CSC→CSR transposition)
-    uses const int* (int32-only at the CUDA API level).
-
-    CSC has indptr=col_ptrs (n+1 elems), indices=row_indices.
-    CSR has indptr=row_ptrs (m+1 elems), indices=col_indices.
-    This is the same problem as CSR→CSC with rows and columns swapped.
-
-    Memory design: uses cupy.unique + scatter-assign (same as _cupy_csr2csc_int64)
-    to avoid two simultaneous large allocations.
+    csr2cscEx2 is int32-only.  Mirror of _cupy_csr2csc_int64
+    with rows and columns swapped.  O(nnz log nnz) time.
     """
-    m, n = int(x.shape[0]), int(x.shape[1])
+    m = int(x.shape[0])
     nnz = x.nnz
     idx_dtype = x.indices.dtype  # int64
 
     if nnz == 0:
-        # Bypass all constructors: the shape-only constructor allocates an
-        # m+1 element indptr (up to ~17 GB for large m), and the tuple-3
-        # constructor uses check_contents=True which downcasts int64 arrays
-        # with small values to int32.  Direct attribute assignment avoids both.
+        # object.__new__ avoids shape-only constructor OOM
+        # and tuple-3 constructor check_contents=True downcast.
         A = object.__new__(cupyx.scipy.sparse.csr_matrix)
         A.data = _cupy.empty(0, x.dtype)
         A.indices = _cupy.empty(0, idx_dtype)
@@ -1467,16 +1436,15 @@ def _cupy_csc2csr_int64(x):
         A.has_sorted_indices = True
         return A
 
-    # Build CSR indptr via uint64 reinterpret: CUDA lacks atomicAdd(long long*,...),
-    # but two's-complement addition is bit-identical for non-negative values, and
-    # indptr counts are bounded by nnz which is far below 2^63.
+    # Build CSR indptr via add.at(view(uint64)).
     csr_indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
     _cupy.add.at(csr_indptr[1:].view(_cupy.uint64), x.indices, _cupy.uint64(1))
     _cupy.cumsum(csr_indptr, out=csr_indptr)
 
     # Build col array from CSC indptr using searchsorted.
     nnz_range = _cupy.arange(nnz, dtype=idx_dtype)
-    col = _cupy.searchsorted(x.indptr[1:], nnz_range, side='right').astype(idx_dtype)
+    col = _cupy.searchsorted(
+        x.indptr[1:], nnz_range, side='right').astype(idx_dtype)
 
     # Sort by (row, col) to get CSR row order.
     order = _cupy.lexsort(_cupy.stack([col, x.indices]))
@@ -1501,7 +1469,7 @@ def csc2csr(x):
         raise RuntimeError('csr2csc is not available.')
 
     if x.indices.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: csc2csr uses const int* (int32-only).
+        # csc2csr is int32-only.
         return _cupy_csc2csr_int64(x)
 
     handle = _device.get_cusparse_handle()
@@ -1529,7 +1497,7 @@ def csc2csrEx2(x):
         raise RuntimeError('csc2csrEx2 is not available.')
 
     if x.indices.dtype == _cupy.int64:
-        # TEMPORARY WORKAROUND: csc2csrEx2 uses const int* (int32-only).
+        # csc2csrEx2 is int32-only.
         return _cupy_csc2csr_int64(x)
 
     handle = _device.get_cusparse_handle()
@@ -2432,35 +2400,13 @@ def spsm(a, b, alpha=1.0, lower=True, unit_diag=False, transa=False):
 
 
 def _cupy_spgemm_int64(a, b, alpha):
-    """Pure-CuPy sort-merge SpGEMM for int64 indices: C = alpha * A * B.
+    """Pure-CuPy sort-merge SpGEMM for int64: C = alpha * A * B.
 
-    TEMPORARY WORKAROUND: cuSPARSE spGEMM returns CUSPARSE_STATUS_NOT_SUPPORTED
-    for int64 index matrices despite advertising int64 support via the Generic API.
-
-    Algorithm: sort-merge SpGEMM (a.k.a. expansion-sort or product-sort).
-      Generate all partial products (i, j, a_ik * b_kj) as a flat COO array,
-      then merge by sorting on (row, col) and summing duplicates.  The
-      expansion uses cumsum + searchsorted in place of cupy.repeat (which
-      rejects CuPy-ndarray repeat-counts — see TEMPORARY WORKAROUND comments).
-
-      This differs from Gustavson's algorithm, which accumulates each output
-      row into a dense temporary workspace of size N (number of columns).
-      Gustavson is O(nnz_C) time and O(N) space per row; for int64 matrices
-      where N can exceed 2^31, a per-row dense workspace would require >16 GB
-      per row and is not feasible on GPU.  The sort-merge approach uses O(P)
-      workspace total, where P = total partial products before merging, which
-      is typically much smaller than N for sparse matrices.
-
-    Complexity:
-      P = sum_k  nnz_col_k(A) * nnz_row_k(B)  (total products before merge)
-      Time:  O(P log P)  dominated by sum_duplicates (lexsort)
-      Space: O(P + nnz_C)
-
-    Index dtype: both inputs are normalised to int64 at entry so all index
-    arithmetic is uniform int64 with no implicit type promotion.
+    Used on CUDA < 13.0 where cuSPARSE spGEMM lacks int64.
+    Expands all (i,j,a*b) products into COO, then sum_duplicates.
+    O(P log P) time, O(P + nnz_C) space, where P = total products.
     """
-    # Normalise index arrays to int64 so the body is free of mixed-dtype
-    # arithmetic.  Share the existing array when it is already int64 (no copy).
+    # Normalise to int64 (no copy if already int64).
     a_indices = (a.indices if a.indices.dtype == _cupy.int64
                  else a.indices.astype(_cupy.int64))
     a_indptr = (a.indptr if a.indptr.dtype == _cupy.int64
@@ -2486,10 +2432,8 @@ def _cupy_spgemm_int64(a, b, alpha):
         c.indptr = _cupy.zeros(m + 1, idx_dtype)
         return c
 
-    # Expand: for each of the total_products output entries, which A nonzero
-    # produced it, and what is its offset within the matching B row?
-    # TEMPORARY WORKAROUND: cupy.repeat(src, counts) fails when counts is a
-    # CuPy ndarray.  Use cumsum + searchsorted instead.
+    # Expand products via cumsum + searchsorted (cupy.repeat
+    # doesn't accept CuPy ndarray counts).
     cum_prod = _cupy.zeros(a.nnz + 1, dtype=_cupy.int64)
     _cupy.cumsum(products_per_a.astype(_cupy.int64), out=cum_prod[1:])
     prod_pos = _cupy.arange(total_products, dtype=_cupy.int64)
@@ -2499,7 +2443,6 @@ def _cupy_spgemm_int64(a, b, alpha):
     del prod_pos, cum_prod                  # free before peak-memory gather
 
     # Expand A indptr → row index for each A nonzero.
-    # TEMPORARY WORKAROUND: same as above (cupy.repeat limitation).
     a_rows = _cupy.searchsorted(
         a_indptr[1:], _cupy.arange(a.nnz, dtype=_cupy.int64),
         side='right').astype(_cupy.int64)
@@ -2516,7 +2459,8 @@ def _cupy_spgemm_int64(a, b, alpha):
         c_vals = c_vals * a.dtype.type(alpha)
 
     # Merge products with the same (row, col) position.
-    coo = cupyx.scipy.sparse.coo_matrix((c_vals, (c_rows, c_cols)), shape=(m, n))
+    coo = cupyx.scipy.sparse.coo_matrix(
+        (c_vals, (c_rows, c_cols)), shape=(m, n))
     coo.sum_duplicates()
     return coo.tocsr()
 

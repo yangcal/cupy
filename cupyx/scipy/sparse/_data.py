@@ -59,6 +59,14 @@ class _data_matrix(_base.spmatrix):
 
     conj.__doc__ = _base.spmatrix.conj.__doc__
 
+    @property
+    def real(self):
+        return self._with_data(self.data.real)
+
+    @property
+    def imag(self):
+        return self._with_data(self.data.imag)
+
     def copy(self):
         return self._with_data(self.data.copy(), copy=True)
 
@@ -68,7 +76,7 @@ class _data_matrix(_base.spmatrix):
         """Returns number of non-zero entries.
 
         .. note::
-           This method counts the actual number of non-zero entories, which
+           This method counts the actual number of non-zero entries, which
            does not include explicit zero entries.
            Instead ``nnz`` returns the number of entries including explicit
            zeros.
