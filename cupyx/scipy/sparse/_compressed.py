@@ -747,37 +747,22 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         out_minor = sort_order[lo[out_src] + offset]   # ∈ [0, n_idx), int64
         out_data = self.data[out_src]
 
-        # Expand indptr → major-axis index for each source nnz entry.
-        # cupy.repeat does not accept CuPy ndarray repeats, so use
-        # searchsorted as a workaround.
-        nnz_range = cupy.arange(self.nnz, dtype=idx_dtype)
-        major_of_each = cupy.searchsorted(
-            self.indptr[1:], nnz_range, side='right').astype(idx_dtype)
-        out_major = major_of_each[out_src]              # ∈ [0, M), int64
+        # Expand indptr → major-axis index for each source nnz.
+        from cupyx import cusparse as _cusparse_mod
+        major_of_each = _cusparse_mod._indptr_to_coo(
+            self.indptr, self.nnz)
+        out_major = major_of_each[out_src]
 
-        # --------------------------------------------------------- #
-        # Step 5: sort output by (major, minor) for canonical     #
-        # (sorted) indices within each major group.               #
-        # --------------------------------------------------------- #
+        # Sort output by (major, minor) for canonical order.
         sort_key = cupy.lexsort(cupy.stack([out_minor, out_major]))
         out_major = out_major[sort_key]
         out_minor = out_minor[sort_key]
         out_data = out_data[sort_key]
 
-        # --------------------------------------------------------- #
-        # Step 6: build output indptr via add.at + cumsum.        #
-        # For int64 indptr, CUDA lacks atomicAdd(long long*,...); #
-        # reinterpret as uint64 (bit-identical for non-negative   #
-        # counts bounded by nnz).                                 #
-        # --------------------------------------------------------- #
+        # Build output indptr.
         out_idx_dtype = _sputils.get_index_dtype(maxval=max(M, n_idx))
-        out_indptr = cupy.zeros(M + 1, dtype=out_idx_dtype)
-        if out_idx_dtype == cupy.int64:
-            cupy.add.at(out_indptr[1:].view(cupy.uint64), out_major,
-                        cupy.uint64(1))
-        else:
-            cupy.add.at(out_indptr[1:], out_major, 1)
-        cupy.cumsum(out_indptr, out=out_indptr)
+        out_indptr = _cusparse_mod._build_indptr(
+            out_major, M, out_idx_dtype)
 
         # --------------------------------------------------------- #
         # Step 7: build output matrix.                            #

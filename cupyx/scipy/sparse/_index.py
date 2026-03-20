@@ -140,11 +140,10 @@ def _csr_row_index(Ax, Aj, Ap, rows):
 
 
 def _csr_indptr_to_coo_rows(nnz, Bp):
-    # Int64 path: xcsr2coo only supports int32; use pure-CuPy searchsorted.
+    # xcsr2coo only supports int32.
     if Bp.dtype == cupy.int64:
-        nnz_range = cupy.arange(nnz, dtype=cupy.int64)
-        return cupy.searchsorted(Bp[1:], nnz_range, side='right').astype(
-            cupy.int64)
+        from cupyx.cusparse import _indptr_to_coo
+        return _indptr_to_coo(Bp, nnz)
 
     from cupy_backends.cuda.libs import cusparse
 

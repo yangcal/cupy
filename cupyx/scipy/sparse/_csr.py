@@ -290,20 +290,11 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 self.indices = new_indices
                 self.indptr = cupy.zeros(nrows + 1, dtype=idx_dtype)
                 return
-            # Expand indptr → per-nnz row assignment via searchsorted.
-            # cupy.repeat(arange, diff(indptr)) fails for CuPy ndarray repeats.
-            nnz_range = cupy.arange(self.nnz, dtype=idx_dtype)
-            row_of_each = cupy.searchsorted(
-                self.indptr[1:], nnz_range, side='right').astype(idx_dtype)
+            row_of_each = cusparse._indptr_to_coo(
+                self.indptr, self.nnz)
             kept_rows = row_of_each[mask]
-            # Build new indptr via uint64 reinterpret: CUDA lacks
-            # atomicAdd(long long*,...), but two's-complement addition is
-            # bit-identical for non-negative values, and indptr counts are
-            # bounded by nnz which is far below 2^63.
-            new_indptr = cupy.zeros(nrows + 1, dtype=idx_dtype)
-            cupy.add.at(new_indptr[1:].view(cupy.uint64), kept_rows,
-                        cupy.uint64(1))
-            cupy.cumsum(new_indptr, out=new_indptr)
+            new_indptr = cusparse._build_indptr(
+                kept_rows, nrows, idx_dtype)
             self.data = new_data
             self.indices = new_indices
             self.indptr = new_indptr

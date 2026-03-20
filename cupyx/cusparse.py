@@ -56,6 +56,36 @@ def _cast_common_type(*xs):
             for x in xs]
 
 
+def _indptr_to_coo(indptr, nnz, dtype=None):
+    """Expand compressed indptr to per-nnz major-axis indices.
+
+    Equivalent to ``repeat(arange(nrows), diff(indptr))`` but avoids
+    the cupy.repeat limitation with CuPy ndarray repeat-counts.
+    """
+    if dtype is None:
+        dtype = indptr.dtype
+    nnz_range = _cupy.arange(nnz, dtype=dtype)
+    return _cupy.searchsorted(
+        indptr[1:], nnz_range, side='right').astype(dtype)
+
+
+def _build_indptr(row_indices, n_rows, dtype):
+    """Build compressed indptr from per-nnz major-axis assignments.
+
+    Uses ``add.at(view(uint64))`` for int64 because CUDA lacks
+    ``atomicAdd(long long*, long long)``.
+    """
+    indptr = _cupy.zeros(n_rows + 1, dtype=dtype)
+    if dtype == _cupy.int64:
+        _cupy.add.at(
+            indptr[1:].view(_cupy.uint64),
+            row_indices, _cupy.uint64(1))
+    else:
+        _cupy.add.at(indptr[1:], row_indices, 1)
+    _cupy.cumsum(indptr, out=indptr)
+    return indptr
+
+
 def _with_indices_dtype(m, dtype):
     """Return a CSR/CSC matrix with indices and indptr cast to *dtype*.
 
@@ -563,18 +593,8 @@ def _cupy_csrgeam_int64(a, b, alpha, beta):
     a_data = a.data * a.dtype.type(alpha) if alpha != 1 else a.data
     b_data = b.data * b.dtype.type(beta) if beta != 1 else b.data
 
-    if a.nnz > 0:
-        a_rows = _cupy.searchsorted(
-            a.indptr[1:], _cupy.arange(a.nnz, dtype=idx_dtype),
-            side='right').astype(idx_dtype)
-    else:
-        a_rows = _cupy.empty(0, idx_dtype)
-    if b.nnz > 0:
-        b_rows = _cupy.searchsorted(
-            b.indptr[1:], _cupy.arange(b.nnz, dtype=idx_dtype),
-            side='right').astype(idx_dtype)
-    else:
-        b_rows = _cupy.empty(0, idx_dtype)
+    a_rows = _indptr_to_coo(a.indptr, a.nnz, idx_dtype)
+    b_rows = _indptr_to_coo(b.indptr, b.nnz, idx_dtype)
 
     rows = _cupy.concatenate([a_rows, b_rows])
     cols = _cupy.concatenate([a.indices, b.indices])
@@ -1023,9 +1043,7 @@ def csrsort(x):
 
     if x.indices.dtype == _cupy.int64:
         # xcsrsort is int32-only; use lexsort fallback.
-        nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        row = _cupy.searchsorted(
-            x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
+        row = _indptr_to_coo(x.indptr, nnz)
         order = _cupy.lexsort(_cupy.stack([x.indices, row]))
         x.indices[:] = x.indices[order]
         x.data[:] = x.data[order]
@@ -1071,9 +1089,7 @@ def cscsort(x):
 
     if x.indices.dtype == _cupy.int64:
         # xcscsort is int32-only; use lexsort fallback.
-        nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        col = _cupy.searchsorted(
-            x.indptr[1:], nnz_range, side='right').astype(_cupy.int64)
+        col = _indptr_to_coo(x.indptr, nnz)
         order = _cupy.lexsort(_cupy.stack([x.indices, col]))
         x.indices[:] = x.indices[order]
         x.data[:] = x.data[order]
@@ -1177,11 +1193,8 @@ def coo2csr(x):
     if nnz == 0:
         indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
     elif idx_dtype == _cupy.int64:
-        # xcoo2csr is int32-only; use add.at(view(uint64)) fallback.
-        indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
-        _cupy.add.at(
-            indptr[1:].view(_cupy.uint64), x.row, _cupy.uint64(1))
-        _cupy.cumsum(indptr, out=indptr)
+        # xcoo2csr is int32-only.
+        indptr = _build_indptr(x.row, m, idx_dtype)
     else:
         handle = _device.get_cusparse_handle()
         indptr = _cupy.empty(m + 1, dtype=idx_dtype)
@@ -1203,11 +1216,8 @@ def coo2csc(x):
     if nnz == 0:
         indptr = _cupy.zeros(n + 1, dtype=idx_dtype)
     elif idx_dtype == _cupy.int64:
-        # xcoo2csr is int32-only; use add.at(view(uint64)) fallback.
-        indptr = _cupy.zeros(n + 1, dtype=idx_dtype)
-        _cupy.add.at(
-            indptr[1:].view(_cupy.uint64), x.col, _cupy.uint64(1))
-        _cupy.cumsum(indptr, out=indptr)
+        # xcoo2csr is int32-only.
+        indptr = _build_indptr(x.col, n, idx_dtype)
     else:
         handle = _device.get_cusparse_handle()
         indptr = _cupy.empty(n + 1, dtype=idx_dtype)
@@ -1240,10 +1250,7 @@ def csr2coo(x, data, indices):
 
     if idx_dtype == _cupy.int64:
         # xcsr2coo is int32-only; use searchsorted fallback.
-        nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        row = _cupy.searchsorted(
-            x.indptr[1:], nnz_range,
-            side='right').astype(_cupy.int64)
+        row = _indptr_to_coo(x.indptr, nnz)
     else:
         if not check_availability('csr2coo'):
             raise RuntimeError('csr2coo is not available.')
@@ -1261,56 +1268,45 @@ def csr2coo(x, data, indices):
     return A
 
 
-def _cupy_csr2csc_int64(x):
-    """Pure-CuPy CSR→CSC for int64 indices.
+def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
+    """Pure-CuPy CSR↔CSC transpose for int64 indices.
 
-    csr2cscEx2 is int32-only.  Uses add.at(view(uint64)) for indptr
-    and lexsort for the transpose.  O(nnz log nnz) time.
+    csr2cscEx2 is int32-only.  Uses _build_indptr + lexsort.
+    O(nnz log nnz) time.
+
+    Args:
+        x: Input compressed sparse matrix.
+        output_cls: Output class (csc_matrix or csr_matrix).
+        out_dim: Size of the output's major axis (n for CSC, m for CSR).
     """
-    n = int(x.shape[1])
     nnz = x.nnz
     idx_dtype = x.indices.dtype  # int64
 
     if nnz == 0:
-        # object.__new__ bypasses __init__: must set data, indices,
-        # indptr, _shape, _descr, has_sorted_indices manually.
-        # Needed because shape-only constructor OOMs for large n,
+        # object.__new__ bypasses __init__: must set all attributes.
+        # Needed because shape-only constructor OOMs for large dim,
         # and tuple-3 constructor downcasts int64 via check_contents.
-        A = object.__new__(cupyx.scipy.sparse.csc_matrix)
+        A = object.__new__(output_cls)
         A.data = _cupy.empty(0, x.dtype)
         A.indices = _cupy.empty(0, idx_dtype)
-        A.indptr = _cupy.zeros(n + 1, idx_dtype)
+        A.indptr = _cupy.zeros(out_dim + 1, idx_dtype)
         A._shape = x.shape
         A._descr = MatDescriptor.create()
         A.has_sorted_indices = True
         return A
 
-    # Build CSC indptr via add.at(view(uint64)).
-    csc_indptr = _cupy.zeros(n + 1, dtype=idx_dtype)
-    _cupy.add.at(csc_indptr[1:].view(_cupy.uint64), x.indices, _cupy.uint64(1))
-    _cupy.cumsum(csc_indptr, out=csc_indptr)
+    out_indptr = _build_indptr(x.indices, out_dim, idx_dtype)
+    expanded = _indptr_to_coo(x.indptr, nnz)
 
-    # Build row array from CSR indptr using searchsorted.
-    # cupy.repeat(arange, diff(indptr)) fails when diff(indptr)
-    # is a CuPy ndarray.
-    nnz_range = _cupy.arange(nnz, dtype=idx_dtype)
-    row = _cupy.searchsorted(
-        x.indptr[1:], nnz_range, side='right').astype(idx_dtype)
+    # Sort by (output major, output minor) for canonical order.
+    order = _cupy.lexsort(_cupy.stack([expanded, x.indices]))
 
-    # Sort by (col, row) to get CSC column order.
-    order = _cupy.lexsort(_cupy.stack([row, x.indices]))
-
-    csc_indices = row[order]
-    csc_data = x.data[order]
-
-    # Bypass all constructors — see nnz=0 path comment above.
-    A = object.__new__(cupyx.scipy.sparse.csc_matrix)
-    A.data = csc_data
-    A.indices = csc_indices
-    A.indptr = csc_indptr
+    A = object.__new__(output_cls)
+    A.data = x.data[order]
+    A.indices = expanded[order]
+    A.indptr = out_indptr
     A._shape = x.shape
     A._descr = MatDescriptor.create()
-    # lexsort([row, col]) produces sorted row indices within each column.
     A.has_sorted_indices = True
     return A
 
@@ -1321,7 +1317,8 @@ def csr2csc(x):
 
     if x.indices.dtype == _cupy.int64:
         # csr2csc is int32-only.
-        return _cupy_csr2csc_int64(x)
+        return _cupy_transpose_compressed_int64(
+            x, cupyx.scipy.sparse.csc_matrix, int(x.shape[1]))
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1349,7 +1346,8 @@ def csr2cscEx2(x):
 
     if x.indices.dtype == _cupy.int64:
         # csr2cscEx2 is int32-only.
-        return _cupy_csr2csc_int64(x)
+        return _cupy_transpose_compressed_int64(
+            x, cupyx.scipy.sparse.csc_matrix, int(x.shape[1]))
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1395,10 +1393,7 @@ def csc2coo(x, data, indices):
 
     if idx_dtype == _cupy.int64:
         # xcsr2coo is int32-only; use searchsorted fallback.
-        nnz_range = _cupy.arange(nnz, dtype=_cupy.int64)
-        col = _cupy.searchsorted(
-            x.indptr[1:], nnz_range,
-            side='right').astype(_cupy.int64)
+        col = _indptr_to_coo(x.indptr, nnz)
     else:
         handle = _device.get_cusparse_handle()
         col = _cupy.empty(nnz, idx_dtype)
@@ -1414,54 +1409,6 @@ def csc2coo(x, data, indices):
     return A
 
 
-def _cupy_csc2csr_int64(x):
-    """Pure-CuPy CSC→CSR for int64 indices.
-
-    csr2cscEx2 is int32-only.  Mirror of _cupy_csr2csc_int64
-    with rows and columns swapped.  O(nnz log nnz) time.
-    """
-    m = int(x.shape[0])
-    nnz = x.nnz
-    idx_dtype = x.indices.dtype  # int64
-
-    if nnz == 0:
-        # object.__new__ avoids shape-only constructor OOM
-        # and tuple-3 constructor check_contents=True downcast.
-        A = object.__new__(cupyx.scipy.sparse.csr_matrix)
-        A.data = _cupy.empty(0, x.dtype)
-        A.indices = _cupy.empty(0, idx_dtype)
-        A.indptr = _cupy.zeros(m + 1, idx_dtype)
-        A._shape = x.shape
-        A._descr = MatDescriptor.create()
-        A.has_sorted_indices = True
-        return A
-
-    # Build CSR indptr via add.at(view(uint64)).
-    csr_indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
-    _cupy.add.at(csr_indptr[1:].view(_cupy.uint64), x.indices, _cupy.uint64(1))
-    _cupy.cumsum(csr_indptr, out=csr_indptr)
-
-    # Build col array from CSC indptr using searchsorted.
-    nnz_range = _cupy.arange(nnz, dtype=idx_dtype)
-    col = _cupy.searchsorted(
-        x.indptr[1:], nnz_range, side='right').astype(idx_dtype)
-
-    # Sort by (row, col) to get CSR row order.
-    order = _cupy.lexsort(_cupy.stack([col, x.indices]))
-
-    csr_indices = col[order]
-    csr_data = x.data[order]
-
-    # Bypass all constructors — see nnz=0 path comment above.
-    A = object.__new__(cupyx.scipy.sparse.csr_matrix)
-    A.data = csr_data
-    A.indices = csr_indices
-    A.indptr = csr_indptr
-    A._shape = x.shape
-    A._descr = MatDescriptor.create()
-    # lexsort([col, row]) produces sorted col indices within each row.
-    A.has_sorted_indices = True
-    return A
 
 
 def csc2csr(x):
@@ -1470,7 +1417,8 @@ def csc2csr(x):
 
     if x.indices.dtype == _cupy.int64:
         # csc2csr is int32-only.
-        return _cupy_csc2csr_int64(x)
+        return _cupy_transpose_compressed_int64(
+            x, cupyx.scipy.sparse.csr_matrix, int(x.shape[0]))
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1498,7 +1446,8 @@ def csc2csrEx2(x):
 
     if x.indices.dtype == _cupy.int64:
         # csc2csrEx2 is int32-only.
-        return _cupy_csc2csr_int64(x)
+        return _cupy_transpose_compressed_int64(
+            x, cupyx.scipy.sparse.csr_matrix, int(x.shape[0]))
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -2443,9 +2392,7 @@ def _cupy_spgemm_int64(a, b, alpha):
     del prod_pos, cum_prod                  # free before peak-memory gather
 
     # Expand A indptr → row index for each A nonzero.
-    a_rows = _cupy.searchsorted(
-        a_indptr[1:], _cupy.arange(a.nnz, dtype=_cupy.int64),
-        side='right').astype(_cupy.int64)
+    a_rows = _indptr_to_coo(a_indptr, a.nnz)
 
     # Gather the (output_row, output_col, value) triple for each product.
     a_col_k = a_indices[a_src]                       # column of A = row of B
