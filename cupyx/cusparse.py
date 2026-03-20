@@ -129,17 +129,16 @@ _available_cusparse_version = {
     'spgemm': (11100, None),
     'spsm': (11600, None),  # CUDA 11.3.1
     # SpGEAM exists in the cuSPARSE dev header (12.5.8) but has never shipped
-    # in any public CUDA release (confirmed absent from 12.7.9, the latest
-    # public release as of 2026-03-17).  Use an unreachable placeholder so
-    # check_availability() returns False until SpGEAM actually ships; update
-    # this once the shipping version is confirmed.
+    # in any public CUDA release (confirmed absent through 13.2, latest as of
+    # 2026-03-20).  Placeholder keeps check_availability() returning False;
+    # update once SpGEAM appears in release notes.
     'spgeam': (99000, None),
-    # spGEMM with int64 indices: dev source (12.5.8 internal) supports it when
-    # all matrices share the same index type (all int32 or all int64).  Not yet
-    # in any public release (latest public: 12.7.9 still returns NOT_SUPPORTED
-    # for any int64 descriptor).  Update this when the shipping version is
-    # confirmed.
-    'spgemm_int64': (99000, None),
+    # spGEMM with int64 indices: added in CUDA 13.0 per official release notes
+    # (CUSPARSE-2365, "Added support for 64-bit index matrices in SpGEMM").
+    # cuSPARSE version encoding: major*1000 + minor*100 + patch; CUDA 13.0
+    # ships cuSPARSE 13.0.x → version >= 13000.  Absent from all 12.x releases.
+    # hipSPARSE entry is (_numpy.inf, None) below — hipSPARSE spGEMM is int32.
+    'spgemm_int64': (13000, None),
 }
 
 
@@ -673,8 +672,10 @@ def csrgeam2(a, b, alpha=1, beta=1):
 def spgeam(a, b, alpha=1, beta=1):
     """Sparse matrix addition using the Generic API: C = alpha*A + beta*B.
 
-    Uses ``cusparseSpGEAM`` (CUDA >= 12.0), which accepts int64 indices
-    natively via ``SpMatDescr``.  Falls back to ``csrgeam2`` for older CUDA.
+    Uses ``cusparseSpGEAM`` when available (not yet in any public CUDA
+    release as of 12.7.9; ``check_availability('spgeam')`` always returns
+    False today).  Falls back to ``_cupy_csrgeam_int64`` for int64 or
+    ``csrgeam2`` for int32.
 
     Args:
         a (cupyx.scipy.sparse.csr_matrix): Sparse matrix A.
@@ -1302,6 +1303,7 @@ def _cupy_csr2csc_int64(x):
         A.indptr = _cupy.zeros(n + 1, idx_dtype)
         A._shape = x.shape
         A._descr = MatDescriptor.create()
+        A.has_sorted_indices = True
         return A
 
     # Build CSC indptr via uint64 reinterpret: CUDA lacks atomicAdd(long long*,...),
@@ -1329,6 +1331,8 @@ def _cupy_csr2csc_int64(x):
     A.indptr = csc_indptr
     A._shape = x.shape
     A._descr = MatDescriptor.create()
+    # lexsort([row, col]) produces sorted row indices within each column.
+    A.has_sorted_indices = True
     return A
 
 
@@ -1460,6 +1464,7 @@ def _cupy_csc2csr_int64(x):
         A.indptr = _cupy.zeros(m + 1, idx_dtype)
         A._shape = x.shape
         A._descr = MatDescriptor.create()
+        A.has_sorted_indices = True
         return A
 
     # Build CSR indptr via uint64 reinterpret: CUDA lacks atomicAdd(long long*,...),
@@ -1486,6 +1491,8 @@ def _cupy_csc2csr_int64(x):
     A.indptr = csr_indptr
     A._shape = x.shape
     A._descr = MatDescriptor.create()
+    # lexsort([col, row]) produces sorted col indices within each row.
+    A.has_sorted_indices = True
     return A
 
 
@@ -2539,9 +2546,13 @@ def spgemm(a, b, alpha=1):
     # pure-CuPy fallback works on all CUDA versions.
     #
     # cuSPARSE spGEMM requires all three matrices (A, B, C) to share the same
-    # index type.  The dev source (12.5.8 internal) supports uniform int64, but
-    # no public release has shipped that support yet (confirmed absent from
-    # 12.7.9).
+    # index type.  CUDA 13.0 added native int64 support (CUSPARSE-2365);
+    # absent from all 12.x releases.
+    #
+    # Always use cuSPARSE when possible, even for mixed int32/int64
+    # inputs — upcast the int32 matrix to int64 (uniform type required by
+    # cuSPARSE) rather than falling back to the pure-CuPy path.  Pure-CuPy
+    # is only used when the native API is unavailable (CUDA < 13.0).
     if a.indices.dtype == _cupy.int64 or b.indices.dtype == _cupy.int64:
         if a.shape[1] != b.shape[0]:
             raise ValueError('mismatched shape')
