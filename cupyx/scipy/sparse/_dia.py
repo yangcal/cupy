@@ -131,10 +131,12 @@ class dia_matrix(_data._data_matrix):
                 'getnnz over an axis is not implemented for DIA format')
 
         m, n = self.shape
+        it = self.offsets.dtype.type
         nnz = _core.ReductionKernel(
-            'int32 offsets, int32 m, int32 n', 'int32 nnz',
+            'I offsets, I m, I n', 'I nnz',
             'offsets > 0 ? min(m, n - offsets) : min(m + offsets, n)',
-            'a + b', 'nnz = a', '0', 'dia_nnz')(self.offsets, m, n)
+            'a + b', 'nnz = a', '0', 'dia_nnz')(
+                self.offsets, it(m), it(n))
         return int(nnz)
 
     def toarray(self, order=None, out=None):

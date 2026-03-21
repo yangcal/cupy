@@ -2393,3 +2393,14 @@ class TestInt64CoosortCanonicalSkip:
         assert float(csr[0, _LARGE]) == pytest.approx(1.0)
         assert float(csr[1, 0]) == pytest.approx(2.0)
         assert float(csr[1, _LARGE]) == pytest.approx(3.0)
+
+
+class TestInt64DiaNnz:
+    """DIA getnnz (nnz property) with int64 offsets."""
+
+    def test_dia_nnz_large_shape(self):
+        data = cupy.ones((1, 2))
+        offsets = cupy.array([0], dtype=cupy.int32)
+        m = sparse.dia_matrix(
+            (data, offsets), shape=(2, _LARGE + 1))
+        assert m.nnz == 2
