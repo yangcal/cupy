@@ -997,9 +997,15 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         to_add[:-1] = ui_indptr
         ui_indptr = to_add
 
-        # Compute the counts for each row in the insertion array
+        # Compute the counts for each row in the insertion array.
+        # TODO(cupy): simplify when cupy.add.at supports int64
         row_counts = cupy.zeros(ui_indptr.size-1, dtype=idx_dtype)
-        cupy.add.at(row_counts, cupy.searchsorted(rows, indptr_inserts), 1)
+        search_idx = cupy.searchsorted(rows, indptr_inserts)
+        if idx_dtype == cupy.int64:
+            cupy.add.at(row_counts.view(cupy.uint64),
+                        search_idx, cupy.uint64(1))
+        else:
+            cupy.add.at(row_counts, search_idx, 1)
 
         self._perform_insert(indices_inserts, data_inserts,
                              rows, row_counts, idx_dtype)

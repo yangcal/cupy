@@ -2219,3 +2219,36 @@ class TestInt64SumDuplicatesEmpty:
         assert m.row.dtype == cupy.int64
         assert m.col.dtype == cupy.int64
         assert m.has_canonical_format
+
+
+class TestInt64SetitemInsert:
+    """Inserting new entries into int64 sparse matrices via __setitem__.
+
+    _insert_many uses cupy.add.at on an int64 target array to count
+    row insertions.  CUDA lacks atomicAdd for signed int64, so this
+    requires the view(uint64) workaround.
+    """
+
+    _shape = (2, _LARGE + 2)
+
+    def test_insert_new_entry_csr(self):
+        m = sparse.csr_matrix._from_parts(
+            cupy.array([1.0]),
+            cupy.array([_LARGE], dtype=cupy.int64),
+            cupy.array([0, 1, 1], dtype=cupy.int64),
+            self._shape)
+        m[1, 0] = 42.0
+        assert m.nnz == 2
+        assert float(m[1, 0]) == pytest.approx(42.0)
+        assert float(m[0, _LARGE]) == pytest.approx(1.0)
+
+    def test_insert_new_entry_csc(self):
+        m = sparse.csc_matrix._from_parts(
+            cupy.array([1.0]),
+            cupy.array([_LARGE], dtype=cupy.int64),
+            cupy.array([0, 1, 1], dtype=cupy.int64),
+            (_LARGE + 2, 2))
+        m[0, 1] = 42.0
+        assert m.nnz == 2
+        assert m.indices.dtype == cupy.int64
+        assert float(m[0, 1]) == pytest.approx(42.0)
