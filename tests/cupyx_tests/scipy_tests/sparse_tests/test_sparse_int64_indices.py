@@ -2273,3 +2273,53 @@ class TestInt64Setdiag:
         m.setdiag(cupy.array([99.0]), k=_LARGE)
         assert float(m[0, _LARGE]) == pytest.approx(99.0)
         assert float(m[0, 0]) == pytest.approx(1.0)
+
+
+class TestInt64Binopt:
+    """Element-wise comparisons and maximum/minimum on int64 CSR.
+
+    binopt_csr kernels use int32 shape/nnz params and int* locals
+    that must be templated to I for int64 support.
+    """
+
+    _shape = (2, _LARGE + 2)
+
+    def _make_pair(self, v1=1.0, v2=2.0):
+        a = sparse.csr_matrix._from_parts(
+            cupy.array([v1]),
+            cupy.array([_LARGE], dtype=cupy.int64),
+            cupy.array([0, 1, 1], dtype=cupy.int64),
+            self._shape)
+        b = sparse.csr_matrix._from_parts(
+            cupy.array([v2]),
+            cupy.array([_LARGE], dtype=cupy.int64),
+            cupy.array([0, 1, 1], dtype=cupy.int64),
+            self._shape)
+        return a, b
+
+    def test_ne_int64(self):
+        a, b = self._make_pair(1.0, 2.0)
+        c = a != b
+        assert c.nnz == 1
+        assert c.indices.dtype == cupy.int64
+
+    def test_maximum_int64(self):
+        a, b = self._make_pair(1.0, 5.0)
+        c = a.maximum(b)
+        assert c.indices.dtype == cupy.int64
+        assert float(c[0, _LARGE]) == pytest.approx(5.0)
+
+    def test_ne_mixed_int32_int64(self):
+        # One operand int64, the other int32 (small shape).
+        a = sparse.csr_matrix._from_parts(
+            cupy.array([1.0, 2.0]),
+            cupy.array([0, 1], dtype=cupy.int64),
+            cupy.array([0, 1, 2], dtype=cupy.int64),
+            (2, 3))
+        b = sparse.csr_matrix._from_parts(
+            cupy.array([1.0, 9.0]),
+            cupy.array([0, 1], dtype=cupy.int32),
+            cupy.array([0, 1, 2], dtype=cupy.int32),
+            (2, 3))
+        c = a != b
+        assert c.nnz == 1

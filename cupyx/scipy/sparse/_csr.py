@@ -101,9 +101,12 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                     return csr_matrix(cupy.ones(self.shape, dtype=numpy.bool_))
                 else:
                     return csr_matrix(self.shape, dtype=numpy.bool_)
-            indices = cupy.zeros((1,), dtype=numpy.int32)
-            indptr = cupy.arange(2, dtype=numpy.int32)
-            other = csr_matrix((data, indices, indptr), shape=(1, 1))
+            idx_dtype = self.indices.dtype
+            other = csr_matrix._from_parts(
+                data,
+                cupy.zeros((1,), dtype=idx_dtype),
+                cupy.arange(2, dtype=idx_dtype),
+                (1, 1))
             return binopt_csr(self, other, op_name)
         elif _util.isdense(other):
             return op(self.todense(), other)
@@ -915,11 +918,16 @@ def binopt_csr(a, b, op_name):
     a_nnz = a.nnz * (m // a_m) * (n // a_n)
     b_nnz = b.nnz * (m // b_m) * (n // b_n)
 
-    a_info = cupy.zeros(a_nnz + 1, dtype=a.indices.dtype)
-    b_info = cupy.zeros(b_nnz + 1, dtype=b.indices.dtype)
+    idx_dtype = numpy.result_type(a.indices.dtype, b.indices.dtype)
+    a_indptr = a.indptr.astype(idx_dtype, copy=False)
+    a_indices = a.indices.astype(idx_dtype, copy=False)
+    b_indptr = b.indptr.astype(idx_dtype, copy=False)
+    b_indices = b.indices.astype(idx_dtype, copy=False)
+    a_info = cupy.zeros(a_nnz + 1, dtype=idx_dtype)
+    b_info = cupy.zeros(b_nnz + 1, dtype=idx_dtype)
     a_valid = cupy.zeros(a_nnz, dtype=numpy.int8)
     b_valid = cupy.zeros(b_nnz, dtype=numpy.int8)
-    c_indptr = cupy.zeros(m + 1, dtype=a.indptr.dtype)
+    c_indptr = cupy.zeros(m + 1, dtype=idx_dtype)
     in_dtype = numpy.promote_types(a.dtype, b.dtype)
     a_data = a.data.astype(in_dtype, copy=False)
     b_data = b.data.astype(in_dtype, copy=False)
@@ -952,13 +960,14 @@ def binopt_csr(a, b, op_name):
         raise ValueError('invalid op_name: {}'.format(op_name))
     a_tmp_data = cupy.empty(a_nnz, dtype=out_dtype)
     b_tmp_data = cupy.empty(b_nnz, dtype=out_dtype)
-    a_tmp_indices = cupy.empty(a_nnz, dtype=a.indices.dtype)
-    b_tmp_indices = cupy.empty(b_nnz, dtype=b.indices.dtype)
+    a_tmp_indices = cupy.empty(a_nnz, dtype=idx_dtype)
+    b_tmp_indices = cupy.empty(b_nnz, dtype=idx_dtype)
     _size = a_nnz + b_nnz
+    it = idx_dtype.type
     cupy_binopt_csr_step1(op_name, preamble=funcs)(
-        m, n,
-        a.indptr, a.indices, a_data, a_m, a_n, a.nnz, a_nnz,
-        b.indptr, b.indices, b_data, b_m, b_n, b.nnz, b_nnz,
+        it(m), it(n),
+        a_indptr, a_indices, a_data, it(a_m), it(a_n), it(a.nnz), it(a_nnz),
+        b_indptr, b_indices, b_data, it(b_m), it(b_n), it(b.nnz), it(b_nnz),
         a_info, a_valid, a_tmp_indices, a_tmp_data,
         b_info, b_valid, b_tmp_indices, b_tmp_data,
         c_indptr, size=_size)
@@ -966,11 +975,11 @@ def binopt_csr(a, b, op_name):
     b_info = cupy.cumsum(b_info, dtype=b_info.dtype)
     c_indptr = cupy.cumsum(c_indptr, dtype=c_indptr.dtype)
     c_nnz = int(c_indptr[-1])
-    c_indices = cupy.empty(c_nnz, dtype=a.indices.dtype)
+    c_indices = cupy.empty(c_nnz, dtype=idx_dtype)
     c_data = cupy.empty(c_nnz, dtype=out_dtype)
     cupy_binopt_csr_step2(op_name)(
-        a_info, a_valid, a_tmp_indices, a_tmp_data, a_nnz,
-        b_info, b_valid, b_tmp_indices, b_tmp_data, b_nnz,
+        a_info, a_valid, a_tmp_indices, a_tmp_data, it(a_nnz),
+        b_info, b_valid, b_tmp_indices, b_tmp_data, it(b_nnz),
         c_indices, c_data, size=_size)
     return csr_matrix((c_data, c_indices, c_indptr), shape=(m, n))
 
@@ -980,11 +989,11 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
     name = 'cupyx_scipy_sparse_csr_binopt_' + op_name + 'step1'
     return cupy.ElementwiseKernel(
         '''
-        int32 M, int32 N,
+        I M, I N,
         raw I A_INDPTR, raw I A_INDICES, raw T A_DATA,
-        int32 A_M, int32 A_N, int32 A_NNZ_ACT, int32 A_NNZ,
+        I A_M, I A_N, I A_NNZ_ACT, I A_NNZ,
         raw I B_INDPTR, raw I B_INDICES, raw T B_DATA,
-        int32 B_M, int32 B_N, int32 B_NNZ_ACT, int32 B_NNZ
+        I B_M, I B_N, I B_NNZ_ACT, I B_NNZ
         ''',
         '''
         raw I A_INFO, raw B A_VALID, raw I A_TMP_INDICES, raw O A_TMP_DATA,
@@ -994,16 +1003,16 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
         '''
         if (i >= A_NNZ + B_NNZ) return;
 
-        const int *MY_INDPTR, *MY_INDICES;  int *MY_INFO;  const T *MY_DATA;
-        const int *OP_INDPTR, *OP_INDICES;  int *OP_INFO;  const T *OP_DATA;
-        int MY_M, MY_N, MY_NNZ_ACT, MY_NNZ;
-        int OP_M, OP_N, OP_NNZ_ACT, OP_NNZ;
+        const I *MY_INDPTR, *MY_INDICES;  I *MY_INFO;  const T *MY_DATA;
+        const I *OP_INDPTR, *OP_INDICES;  I *OP_INFO;  const T *OP_DATA;
+        I MY_M, MY_N, MY_NNZ_ACT, MY_NNZ;
+        I OP_M, OP_N, OP_NNZ_ACT, OP_NNZ;
         signed char *MY_VALID;  I *MY_TMP_INDICES;  O *MY_TMP_DATA;
 
-        int my_j;
+        I my_j;
         if (i < A_NNZ) {
             // in charge of one of non-zero element of sparse matrix A
-            my_j = i;
+            my_j = (I)i;
             MY_INDPTR  = &(A_INDPTR[0]);   OP_INDPTR  = &(B_INDPTR[0]);
             MY_INDICES = &(A_INDICES[0]);  OP_INDICES = &(B_INDICES[0]);
             MY_INFO    = &(A_INFO[0]);     OP_INFO    = &(B_INFO[0]);
@@ -1017,7 +1026,7 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
             MY_TMP_INDICES = &(A_TMP_INDICES[0]);
         } else {
             // in charge of one of non-zero element of sparse matrix B
-            my_j = i - A_NNZ;
+            my_j = (I)i - A_NNZ;
             MY_INDPTR  = &(B_INDPTR[0]);   OP_INDPTR  = &(A_INDPTR[0]);
             MY_INDICES = &(B_INDICES[0]);  OP_INDICES = &(A_INDICES[0]);
             MY_INFO    = &(B_INFO[0]);     OP_INFO    = &(A_INFO[0]);
@@ -1030,11 +1039,11 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
             MY_TMP_DATA= &(B_TMP_DATA[0]);
             MY_TMP_INDICES = &(B_TMP_INDICES[0]);
         }
-        int _min, _max, _mid;
+        I _min, _max, _mid;
 
         // get column location
-        int my_col;
-        int my_j_act = my_j;
+        I my_col;
+        I my_j_act = my_j;
         if (MY_M == 1 && MY_M < M) {
             if (MY_N == 1 && MY_N < N) my_j_act = 0;
             else                       my_j_act = my_j % MY_NNZ_ACT;
@@ -1047,22 +1056,22 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
         }
 
         // get row location
-        int my_row = get_row_id(my_j_act, 0, MY_M - 1, &(MY_INDPTR[0]));
+        I my_row = get_row_id(my_j_act, (I)0, MY_M - 1, &(MY_INDPTR[0]));
         if (MY_M == 1 && MY_M < M) {
             if (MY_N == 1 && MY_N < N) my_row = my_j / N;
             else                       my_row = my_j / MY_NNZ_ACT;
         }
 
-        int op_row = my_row;
-        int op_row_act = op_row;
+        I op_row = my_row;
+        I op_row_act = op_row;
         if (OP_M == 1 && OP_M < M) {
             op_row_act = 0;
         }
 
-        int op_col = 0;
+        I op_col = 0;
         _min = OP_INDPTR[op_row_act];
         _max = OP_INDPTR[op_row_act + 1] - 1;
-        int op_j_act = _min;
+        I op_j_act = _min;
         bool op_nz = false;
         if (_min <= _max) {
             if (OP_N == 1 && OP_N < N) {
@@ -1093,7 +1102,7 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
             }
         }
 
-        int op_j = op_j_act;
+        I op_j = op_j_act;
         if (OP_M == 1 && OP_M < M) {
             if (OP_N == 1 && OP_N < N) {
                 op_j = (op_col + N * op_row) * OP_NNZ_ACT;
@@ -1117,9 +1126,9 @@ def cupy_binopt_csr_step1(op_name, preamble=''):
                 MY_VALID[my_j] = 1;
                 MY_TMP_DATA[my_j] = out;
                 MY_TMP_INDICES[my_j] = my_col;
-                atomicAdd( &(C_INFO[my_row + 1]), 1 );
-                atomicAdd( &(MY_INFO[my_j + 1]), 1 );
-                atomicAdd( &(OP_INFO[op_j]), 1 );
+                _atomic_add_one( &(C_INFO[my_row + 1]) );
+                _atomic_add_one( &(MY_INFO[my_j + 1]) );
+                _atomic_add_one( &(OP_INFO[op_j]) );
             }
         }
         ''',
@@ -1133,20 +1142,20 @@ def cupy_binopt_csr_step2(op_name):
     return cupy.ElementwiseKernel(
         '''
         raw I A_INFO, raw B A_VALID, raw I A_TMP_INDICES, raw O A_TMP_DATA,
-        int32 A_NNZ,
+        I A_NNZ,
         raw I B_INFO, raw B B_VALID, raw I B_TMP_INDICES, raw O B_TMP_DATA,
-        int32 B_NNZ
+        I B_NNZ
         ''',
         'raw I C_INDICES, raw O C_DATA',
         '''
         if (i < A_NNZ) {
-            int j = i;
+            I j = (I)i;
             if (A_VALID[j]) {
                 C_INDICES[A_INFO[j]] = A_TMP_INDICES[j];
                 C_DATA[A_INFO[j]]    = A_TMP_DATA[j];
             }
         } else if (i < A_NNZ + B_NNZ) {
-            int j = i - A_NNZ;
+            I j = (I)i - A_NNZ;
             if (B_VALID[j]) {
                 C_INDICES[B_INFO[j]] = B_TMP_INDICES[j];
                 C_DATA[B_INFO[j]]    = B_TMP_DATA[j];
