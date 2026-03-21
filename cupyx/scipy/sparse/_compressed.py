@@ -891,11 +891,11 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         x = cupy.array(x, dtype=self.dtype, copy=True, ndmin=1).ravel()
 
         new_sp = cupyx.scipy.sparse.csr_matrix(
-            (cupy.arange(self.nnz, dtype=cupy.float32),
+            (cupy.arange(self.nnz, dtype=cupy.float64),
              self.indices, self.indptr), shape=(M, N))
 
         offsets = new_sp._get_arrayXarray(
-            i, j, not_found_val=-1).astype(cupy.int32).ravel()
+            i, j, not_found_val=-1).astype(self.indices.dtype).ravel()
 
         mask = offsets > -1
         self.data[offsets[mask]] = x[mask]
@@ -922,11 +922,11 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         i, j, M, N = self._prepare_indices(i, j)
 
         new_sp = cupyx.scipy.sparse.csr_matrix(
-            (cupy.arange(self.nnz, dtype=cupy.float32),
+            (cupy.arange(self.nnz, dtype=cupy.float64),
              self.indices, self.indptr), shape=(M, N))
 
         offsets = new_sp._get_arrayXarray(
-            i, j, not_found_val=-1).astype(cupy.int32).ravel()
+            i, j, not_found_val=-1).astype(self.indices.dtype).ravel()
 
         # only assign zeros to the existing sparsity structure
         self.data[offsets[offsets > -1]] = 0
