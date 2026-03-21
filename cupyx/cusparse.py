@@ -791,7 +791,7 @@ def spgeam(a, b, alpha=1, beta=1):
 
     c = cupyx.scipy.sparse.csr_matrix(
         (c_data, c_indices, c_indptr), shape=(m, n))
-    c._has_canonical_format = True
+    c.has_canonical_format = True
     return c
 
 
@@ -1152,7 +1152,7 @@ def coosort(x, sort_by='r'):
         x.col[:] = x.col[order]
         x.data[:] = x.data[order]
         if sort_by == 'c':
-            x._has_canonical_format = False
+            x.has_canonical_format = False
         return
 
     if not check_availability('coosort'):

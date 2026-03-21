@@ -337,6 +337,10 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         Caller must ensure *indices* and *indptr* have the correct
         dtype and are within bounds for *shape*.
+
+        ``has_sorted_indices`` and ``has_canonical_format`` are not
+        set; they will be lazy-computed on first access.  Set them
+        explicitly after construction if the sort order is known.
         """
         A = cls.__new__(cls)
         sparse_data._data_matrix.__init__(A, data)

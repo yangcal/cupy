@@ -192,6 +192,9 @@ class coo_matrix(sparse_data._data_matrix):
         already determined the correct index dtype.  Skips the
         check_contents=True downcast that the tuple-2 constructor
         applies.
+
+        ``has_canonical_format`` is not set; set explicitly after
+        construction if the canonical state is known.
         """
         A = cls.__new__(cls)
         sparse_data._data_matrix.__init__(A, data)
