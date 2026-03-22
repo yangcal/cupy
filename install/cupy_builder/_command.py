@@ -173,7 +173,7 @@ class custom_build_ext(setuptools.command.build_ext.build_ext):
         cuda_path = build.get_cuda_path()
         cuda_include = os.path.join(cuda_path, 'include')
         source = os.path.abspath(
-            os.path.join('cupy_backends', 'cuda', 'libs', 'cupy_cufilt.c'))
+            os.path.join('cupy', 'cuda', 'cupy_cufilt.c'))
 
         out_dir = os.path.join(self.build_lib, 'cupy', 'cuda')
 
