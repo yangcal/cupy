@@ -2404,3 +2404,49 @@ class TestInt64DiaNnz:
         m = sparse.dia_matrix(
             (data, offsets), shape=(2, _LARGE + 1))
         assert m.nnz == 2
+
+
+class TestInt64RandomSparse:
+    """random() with large shapes uses O(k) memory, not O(m*n)."""
+
+    def test_random_large_shape_int64(self):
+        m = sparse.random(_LARGE, 2, density=1e-9, format='coo')
+        assert m.row.dtype == cupy.int64
+        assert m.shape == (_LARGE, 2)
+
+    def test_random_large_mn(self):
+        # m*n = 10^12 — old code would OOM allocating 8 TB
+        m = sparse.random(10**6, 10**6, density=1e-9, format='coo')
+        assert m.nnz > 0
+        assert m.shape == (10**6, 10**6)
+
+    def test_random_small_shape_int32(self):
+        # Small shapes must still produce int32 indices
+        m = sparse.random(100, 200, density=0.1, format='coo')
+        assert m.row.dtype == cupy.int32
+        assert m.col.dtype == cupy.int32
+
+    def test_random_seed_reproducibility(self):
+        rs1 = cupy.random.RandomState(42)
+        rs2 = cupy.random.RandomState(42)
+        m1 = sparse.random(50, 50, density=0.1, random_state=rs1)
+        m2 = sparse.random(50, 50, density=0.1, random_state=rs2)
+        cupy.testing.assert_array_equal(m1.toarray(), m2.toarray())
+
+    def test_random_density_zero(self):
+        m = sparse.random(100, 100, density=0.0, format='coo')
+        assert m.nnz == 0
+
+    def test_random_formats(self):
+        for fmt in ('coo', 'csr', 'csc'):
+            m = sparse.random(50, 50, density=0.1, format=fmt)
+            assert m.format == fmt
+            assert m.nnz > 0
+
+    def test_random_large_shape_csr(self):
+        # COO uses int64 (flat mn > INT32_MAX), but CSR indices/indptr
+        # are int32 because the individual dimensions fit in int32.
+        m = sparse.random(10**6, 10**6, density=1e-9, format='csr')
+        assert m.indices.dtype == cupy.int32
+        assert m.indptr.dtype == cupy.int32
+        assert m.nnz > 0

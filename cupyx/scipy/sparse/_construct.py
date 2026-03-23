@@ -364,8 +364,6 @@ def random(m, n, density=0.01, format='coo', dtype=None,
     if dtype.char not in 'fd':
         raise NotImplementedError('type %s not supported' % dtype)
 
-    mn = m * n
-
     k = int(density * m * n)
 
     if random_state is None:
@@ -376,12 +374,49 @@ def random(m, n, density=0.01, format='coo', dtype=None,
     if data_rvs is None:
         data_rvs = random_state.rand
 
-    ind = random_state.choice(mn, size=k, replace=False)
+    mn = m * n
+
+    # For moderate m*n that fits comfortably in GPU memory, the
+    # original choice-based algorithm is faster (single kernel).
+    # For large m*n, use rejection sampling (O(k) memory).
+    tp = numpy.int64 if mn > numpy.iinfo(numpy.int32).max \
+        else numpy.int32
+    try:
+        ind = random_state.choice(mn, size=k, replace=False)
+        ind = ind.astype(tp, copy=False)
+    except cupy.cuda.memory.OutOfMemoryError:
+        cupy.get_default_memory_pool().free_all_blocks()
+        ind = _rejection_sample_indices(mn, k, random_state, tp)
     j = ind // m
     i = ind - j * m
     vals = data_rvs(k).astype(dtype)
     return _coo.coo_matrix(
         (vals, (i, j)), shape=(m, n)).asformat(format)
+
+
+def _rejection_sample_indices(mn, k, random_state, tp):
+    """Sample k unique flat indices from [0, mn) using O(k) memory.
+
+    Fallback for when mn is too large for ``choice(mn, k)``.
+    Uses rejection sampling: generate random candidates, deduplicate
+    via sort+unique, repeat for any shortfall.  Converges in 1-2
+    iterations for typical sparse densities (collision rate k²/2mn).
+    """
+    flat = cupy.empty(0, dtype=tp)
+    remaining = k
+
+    while remaining > 0:
+        sample_size = remaining + max(remaining // 20, 1)
+        flat_new = (random_state.rand(sample_size) * mn).astype(tp)
+        flat = cupy.unique(cupy.concatenate([flat, flat_new]))
+
+        if len(flat) >= k:
+            flat = flat[:k]
+            remaining = 0
+        else:
+            remaining = k - len(flat)
+
+    return flat
 
 
 def rand(m, n, density=0.01, format='coo', dtype=None, random_state=None):
