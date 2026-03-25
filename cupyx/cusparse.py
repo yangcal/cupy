@@ -105,12 +105,15 @@ def _with_indices_dtype(m, dtype):
     Data array is shared (no copy).  Used to promote int32 index arrays to
     int64 before calling a cuSPARSE function that requires uniform int64.
     """
-    c = m.__class__._from_parts(
+    # Read private attrs to avoid triggering the lazy property getter
+    # (GPU kernel + D2H sync) when the flags have not been computed.
+    return m.__class__._from_parts(
         m.data, m.indices.astype(dtype), m.indptr.astype(dtype),
-        m.shape)
-    c.has_canonical_format = m.has_canonical_format
-    c.has_sorted_indices = m.has_sorted_indices
-    return c
+        m.shape,
+        has_canonical_format=getattr(
+            m, '_has_canonical_format', None),
+        has_sorted_indices=getattr(
+            m, '_has_sorted_indices', None))
 
 
 def _transpose_flag(trans):
@@ -1279,13 +1282,12 @@ def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
     idx_dtype = x.indices.dtype  # int64
 
     if nnz == 0:
-        A = output_cls._from_parts(
+        return output_cls._from_parts(
             _cupy.empty(0, x.dtype),
             _cupy.empty(0, idx_dtype),
             _cupy.zeros(out_dim + 1, idx_dtype),
-            x.shape)
-        A.has_sorted_indices = True
-        return A
+            x.shape,
+            has_sorted_indices=True)
 
     out_indptr = _build_indptr(x.indices, out_dim, idx_dtype)
     expanded = _indptr_to_coo(x.indptr, nnz)
@@ -1293,10 +1295,9 @@ def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
     # Sort by (output major, output minor) for canonical order.
     order = _cupy.lexsort(_cupy.stack([expanded, x.indices]))
 
-    A = output_cls._from_parts(
-        x.data[order], expanded[order], out_indptr, x.shape)
-    A.has_sorted_indices = True
-    return A
+    return output_cls._from_parts(
+        x.data[order], expanded[order], out_indptr, x.shape,
+        has_sorted_indices=True)
 
 
 def csr2csc(x):

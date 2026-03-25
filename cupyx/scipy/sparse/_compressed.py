@@ -327,7 +327,9 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         self._shape = shape
 
     @classmethod
-    def _from_parts(cls, data, indices, indptr, shape):
+    def _from_parts(cls, data, indices, indptr, shape,
+                    has_canonical_format=None,
+                    has_sorted_indices=None):
         """Construct from pre-validated arrays (no check_contents).
 
         Internal API for building sparse matrices when the caller has
@@ -338,9 +340,13 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         Caller must ensure *indices* and *indptr* have the correct
         dtype and are within bounds for *shape*.
 
-        ``has_sorted_indices`` and ``has_canonical_format`` are not
-        set; they will be lazy-computed on first access.  Set them
-        explicitly after construction if the sort order is known.
+        Args:
+            has_canonical_format (bool or None): If ``True`` or
+                ``False``, cache the flag directly (avoids the lazy
+                GPU kernel on first access).  ``None`` (default)
+                leaves the flag unset for lazy computation.
+                ``True`` implies ``has_sorted_indices=True``.
+            has_sorted_indices (bool or None): Same semantics.
         """
         A = cls.__new__(cls)
         sparse_data._data_matrix.__init__(A, data)
@@ -349,15 +355,29 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         from cupyx.cusparse import MatDescriptor
         A._descr = MatDescriptor.create()
         A._shape = shape
+        if has_canonical_format is not None:
+            A._has_canonical_format = has_canonical_format
+            if has_canonical_format:
+                A._has_sorted_indices = True
+        if has_sorted_indices is not None:
+            A._has_sorted_indices = has_sorted_indices
         return A
 
     def _with_data(self, data, copy=True):
-        A = self.__class__._from_parts(
+        """Return a matrix with the same sparsity structure but
+        different data.  Preserves sort/canonical flags.
+        """
+        # Read private attrs to avoid the property getter, which
+        # launches a GPU kernel when the flag has not been computed.
+        return self.__class__._from_parts(
             data,
             self.indices.copy() if copy else self.indices,
             self.indptr.copy() if copy else self.indptr,
-            self.shape)
-        return A
+            self.shape,
+            has_canonical_format=getattr(
+                self, '_has_canonical_format', None),
+            has_sorted_indices=getattr(
+                self, '_has_sorted_indices', None))
 
     def _convert_dense(self, x):
         raise NotImplementedError
@@ -782,11 +802,10 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             out_major, M, out_idx_dtype)
 
         # Build output matrix.
-        A_out = self.__class__._from_parts(
+        return self.__class__._from_parts(
             out_data, out_minor.astype(out_idx_dtype),
-            out_indptr, new_shape)
-        A_out.has_sorted_indices = True
-        return A_out
+            out_indptr, new_shape,
+            has_sorted_indices=True)
 
     def _major_slice(self, idx, copy=False):
         """Index along the major axis where idx is a slice object.
@@ -890,9 +909,12 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         i, j, M, N = self._prepare_indices(i, j)
         x = cupy.array(x, dtype=self.dtype, copy=True, ndmin=1).ravel()
 
-        new_sp = cupyx.scipy.sparse.csr_matrix(
-            (cupy.arange(self.nnz, dtype=cupy.float64),
-             self.indices, self.indptr), shape=(M, N))
+        # Temporary CSR mapping each stored element to its flat offset.
+        # Use _from_parts to avoid check_contents D2H syncs; the
+        # indices/indptr are already validated (they come from self).
+        new_sp = cupyx.scipy.sparse.csr_matrix._from_parts(
+            cupy.arange(self.nnz, dtype=cupy.float64),
+            self.indices, self.indptr, shape=(M, N))
 
         offsets = new_sp._get_arrayXarray(
             i, j, not_found_val=-1).astype(self.indices.dtype).ravel()
@@ -921,9 +943,9 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         """
         i, j, M, N = self._prepare_indices(i, j)
 
-        new_sp = cupyx.scipy.sparse.csr_matrix(
-            (cupy.arange(self.nnz, dtype=cupy.float64),
-             self.indices, self.indptr), shape=(M, N))
+        new_sp = cupyx.scipy.sparse.csr_matrix._from_parts(
+            cupy.arange(self.nnz, dtype=cupy.float64),
+            self.indices, self.indptr, shape=(M, N))
 
         offsets = new_sp._get_arrayXarray(
             i, j, not_found_val=-1).astype(self.indices.dtype).ravel()

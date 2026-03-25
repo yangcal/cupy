@@ -185,7 +185,8 @@ class coo_matrix(sparse_data._data_matrix):
         self._shape = int(shape[0]), int(shape[1])
 
     @classmethod
-    def _from_parts(cls, data, row, col, shape):
+    def _from_parts(cls, data, row, col, shape,
+                    has_canonical_format=False):
         """Construct from pre-validated arrays (no check_contents).
 
         Internal API for building COO matrices when the caller has
@@ -193,28 +194,28 @@ class coo_matrix(sparse_data._data_matrix):
         check_contents=True downcast that the tuple-2 constructor
         applies.
 
-        ``has_canonical_format`` is not set; set explicitly after
-        construction if the canonical state is known.
+        Args:
+            has_canonical_format (bool): Defaults to ``False`` (not
+                known to be canonical).
         """
         A = cls.__new__(cls)
         sparse_data._data_matrix.__init__(A, data)
         A.row = row
         A.col = col
         A._shape = int(shape[0]), int(shape[1])
+        A.has_canonical_format = has_canonical_format
         return A
 
     def _with_data(self, data, copy=True):
-        """Returns a matrix with the same sparsity structure as self,
-        but with different data.  By default the index arrays
-        (i.e. .row and .col) are copied.
+        """Return a matrix with the same sparsity structure but
+        different data.  Preserves has_canonical_format.
         """
-        A = coo_matrix._from_parts(
+        return coo_matrix._from_parts(
             data,
             self.row.copy() if copy else self.row,
             self.col.copy() if copy else self.col,
-            self.shape)
-        A.has_canonical_format = self.has_canonical_format
-        return A
+            self.shape,
+            has_canonical_format=self.has_canonical_format)
 
     def diagonal(self, k=0):
         """Returns the k-th diagonal of the matrix.
