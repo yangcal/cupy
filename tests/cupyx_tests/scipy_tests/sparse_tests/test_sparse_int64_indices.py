@@ -1243,6 +1243,71 @@ class TestInt64DtypePreservation:
         c2 = m2.copy()
         assert c2.has_canonical_format is False
 
+    def test_csr_transpose_preserves_int64_small_values(self):
+        # transpose() used the public constructor, which ran
+        # check_contents=True and downcast small int64 to int32.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix._from_parts(
+            data, indices, indptr, shape=(3, 3),
+            has_canonical_format=True)
+        mt = m.T
+        assert mt.indices.dtype == cupy.int64
+        assert mt.indptr.dtype == cupy.int64
+        testing.assert_array_equal(mt.toarray(), m.toarray().T)
+
+    def test_csc_transpose_preserves_int64_small_values(self):
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csc_matrix._from_parts(
+            data, indices, indptr, shape=(3, 3),
+            has_canonical_format=True)
+        mt = m.T
+        assert mt.indices.dtype == cupy.int64
+        assert mt.indptr.dtype == cupy.int64
+        testing.assert_array_equal(mt.toarray(), m.toarray().T)
+
+    def test_coo_transpose_preserves_int64_small_values(self):
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix._from_parts(
+            data, row, col, shape=(3, 3),
+            has_canonical_format=True)
+        mt = m.T
+        assert mt.row.dtype == cupy.int64
+        assert mt.col.dtype == cupy.int64
+        testing.assert_array_equal(mt.toarray(), m.toarray().T)
+
+    def test_coo_dot_scalar_preserves_int64_small_values(self):
+        # COO.dot(scalar) used the public constructor, downcasting.
+        data = cupy.array([1.0, 2.0, 3.0])
+        row = cupy.array([0, 1, 2], dtype=cupy.int64)
+        col = cupy.array([0, 1, 2], dtype=cupy.int64)
+        m = sparse.coo_matrix._from_parts(
+            data, row, col, shape=(3, 3),
+            has_canonical_format=True)
+        result = m.dot(2.0)
+        assert result.row.dtype == cupy.int64
+        assert result.col.dtype == cupy.int64
+        testing.assert_array_equal(
+            result.toarray(), m.toarray() * 2.0)
+
+    def test_csr_max_axis_preserves_dtype(self):
+        # _min_or_max_axis returned float64 when input was float32
+        # because the reduction promotes dtype and the old code
+        # didn't cast back.
+        data = cupy.array([1.0, 2.0, 3.0], dtype=cupy.float32)
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix._from_parts(
+            data, indices, indptr, shape=(3, 3),
+            has_canonical_format=True)
+        result = m.max(axis=0)
+        assert result.dtype == cupy.float32
+
     def test_vstack_preserves_explicitly_set_int64(self):
         # _compressed_sparse_stack bypass: vstack must not downcast int64
         # indices set explicitly on input matrices.

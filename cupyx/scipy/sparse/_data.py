@@ -170,20 +170,24 @@ class _minmax_mixin:
 
         # Do the reduction
         value = mat._minor_reduce(min_or_max, axis, explicit)
-        major_index = cupy.arange(M)
+        idx_dtype = _sputils.get_index_dtype(maxval=max(self.shape))
+        major_index = cupy.arange(M, dtype=idx_dtype)
 
         mask = value != 0
         major_index = cupy.compress(mask, major_index)
         value = cupy.compress(mask, value)
 
+        n = len(value)
+        zeros = cupy.zeros(n, dtype=idx_dtype)
+        value = value.astype(self.dtype, copy=False)
         if axis == 0:
-            return _coo.coo_matrix(
-                (value, (cupy.zeros(len(value)), major_index)),
-                dtype=self.dtype, shape=(1, M))
+            return _coo.coo_matrix._from_parts(
+                value, zeros, major_index,
+                shape=(1, M))
         else:
-            return _coo.coo_matrix(
-                (value, (major_index, cupy.zeros(len(value)))),
-                dtype=self.dtype, shape=(M, 1))
+            return _coo.coo_matrix._from_parts(
+                value, major_index, zeros,
+                shape=(M, 1))
 
     def _min_or_max(self, axis, out, min_or_max, explicit):
         if out is not None:

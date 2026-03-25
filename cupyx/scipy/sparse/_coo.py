@@ -604,16 +604,23 @@ class coo_matrix(sparse_data._data_matrix):
                 'Sparse matrices do not support an \'axes\' parameter because '
                 'swapping dimensions is the only logical permutation.')
         shape = self.shape[1], self.shape[0]
-        return coo_matrix(
-            (self.data, (self.col, self.row)), shape=shape, copy=copy)
+        if copy:
+            data = self.data.copy()
+            row, col = self.col.copy(), self.row.copy()
+        else:
+            data, row, col = self.data, self.col, self.row
+        return coo_matrix._from_parts(
+            data, row, col, shape,
+            has_canonical_format=self.has_canonical_format)
 
     def dot(self, other):
         """Ordinary dot product"""
         if _util.isscalarlike(other):
-            return coo_matrix(
-                (self.data * other, (self.row, self.col)),
-                shape=self.shape, copy=True,
-            )
+            return coo_matrix._from_parts(
+                self.data * other,
+                self.row.copy(), self.col.copy(),
+                self.shape,
+                has_canonical_format=self.has_canonical_format)
         else:
             return self @ other
 

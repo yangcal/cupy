@@ -105,6 +105,8 @@ def _with_indices_dtype(m, dtype):
     Data array is shared (no copy).  Used to promote int32 index arrays to
     int64 before calling a cuSPARSE function that requires uniform int64.
     """
+    if m.indptr.dtype == dtype:
+        return m
     # Read private attrs to avoid triggering the lazy property getter
     # (GPU kernel + D2H sync) when the flags have not been computed.
     return m.__class__._from_parts(

@@ -543,10 +543,18 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 'swapping dimensions is the only logical permutation.')
 
         shape = self.shape[1], self.shape[0]
-        trans = _csc.csc_matrix(
-            (self.data, self.indices, self.indptr), shape=shape, copy=copy)
-        trans.has_canonical_format = self.has_canonical_format
-        return trans
+        if copy:
+            data = self.data.copy()
+            indices = self.indices.copy()
+            indptr = self.indptr.copy()
+        else:
+            data, indices, indptr = self.data, self.indices, self.indptr
+        return _csc.csc_matrix._from_parts(
+            data, indices, indptr, shape,
+            has_canonical_format=getattr(
+                self, '_has_canonical_format', None),
+            has_sorted_indices=getattr(
+                self, '_has_sorted_indices', None))
 
     def getrow(self, i):
         """Returns a copy of row i of the matrix, as a (1 x n)
