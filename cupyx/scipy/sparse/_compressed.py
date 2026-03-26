@@ -337,8 +337,8 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         check_contents=True downcast that the tuple-3 constructor
         applies.
 
-        Caller must ensure *indices* and *indptr* have the correct
-        dtype and are within bounds for *shape*.
+        Caller must ensure *indices* and *indptr* share the same
+        integer dtype and are within bounds for *shape*.
 
         Args:
             has_canonical_format (bool or None): If ``True`` or
@@ -348,6 +348,10 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
                 ``True`` implies ``has_sorted_indices=True``.
             has_sorted_indices (bool or None): Same semantics.
         """
+        if indices.dtype != indptr.dtype:
+            raise ValueError(
+                'indices and indptr must have the same dtype, '
+                'got {} and {}'.format(indices.dtype, indptr.dtype))
         A = cls.__new__(cls)
         sparse_data._data_matrix.__init__(A, data)
         A.indices = indices
@@ -378,16 +382,6 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
                 self, '_has_canonical_format', None),
             has_sorted_indices=getattr(
                 self, '_has_sorted_indices', None))
-
-    def _empty_like(self, shape):
-        """Return an empty matrix with the same index dtype."""
-        idx = self.indices.dtype
-        major = self._swap(*shape)[0]
-        return self.__class__._from_parts(
-            cupy.empty(0, self.dtype),
-            cupy.empty(0, idx),
-            cupy.zeros(major + 1, idx),
-            shape)
 
     def _convert_dense(self, x):
         raise NotImplementedError
@@ -487,12 +481,11 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         M = idx.size
         new_shape = self._swap(M, N)
         if self.nnz == 0 or M == 0:
-            return self._empty_like(new_shape)
+            return self.__class__(new_shape, dtype=self.dtype)
 
-        return self.__class__._from_parts(
-            *_index._csr_row_index(
-                self.data, self.indices, self.indptr, idx),
-            shape=new_shape)
+        return self.__class__(
+            _index._csr_row_index(self.data, self.indices, self.indptr, idx),
+            shape=new_shape, copy=False)
 
     _bincount_kernel = r"""
     extern "C" __global__
@@ -808,7 +801,10 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         out_data = out_data[sort_key]
 
         # Build output indptr.
-        out_idx_dtype = _sputils.get_index_dtype(maxval=max(M, n_idx))
+        # Propagate the source's index dtype so that int64
+        # matrices produce int64 results.
+        out_idx_dtype = _sputils.get_index_dtype(
+            arrays=(self.indices,), maxval=max(M, n_idx))
         out_indptr = _cusparse_mod._build_indptr(
             out_major, M, out_idx_dtype)
 
@@ -832,16 +828,11 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         if step == 1:
             if M == 0 or self.nnz == 0:
-                return self._empty_like(new_shape)
-            data, indices, indptr = \
+                return self.__class__(new_shape, dtype=self.dtype)
+            return self.__class__(
                 _index._get_csr_submatrix_major_axis(
-                    self.data, self.indices, self.indptr,
-                    start, stop)
-            if copy:
-                data = data.copy()
-                indices = indices.copy()
-            return self.__class__._from_parts(
-                data, indices, indptr, new_shape)
+                    self.data, self.indices, self.indptr, start, stop),
+                shape=new_shape, copy=copy)
         rows = cupy.arange(start, stop, step, dtype=self.indptr.dtype)
         return self._major_index_fancy(rows)
 
@@ -858,13 +849,12 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         new_shape = self._swap(M, N)
 
         if N == 0 or self.nnz == 0:
-            return self._empty_like(new_shape)
+            return self.__class__(new_shape, dtype=self.dtype)
         if step == 1:
-            return self.__class__._from_parts(
-                *_index._get_csr_submatrix_minor_axis(
-                    self.data, self.indices, self.indptr,
-                    start, stop),
-                shape=new_shape)
+            return self.__class__(
+                _index._get_csr_submatrix_minor_axis(
+                    self.data, self.indices, self.indptr, start, stop),
+                shape=new_shape, copy=False)
         cols = cupy.arange(start, stop, step, dtype=self.indices.dtype)
         return self._minor_index_fancy(cols)
 

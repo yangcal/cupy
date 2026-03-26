@@ -101,6 +101,53 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                     return csr_matrix(cupy.ones(self.shape, dtype=numpy.bool_))
                 else:
                     return csr_matrix(self.shape, dtype=numpy.bool_)
+            scalar = data[0]
+            # Fast path: when op(0, scalar) is False, unstored
+            # entries (implicit zeros) all produce False.  The result
+            # is sparse -- only stored entries can contribute True.
+            # This avoids the O(m*n) expansion in binopt_csr.
+            try:
+                zero_cmp = bool(op(self.dtype.type(0), scalar))
+            except TypeError:
+                # Complex dtypes don't support < > in Python
+                zero_cmp = True  # fall through to binopt
+            if not zero_cmp:
+                self.sum_duplicates()
+                new_data = op(self.data, scalar)
+                # Keep only True entries (filter explicit False).
+                mask = new_data
+                if mask.all():
+                    return csr_matrix._from_parts(
+                        new_data, self.indices.copy(),
+                        self.indptr.copy(), self.shape,
+                        has_sorted_indices=True)
+                from cupyx.cusparse import (
+                    _indptr_to_coo, _build_indptr)
+                idx_dtype = self.indices.dtype
+                rows = _indptr_to_coo(self.indptr, self.nnz)
+                rows = rows[mask]
+                cols = self.indices[mask]
+                data = new_data[mask]
+                M = self._swap(*self.shape)[0]
+                indptr = _build_indptr(rows, M, idx_dtype)
+                return csr_matrix._from_parts(
+                    data, cols, indptr, self.shape,
+                    has_sorted_indices=True)
+            # Slow path: op(0, scalar) is True, so unstored entries
+            # contribute.  Fall through to binopt_csr which expands
+            # to O(m*n).  This is unavoidable when the result is
+            # dense.  Match scipy by emitting a warning.
+            _inv = {
+                '_eq_': ('==', '!='), '_ne_': ('!=', '=='),
+                '_lt_': ('<', '>='), '_gt_': ('>', '<='),
+                '_le_': ('<=', '>'), '_ge_': ('>=', '<'),
+            }
+            sym, alt = _inv.get(op_name, (op_name, '!='))
+            warnings.warn(
+                'Comparing a sparse matrix with {} using {} is '
+                'inefficient. Try using {} instead.'
+                .format(scalar, sym, alt),
+                _base.SparseEfficiencyWarning)
             idx_dtype = self.indices.dtype
             other = csr_matrix._from_parts(
                 data,
@@ -633,9 +680,12 @@ def check_shape_for_pointwise_op(a_shape, b_shape, allow_broadcasting=True):
 
 def multiply_by_scalar(sp, a):
     data = sp.data * a
-    indices = sp.indices.copy()
-    indptr = sp.indptr.copy()
-    return csr_matrix((data, indices, indptr), shape=sp.shape)
+    return csr_matrix._from_parts(
+        data, sp.indices.copy(), sp.indptr.copy(), sp.shape,
+        has_canonical_format=getattr(
+            sp, '_has_canonical_format', None),
+        has_sorted_indices=getattr(
+            sp, '_has_sorted_indices', None))
 
 
 def multiply_by_dense(sp, dn):
@@ -665,7 +715,8 @@ def multiply_by_dense(sp, dn):
         dn, it(dn_m), it(dn_n), indptr, it(m), it(n),
         data, indices)
 
-    return csr_matrix((data, indices, indptr), shape=(m, n))
+    return csr_matrix._from_parts(
+        data, indices, indptr, shape=(m, n))
 
 
 _GET_ROW_ID_ = '''
@@ -811,7 +862,8 @@ def multiply_by_csr(a, b):
     # remove zero elements in matrix c
     cupy_multiply_by_csr_step2()(c_data, c_indices, flags, d_data, d_indices)
 
-    return csr_matrix((d_data, d_indices, d_indptr), shape=(m, n))
+    return csr_matrix._from_parts(
+        d_data, d_indices, d_indptr, shape=(m, n))
 
 
 @cupy._util.memoize(for_each_device=True)
@@ -989,8 +1041,7 @@ def binopt_csr(a, b, op_name):
         a_info, a_valid, a_tmp_indices, a_tmp_data, it(a_nnz),
         b_info, b_valid, b_tmp_indices, b_tmp_data, it(b_nnz),
         c_indices, c_data, size=_size)
-    return csr_matrix._from_parts(
-        c_data, c_indices, c_indptr, shape=(m, n))
+    return csr_matrix((c_data, c_indices, c_indptr), shape=(m, n))
 
 
 @cupy._util.memoize(for_each_device=True)

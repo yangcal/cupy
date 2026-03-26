@@ -1390,6 +1390,54 @@ class TestInt64DtypePreservation:
         assert r.row.dtype == cupy.int64
         assert r.col.dtype == cupy.int64
 
+    def test_csr_truediv_preserves_int64_small_values(self):
+        # multiply_by_scalar used the public constructor.
+        data = cupy.array([2.0, 4.0, 6.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix._from_parts(
+            data, indices, indptr, shape=(3, 3),
+            has_canonical_format=True)
+        r = m / 2.0
+        assert r.indices.dtype == cupy.int64
+        testing.assert_array_almost_equal(
+            r.toarray(), cupy.diag(cupy.array([1., 2., 3.])))
+
+    def test_csr_multiply_csr_preserves_int64_small_values(self):
+        # multiply_by_csr used the public constructor.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix._from_parts(
+            data, indices, indptr, shape=(3, 3),
+            has_canonical_format=True,
+            has_sorted_indices=True)
+        r = m.multiply(m)
+        assert r.indices.dtype == cupy.int64
+
+    def test_csr_fancy_col_preserves_int64_small_values(self):
+        # _minor_index_fancy_sorted recomputed dtype from output
+        # shape instead of propagating the input's index dtype.
+        data = cupy.array([1.0, 2.0, 3.0])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix._from_parts(
+            data, indices, indptr, shape=(3, 3),
+            has_canonical_format=True,
+            has_sorted_indices=True)
+        r = m[:, cupy.array([0, 2])]
+        assert r.indices.dtype == cupy.int64
+
+    def test_from_parts_rejects_mismatched_dtypes(self):
+        # _from_parts should reject mismatched indices/indptr dtypes.
+        import pytest
+        with pytest.raises(ValueError, match='same dtype'):
+            sparse.csr_matrix._from_parts(
+                cupy.array([1.0]),
+                cupy.array([0], dtype=cupy.int32),
+                cupy.array([0, 1], dtype=cupy.int64),
+                shape=(1, 3))
+
     def test_vstack_preserves_explicitly_set_int64(self):
         # _compressed_sparse_stack bypass: vstack must not downcast int64
         # indices set explicitly on input matrices.
