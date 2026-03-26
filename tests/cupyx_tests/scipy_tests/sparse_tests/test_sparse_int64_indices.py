@@ -1438,6 +1438,30 @@ class TestInt64DtypePreservation:
                 cupy.array([0, 1], dtype=cupy.int64),
                 shape=(1, 3))
 
+    def test_csr_fancy_col_empty_preserves_int64(self):
+        # _minor_index_fancy empty case used the public constructor.
+        m = sparse.csr_matrix._from_parts(
+            cupy.empty(0, 'f'),
+            cupy.empty(0, cupy.int64),
+            cupy.zeros(4, cupy.int64),
+            shape=(3, 3))
+        r = m[:, [0, 2]]
+        assert r.indices.dtype == cupy.int64
+
+    def test_csr_fancy_col_zero_match_preserves_int64(self):
+        # _minor_index_fancy_sorted zero-nnz case used the public
+        # constructor.
+        data = cupy.array([1., 2., 3.])
+        indices = cupy.array([0, 1, 2], dtype=cupy.int64)
+        indptr = cupy.array([0, 1, 2, 3], dtype=cupy.int64)
+        m = sparse.csr_matrix._from_parts(
+            data, indices, indptr, shape=(3, 5),
+            has_canonical_format=True,
+            has_sorted_indices=True)
+        r = m[:, cupy.array([3, 4])]
+        assert r.indices.dtype == cupy.int64
+        assert r.nnz == 0
+
     def test_vstack_preserves_explicitly_set_int64(self):
         # _compressed_sparse_stack bypass: vstack must not downcast int64
         # indices set explicitly on input matrices.
