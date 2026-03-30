@@ -2549,16 +2549,15 @@ class TestInt64Binopt:
 
 
 class TestInt64Dense2csrGuard:
-    """dense2csr fallback rejects large bool matrices.
-
-    The fallback kernels use int32 arithmetic, so matrices with
-    m*n > INT32_MAX would silently overflow.  The guard raises
-    ValueError with a suggestion to convert to float first.
-    """
+    """dense2csr with int64 kernels for large bool matrices."""
 
     @testing.slow
     def test_large_bool_dense_to_csr(self):
         n = numpy.iinfo(numpy.int32).max // 2 + 1
+        # Requires ~19 GB: 2*n bytes (dense) + (2*n+1)*8 (info array)
+        mem_free = cupy.cuda.runtime.memGetInfo()[0]
+        if mem_free < 20 * (1 << 30):
+            pytest.skip('insufficient GPU memory (~20 GB needed)')
         a = cupy.zeros((2, n), dtype=bool)
         a[0, 0] = True
         m = sparse.csr_matrix(a)
@@ -2856,6 +2855,9 @@ class TestInt64FollowupDense2csr:
     @testing.slow
     def test_large_bool_dense_to_csr(self):
         n = numpy.iinfo(numpy.int32).max // 2 + 1
+        mem_free = cupy.cuda.runtime.memGetInfo()[0]
+        if mem_free < 20 * (1 << 30):
+            pytest.skip('insufficient GPU memory (~20 GB needed)')
         a = cupy.zeros((2, n), dtype=bool)
         a[0, 0] = True
         m = sparse.csr_matrix(a)
