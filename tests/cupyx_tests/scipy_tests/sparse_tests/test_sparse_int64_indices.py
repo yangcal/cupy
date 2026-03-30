@@ -2557,12 +2557,14 @@ class TestInt64Dense2csrGuard:
     """
 
     @testing.slow
-    def test_large_bool_dense_to_csr_raises(self):
+    def test_large_bool_dense_to_csr(self):
         n = numpy.iinfo(numpy.int32).max // 2 + 1
         a = cupy.zeros((2, n), dtype=bool)
         a[0, 0] = True
-        with pytest.raises(ValueError, match='dense2csr'):
-            sparse.csr_matrix(a)
+        m = sparse.csr_matrix(a)
+        assert m.indices.dtype == cupy.int64
+        assert m.nnz == 1
+        assert int(m.indices[0]) == 0
 
 
 class TestInt64DiaConversion:
@@ -2680,3 +2682,196 @@ class TestInt64RandomSparse:
         assert m.indices.dtype == cupy.int32
         assert m.indptr.dtype == cupy.int32
         assert m.nnz > 0
+
+
+# ===================================================================
+# Regression tests for CUDA 13.0 followup and deep-review fixes.
+#
+# Each test demonstrates a specific bug that existed before the fix.
+# They should fail if the corresponding fix is reverted.
+# ===================================================================
+
+
+def _small_int64_csr(values=None, shape=(3, 3)):
+    """Diagonal CSR with int64 indices whose values fit in int32."""
+    if values is None:
+        values = [1., 2., 3.]
+    n = len(values)
+    return sparse.csr_matrix._from_parts(
+        cupy.array(values, dtype='f'),
+        cupy.array(list(range(n)), dtype=cupy.int64),
+        cupy.array(list(range(n + 1)), dtype=cupy.int64),
+        shape=shape,
+        has_canonical_format=True,
+        has_sorted_indices=True)
+
+
+class TestInt64FollowupOpsPreserveDtype:
+    """Operations that used the public constructor (which calls
+    check_contents=True) would silently downcast int64 indices to
+    int32 when values fit.  Fixed by using _from_parts."""
+
+    def test_multiply_scalar_truediv_csr_dense(self):
+        m = _small_int64_csr()
+        for r in [m * 2.0, m / 2.0, m.multiply(m),
+                  m.multiply(cupy.ones((3, 3), dtype='f'))]:
+            assert r.indices.dtype == cupy.int64
+
+    def test_maximum_minimum(self):
+        m = _small_int64_csr([1., 5., 3.])
+        # Sparse paths: maximum(<=0), minimum(>=0).
+        assert m.maximum(-1.0).indices.dtype == cupy.int64
+        assert m.minimum(10.0).indices.dtype == cupy.int64
+        # Original fix broke float32 → float64 promotion.
+        assert m.maximum(-0.5).dtype == numpy.float32
+
+    def test_setdiag(self):
+        m = _small_int64_csr()
+        m.setdiag(cupy.array([10., 20., 30.], dtype='f'))
+        assert m.indices.dtype == cupy.int64
+
+    def test_spgemm(self):
+        a = sparse.random(50, 50, density=0.1, format='csr')
+        a = sparse.csr_matrix._from_parts(
+            a.data, a.indices.astype(cupy.int64),
+            a.indptr.astype(cupy.int64), a.shape,
+            has_canonical_format=True,
+            has_sorted_indices=True)
+        assert (a @ a).indices.dtype == cupy.int64
+
+    def test_hstack_bmat(self):
+        a = _small_int64_csr([1., 2.], shape=(2, 2))
+        # hstack goes through bmat's slow COO path, which converted
+        # inputs via the public COO constructor (downcasting int64).
+        h = sparse.hstack([a, a]).tocsr()
+        assert h.indices.dtype == cupy.int64
+        b = sparse.bmat([[a, a], [a, a]]).tocsr()
+        assert b.indices.dtype == cupy.int64
+        # int32 inputs must stay int32 (no spurious upgrade).
+        a32 = sparse.csr_matrix(cupy.eye(2))
+        h32 = sparse.hstack([a32, a32])
+        idx = h32.row if hasattr(h32, 'row') else h32.indices
+        assert idx.dtype == cupy.int32
+
+    def test_bmat_with_dense_blocks(self):
+        # bmat's blocks_flat was stale after COO conversion, causing
+        # AttributeError: 'ndarray' has no attribute 'nnz'.
+        d = cupy.eye(2, dtype='f')
+        a = sparse.csr_matrix(cupy.eye(2, dtype='f'))
+        r = sparse.bmat([[a, d]]).tocsr()
+        assert r.shape == (2, 4)
+        assert r.nnz == 4
+
+
+class TestInt64FollowupScalarComparison:
+    """Scalar comparison created a (1,1) CSR and broadcast it to the
+    full shape via binopt_csr, allocating O(m*n) temporaries.  The
+    fast path filters stored entries directly when op(0, scalar) is
+    False."""
+
+    def test_fast_path_correctness(self):
+        m = _small_int64_csr([1., 5., 3.])
+        assert (m != 0).nnz == 3
+        assert (m == 5).nnz == 1
+        assert (m > 2).nnz == 2
+
+    def test_matches_scipy(self):
+        import scipy.sparse
+        dense = numpy.array([[1., 0., 3.], [0., -2., 0.]])
+        sp_m = scipy.sparse.csr_matrix(dense)
+        cp_m = sparse.csr_matrix(cupy.array(dense))
+        for scalar in [0, 1, -1]:
+            for op in ['__eq__', '__ne__', '__gt__', '__lt__']:
+                sp_r = getattr(sp_m, op)(scalar).toarray()
+                cp_r = getattr(cp_m, op)(scalar).toarray().get()
+                assert numpy.array_equal(sp_r, cp_r), \
+                    f'{op}({scalar}) mismatch'
+
+    def test_large_shape_no_oom(self):
+        # Without the fast path these would each allocate ~34 GB.
+        m = sparse.csr_matrix._from_parts(
+            cupy.array([5.0]),
+            cupy.array([_LARGE], dtype=cupy.int64),
+            cupy.array([0, 1, 1], dtype=cupy.int64),
+            (2, _LARGE + 2), has_canonical_format=True)
+        assert (m != 0).nnz == 1
+        assert (m > 3).nnz == 1
+        assert (m == 1.0).nnz == 0
+
+
+class TestInt64FollowupSlicingFlags:
+    """_major_slice did not copy indptr on copy=True and lost
+    sort/canonical flags.  _minor_index_fancy_sorted did not set
+    has_canonical_format."""
+
+    def test_major_slice_copy_indptr(self):
+        m = _small_int64_csr()
+        s = m[0:1, :].copy()
+        assert s.indptr.data.ptr != m.indptr.data.ptr
+
+    def test_major_slice_propagates_flags(self):
+        m = _small_int64_csr()
+        s = m[0:1, :]
+        assert s._has_sorted_indices is True
+        assert s._has_canonical_format is True
+
+    def test_fancy_col_sets_canonical(self):
+        m = _small_int64_csr()
+        r = m[:, cupy.array([0, 2])]
+        assert r._has_canonical_format is True
+
+    def test_empty_fancy_col_preserves_int64(self):
+        m = _small_int64_csr(shape=(3, 5))
+        r = m[:, cupy.array([3, 4])]
+        assert r.indices.dtype == cupy.int64
+        assert r.nnz == 0
+
+
+class TestInt64FollowupCumsumWorkaround:
+    """cupy.cumsum silently fails on arrays > 2^31 elements.
+    _cumsum_int64 splits into chunks."""
+
+    def test_cumsum_int64_basic(self):
+        from cupyx.cusparse import _cumsum_int64
+        for dtype in [cupy.int32, cupy.int64]:
+            a = cupy.array([0, 1, 0, 2, 0, 3], dtype=dtype)
+            _cumsum_int64(a)
+            cupy.testing.assert_array_equal(
+                a, cupy.array([0, 1, 1, 3, 3, 6]))
+
+    def test_coo_sum_duplicates_uses_safe_cumsum(self):
+        data = cupy.array([1., 2., 3., 4.])
+        row = cupy.array([0, 0, 1, 1], dtype=cupy.int64)
+        col = cupy.array([0, 0, 1, 1], dtype=cupy.int64)
+        m = sparse.coo_matrix._from_parts(data, row, col, (2, 2))
+        m.sum_duplicates()
+        assert m.nnz == 2
+        cupy.testing.assert_array_equal(
+            m.toarray(), cupy.array([[3., 0.], [0., 7.]]))
+
+
+class TestInt64FollowupDense2csr:
+    """dense2csr kernels were int32-only; now templated for int64."""
+
+    @testing.slow
+    def test_large_bool_dense_to_csr(self):
+        n = numpy.iinfo(numpy.int32).max // 2 + 1
+        a = cupy.zeros((2, n), dtype=bool)
+        a[0, 0] = True
+        m = sparse.csr_matrix(a)
+        assert m.indices.dtype == cupy.int64
+        assert m.nnz == 1
+
+
+class TestInt64FollowupAssertToValueError:
+    """Bare asserts in cusparse.py would be hidden by python -O.
+    Now they raise ValueError/TypeError."""
+
+    def test_raises_valueerror_not_assertionerror(self):
+        m = sparse.csr_matrix(cupy.eye(2, dtype=cupy.float64))
+        m._has_canonical_format = False
+        with pytest.raises(ValueError, match='canonical'):
+            cusparse.spmv(m, cupy.ones(2, dtype=cupy.float64))
+        m._has_canonical_format = True
+        with pytest.raises(ValueError, match='2-D'):
+            cusparse.spmm(m, cupy.ones(2, dtype=cupy.float64))

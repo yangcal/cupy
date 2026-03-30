@@ -266,6 +266,14 @@ def bmat(blocks, format=None, dtype=None):
     brow_lengths = numpy.zeros(M+1, dtype=numpy.int64)
     bcol_lengths = numpy.zeros(N+1, dtype=numpy.int64)
 
+    # Check if any input block has int64 indices before conversion
+    # to COO (the COO constructor may downcast via check_contents).
+    _has_int64 = any(
+        getattr(b, 'indices', getattr(b, 'row', None)) is not None
+        and getattr(b, 'indices', getattr(b, 'row', None)).dtype
+        == cupy.int64
+        for b in blocks_flat)
+
     # convert everything to COO format
     for i in range(M):
         for j in range(N):
@@ -294,6 +302,10 @@ def bmat(blocks, format=None, dtype=None):
                                                     got=A.shape[1]))
                     raise ValueError(msg)
 
+    # Rebuild blocks_flat after COO conversion so that .nnz and
+    # .dtype are available for dense inputs that were converted.
+    blocks_flat = [blocks[i][j] for i in range(M) for j in range(N)
+                   if blocks[i][j] is not None]
     nnz = sum(block.nnz for block in blocks_flat)
     if dtype is None:
         all_dtypes = [blk.dtype for blk in blocks_flat]
@@ -305,12 +317,14 @@ def bmat(blocks, format=None, dtype=None):
     shape = (row_offsets[-1], col_offsets[-1])
 
     data = cupy.empty(nnz, dtype=dtype)
-    # Use the flat-index product as the maxval heuristic: if nrows*ncols >
-    # INT32_MAX, the matrix is "large" and we upgrade to int64 indices to
-    # avoid overflow in downstream operations (e.g. tocsr indptr arithmetic).
-    # Python int arithmetic avoids numpy int32 overflow in the multiplication.
-    idx_dtype = _sputils.get_index_dtype(
-        maxval=int(shape[0]) * int(shape[1]) - 1)
+    # Propagate int64 from input blocks: if any input block had int64
+    # indices (checked before COO conversion), the output should too.
+    # Also check the flat-index product as a maxval heuristic.
+    _maxval = int(shape[0]) * int(shape[1]) - 1
+    if _has_int64:
+        idx_dtype = numpy.int64
+    else:
+        idx_dtype = _sputils.get_index_dtype(maxval=_maxval)
     row = cupy.empty(nnz, dtype=idx_dtype)
     col = cupy.empty(nnz, dtype=idx_dtype)
 
@@ -382,12 +396,25 @@ def random(m, n, density=0.01, format='coo', dtype=None,
     # For large m*n, use rejection sampling (O(k) memory).
     tp = numpy.int64 if mn > numpy.iinfo(numpy.int32).max \
         else numpy.int32
-    try:
-        ind = random_state.choice(mn, size=k, replace=False)
-        ind = ind.astype(tp, copy=False)
-    except cupy.cuda.memory.OutOfMemoryError:
-        cupy.get_default_memory_pool().free_all_blocks()
+
+    # choice() is a fast single-kernel path but allocates an mn-element
+    # permutation array.  When that array exceeds 256 MB AND density is
+    # low enough that rejection sampling converges quickly (< ~10%),
+    # skip the wasteful allocation.  256 MB is at most 1.6% of a 16 GB
+    # GPU and negligible on larger cards, so below this cap we always
+    # prefer the faster choice() path.  The OOM fallback below still
+    # catches cases where even 256 MB is too much.
+    _choice_bytes = mn * (8 if tp == numpy.int64 else 4)
+    _use_rejection = _choice_bytes > (1 << 28) and k < mn // 10
+    if _use_rejection:
         ind = _rejection_sample_indices(mn, k, random_state, tp)
+    else:
+        try:
+            ind = random_state.choice(mn, size=k, replace=False)
+            ind = ind.astype(tp, copy=False)
+        except cupy.cuda.memory.OutOfMemoryError:
+            cupy.get_default_memory_pool().free_all_blocks()
+            ind = _rejection_sample_indices(mn, k, random_state, tp)
     j = ind // m
     i = ind - j * m
     vals = data_rvs(k).astype(dtype)

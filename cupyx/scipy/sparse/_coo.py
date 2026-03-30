@@ -607,9 +607,11 @@ class coo_matrix(sparse_data._data_matrix):
             row, col = self.col.copy(), self.row.copy()
         else:
             data, row, col = self.data, self.col, self.row
+        # Transposing swaps row/col, which generally destroys
+        # canonical order (sorted by row then col).
         return coo_matrix._from_parts(
             data, row, col, shape,
-            has_canonical_format=self.has_canonical_format)
+            has_canonical_format=False)
 
     def dot(self, other):
         """Ordinary dot product"""

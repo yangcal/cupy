@@ -81,6 +81,34 @@ def _indptr_to_coo(indptr, nnz, dtype=None):
         indptr[1:], nnz_range, side='right').astype(dtype)
 
 
+def _cumsum_int64(arr):
+    # TODO(cupy): remove once https://github.com/cupy/cupy/pull/9810
+    # is merged (widens ``int`` to ``long long`` in the CUB scan
+    # wrapper so cupy.cumsum handles > 2^32 elements natively).
+    """In-place cumulative sum that works for arrays >= 2^32 elements.
+
+    ``cupy.cumsum`` silently produces wrong results when the array
+    has >= 2^32 elements.  This helper splits into chunks and chains
+    the partial sums.  For arrays < 2^32 elements, delegates directly
+    to ``cupy.cumsum``.
+    """
+    _CHUNK = (1 << 32) - 1  # UINT32_MAX — largest safe CUB scan size
+    n = arr.shape[0]
+    if n <= _CHUNK:
+        _cupy.cumsum(arr, out=arr)
+        return arr
+    carry = arr.dtype.type(0)
+    for start in range(0, n, _CHUNK):
+        end = min(start + _CHUNK, n)
+        chunk = arr[start:end]
+        _cupy.cumsum(chunk, out=chunk)
+        if start > 0:
+            chunk += carry
+        carry = chunk[-1].item()
+        carry = arr.dtype.type(carry)
+    return arr
+
+
 def _build_indptr(row_indices, n_rows, dtype):
     # TODO(cupy): simplify when cupy.add.at supports int64
     """Build compressed indptr from per-nnz major-axis assignments.
@@ -95,7 +123,7 @@ def _build_indptr(row_indices, n_rows, dtype):
             row_indices, _cupy.uint64(1))
     else:
         _cupy.add.at(indptr[1:], row_indices, 1)
-    _cupy.cumsum(indptr, out=indptr)
+    _cumsum_int64(indptr)
     return indptr
 
 
@@ -179,10 +207,15 @@ _available_cusparse_version = {
     # TODO(cuSPARSE): update when SpGEAM ships in a public release.
     # Absent from all releases through CUDA 13.2 (checked 2026-03-20).
     'spgeam': (99000, None),
-    # TODO(cuSPARSE): verify on CUDA 13.0+ hardware.
-    # CUSPARSE-2365 added int64 SpGEMM in CUDA 13.0.
-    # Encoding: major*1000 + minor*100 + patch → 13000.
-    # hipSPARSE entry is (_numpy.inf, None) below — hipSPARSE spGEMM is int32.
+    # CUSPARSE-2365 added int64 SpGEMM in CUDA 13.0, but cuSPARSE ships
+    # as version 12.7.9 (12709) for both CUDA 12.7 and 13.0.  The
+    # cuSPARSE version alone cannot distinguish the two, so the spgemm()
+    # dispatch checks CUDA runtime version (>= 13000) directly instead
+    # of using check_availability('spgemm_int64').  This dict entry is
+    # kept as a fallback for a future cuSPARSE version that bumps past
+    # 12709 and also supports int64 SpGEMM.
+    # hipSPARSE entry is (_numpy.inf, None) below — hipSPARSE spGEMM is
+    # int32-only.
     'spgemm_int64': (13000, None),
 }
 
@@ -288,7 +321,8 @@ def csrmv(a, x, y=None, alpha=1, beta=0, transa=False):
     if not check_availability('csrmv'):
         raise RuntimeError('csrmv is not available.')
 
-    assert y is None or y.flags.f_contiguous
+    if y is not None and not y.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for y')
 
     a_shape = a.shape if not transa else a.shape[::-1]
     if a_shape[1] != len(x):
@@ -368,7 +402,8 @@ def csrmvEx(a, x, y=None, alpha=1, beta=0, merge_path=True):
     if not check_availability('csrmvEx'):
         raise RuntimeError('csrmvEx is not available.')
 
-    assert y is None or y.flags.f_contiguous
+    if y is not None and not y.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for y')
 
     if a.shape[1] != len(x):
         raise ValueError('dimension mismatch')
@@ -437,9 +472,12 @@ def csrmm(a, b, c=None, alpha=1, beta=0, transa=False):
     if not check_availability('csrmm'):
         raise RuntimeError('csrmm is not available.')
 
-    assert a.ndim == b.ndim == 2
-    assert b.flags.f_contiguous
-    assert c is None or c.flags.f_contiguous
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError('expected 2-D matrices')
+    if not b.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for b')
+    if c is not None and not c.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for c')
 
     a_shape = a.shape if not transa else a.shape[::-1]
     if a_shape[1] != b.shape[0]:
@@ -497,10 +535,14 @@ def csrmm2(a, b, c=None, alpha=1.0, beta=0.0, transa=False, transb=False):
     if not check_availability('csrmm2'):
         raise RuntimeError('csrmm2 is not available.')
 
-    assert a.ndim == b.ndim == 2
-    assert a.has_canonical_format
-    assert b.flags.f_contiguous
-    assert c is None or c.flags.f_contiguous
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError('expected 2-D matrices')
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for b')
+    if c is not None and not c.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for c')
     assert not (transa and transb)
 
     a_shape = a.shape if not transa else a.shape[::-1]
@@ -554,8 +596,10 @@ def csrgeam(a, b, alpha=1, beta=1):
         raise TypeError('unsupported type (actual: {})'.format(type(a)))
     if not isinstance(b, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(b)))
-    assert a.has_canonical_format
-    assert b.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.has_canonical_format:
+        raise ValueError('expected canonical format for b')
     if a.shape != b.shape:
         raise ValueError('inconsistent shapes')
 
@@ -652,8 +696,10 @@ def csrgeam2(a, b, alpha=1, beta=1):
     if not check_availability('csrgeam2'):
         raise RuntimeError('csrgeam2 is not available.')
 
-    assert a.has_canonical_format
-    assert b.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.has_canonical_format:
+        raise ValueError('expected canonical format for b')
     if a.shape != b.shape:
         raise ValueError('inconsistent shapes')
 
@@ -729,8 +775,10 @@ def spgeam(a, b, alpha=1, beta=1):
         raise TypeError('unsupported type (actual: {})'.format(type(a)))
     if not isinstance(b, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(b)))
-    assert a.has_canonical_format
-    assert b.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.has_canonical_format:
+        raise ValueError('expected canonical format for b')
     if a.shape != b.shape:
         raise ValueError('inconsistent shapes')
 
@@ -740,10 +788,11 @@ def spgeam(a, b, alpha=1, beta=1):
     handle = _device.get_cusparse_handle()
 
     # Build an empty C with the right index dtype so SpMatDescr carries it.
+    # Use _from_parts to preserve int64 (public constructor downcasts).
     c_indptr = _cupy.empty(m + 1, dtype=idx_dtype)
-    c = cupyx.scipy.sparse.csr_matrix(
-        (_cupy.empty(0, a.dtype), _cupy.empty(0, idx_dtype), c_indptr),
-        shape=(m, n))
+    c = cupyx.scipy.sparse.csr_matrix._from_parts(
+        _cupy.empty(0, a.dtype), _cupy.empty(0, idx_dtype),
+        c_indptr, (m, n))
 
     mat_a = SpMatDescriptor.create(a)
     mat_b = SpMatDescriptor.create(b)
@@ -794,9 +843,9 @@ def spgeam(a, b, alpha=1, beta=1):
     finally:
         _cusparse.spGEAM_destroyDescr(desc)
 
-    c = cupyx.scipy.sparse.csr_matrix(
-        (c_data, c_indices, c_indptr), shape=(m, n))
-    c.has_canonical_format = True
+    c = cupyx.scipy.sparse.csr_matrix._from_parts(
+        c_data, c_indices, c_indptr, (m, n),
+        has_canonical_format=True)
     return c
 
 
@@ -819,9 +868,12 @@ def csrgemm(a, b, transa=False, transb=False):
     if not check_availability('csrgemm'):
         raise RuntimeError('csrgemm is not available.')
 
-    assert a.ndim == b.ndim == 2
-    assert a.has_canonical_format
-    assert b.has_canonical_format
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError('expected 2-D matrices')
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.has_canonical_format:
+        raise ValueError('expected canonical format for b')
     a_shape = a.shape if not transa else a.shape[::-1]
     b_shape = b.shape if not transb else b.shape[::-1]
     if a_shape[1] != b_shape[0]:
@@ -889,20 +941,25 @@ def csrgemm2(a, b, d=None, alpha=1, beta=1):
     if not check_availability('csrgemm2'):
         raise RuntimeError('csrgemm2 is not available.')
 
-    assert a.ndim == b.ndim == 2
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError('expected 2-D matrices')
     if not isinstance(a, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(a)))
     if not isinstance(b, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(b)))
-    assert a.has_canonical_format
-    assert b.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.has_canonical_format:
+        raise ValueError('expected canonical format for b')
     if a.shape[1] != b.shape[0]:
         raise ValueError('mismatched shape')
     if d is not None:
-        assert d.ndim == 2
+        if d.ndim != 2:
+            raise ValueError('expected 2-D matrix for d')
         if not isinstance(d, cupyx.scipy.sparse.csr_matrix):
             raise TypeError('unsupported type (actual: {})'.format(type(d)))
-        assert d.has_canonical_format
+        if not d.has_canonical_format:
+            raise ValueError('expected canonical format for d')
         if a.shape[0] != d.shape[0] or b.shape[1] != d.shape[1]:
             raise ValueError('mismatched shape')
         if _runtime.is_hip and _driver.get_build_version() < 402:
@@ -990,11 +1047,13 @@ def csr2dense(x, out=None):
         raise RuntimeError('csr2dense is not available.')
 
     dtype = x.dtype
-    assert dtype.char in 'fdFD'
+    if dtype.char not in 'fdFD':
+        raise ValueError('unsupported dtype')
     if out is None:
         out = _cupy.empty(x.shape, dtype=dtype, order='F')
     else:
-        assert out.flags.f_contiguous
+        if not out.flags.f_contiguous:
+            raise ValueError('expected F-contiguous array for out')
 
     handle = _device.get_cusparse_handle()
     _call_cusparse(
@@ -1022,11 +1081,13 @@ def csc2dense(x, out=None):
         raise RuntimeError('csc2dense is not available.')
 
     dtype = x.dtype
-    assert dtype.char in 'fdFD'
+    if dtype.char not in 'fdFD':
+        raise ValueError('unsupported dtype')
     if out is None:
         out = _cupy.empty(x.shape, dtype=dtype, order='F')
     else:
-        assert out.flags.f_contiguous
+        if not out.flags.f_contiguous:
+            raise ValueError('expected F-contiguous array for out')
 
     handle = _device.get_cusparse_handle()
     _call_cusparse(
@@ -1303,13 +1364,13 @@ def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
 
 
 def csr2csc(x):
-    if not check_availability('csr2csc'):
-        raise RuntimeError('csr2csc is not available.')
-
     if x.indices.dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when csr2csc supports int64
         return _cupy_transpose_compressed_int64(
             x, cupyx.scipy.sparse.csc_matrix, int(x.shape[1]))
+
+    if not check_availability('csr2csc'):
+        raise RuntimeError('csr2csc is not available.')
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1332,13 +1393,13 @@ def csr2csc(x):
 
 
 def csr2cscEx2(x):
-    if not check_availability('csr2cscEx2'):
-        raise RuntimeError('csr2cscEx2 is not available.')
-
     if x.indices.dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when csr2cscEx2 supports int64
         return _cupy_transpose_compressed_int64(
             x, cupyx.scipy.sparse.csc_matrix, int(x.shape[1]))
+
+    if not check_availability('csr2cscEx2'):
+        raise RuntimeError('csr2cscEx2 is not available.')
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1398,13 +1459,13 @@ def csc2coo(x, data, indices):
 
 
 def csc2csr(x):
-    if not check_availability('csc2csr'):
-        raise RuntimeError('csr2csc is not available.')
-
     if x.indices.dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when csc2csr supports int64
         return _cupy_transpose_compressed_int64(
             x, cupyx.scipy.sparse.csr_matrix, int(x.shape[0]))
+
+    if not check_availability('csc2csr'):
+        raise RuntimeError('csr2csc is not available.')
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1427,13 +1488,13 @@ def csc2csr(x):
 
 
 def csc2csrEx2(x):
-    if not check_availability('csc2csrEx2'):
-        raise RuntimeError('csc2csrEx2 is not available.')
-
     if x.indices.dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when csc2csrEx2 supports int64
         return _cupy_transpose_compressed_int64(
             x, cupyx.scipy.sparse.csr_matrix, int(x.shape[0]))
+
+    if not check_availability('csc2csrEx2'):
+        raise RuntimeError('csc2csrEx2 is not available.')
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1474,7 +1535,8 @@ def dense2csc(x):
     if not check_availability('dense2csc'):
         raise RuntimeError('dense2csc is not available.')
 
-    assert x.ndim == 2
+    if x.ndim != 2:
+        raise ValueError('expected 2-D matrix')
     x = _cupy.asfortranarray(x)
     nnz = _numpy.empty((), dtype='i')
     handle = _device.get_cusparse_handle()
@@ -1516,7 +1578,8 @@ def dense2csr(x):
     if not check_availability('dense2csr'):
         raise RuntimeError('dense2csr is not available.')
 
-    assert x.ndim == 2
+    if x.ndim != 2:
+        raise ValueError('expected 2-D matrix')
     x = _cupy.asfortranarray(x)
     nnz = _numpy.empty((), dtype='i')
     handle = _device.get_cusparse_handle()
@@ -1553,7 +1616,8 @@ def csr2csr_compress(x, tol):
     if not check_availability('csr2csr_compress'):
         raise RuntimeError('csr2csr_compress is not available.')
 
-    assert x.dtype.char in 'fdFD'
+    if x.dtype.char not in 'fdFD':
+        raise ValueError('unsupported dtype')
 
     handle = _device.get_cusparse_handle()
     m, n = x.shape
@@ -1614,7 +1678,8 @@ class SpMatDescriptor(BaseDescriptor):
 
     @classmethod
     def create(cls, a):
-        assert cupyx.scipy.sparse.issparse(a)
+        if not cupyx.scipy.sparse.issparse(a):
+            raise TypeError('expected sparse matrix')
         rows, cols = a.shape
         idx_base = _cusparse.CUSPARSE_INDEX_BASE_ZERO
         cuda_dtype = _dtype.to_cuda_dtype(a.dtype)
@@ -1676,8 +1741,10 @@ class DnMatDescriptor(BaseDescriptor):
 
     @classmethod
     def create(cls, a):
-        assert a.ndim == 2
-        assert a.flags.f_contiguous
+        if a.ndim != 2:
+            raise ValueError('expected 2-D matrix')
+        if not a.flags.f_contiguous:
+            raise ValueError('expected F-contiguous array')
         rows, cols = a.shape
         ld = rows
         cuda_dtype = _dtype.to_cuda_dtype(a.dtype)
@@ -1723,7 +1790,8 @@ def spmv(a, x, y=None, alpha=1, beta=0, transa=False):
     a_shape = a.shape if not transa else a.shape[::-1]
     if a_shape[1] != len(x):
         raise ValueError('dimension mismatch')
-    assert a.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format')
 
     m, n = a_shape
     a, x, y = _cast_common_type(a, x, y)
@@ -1778,9 +1846,12 @@ def spmm(a, b, c=None, alpha=1, beta=0, transa=False, transb=False):
     if not check_availability('spmm'):
         raise RuntimeError('spmm is not available.')
 
-    assert a.ndim == b.ndim == 2
-    assert b.flags.f_contiguous
-    assert c is None or c.flags.f_contiguous
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError('expected 2-D matrices')
+    if not b.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for b')
+    if c is not None and not c.flags.f_contiguous:
+        raise ValueError('expected F-contiguous array for c')
 
     if isinstance(a, cupyx.scipy.sparse.csc_matrix):
         aT = a.T
@@ -1796,7 +1867,8 @@ def spmm(a, b, c=None, alpha=1, beta=0, transa=False, transb=False):
     b_shape = b.shape if not transb else b.shape[::-1]
     if a_shape[1] != b_shape[0]:
         raise ValueError('dimension mismatch')
-    assert a.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
 
     m, k = a_shape
     _, n = b_shape
@@ -1936,7 +2008,8 @@ def csrsm2(a, b, alpha=1.0, lower=True, unit_diag=False, transa=False,
             raise ValueError('If matrix is CSC format and complex dtype,'
                              'transa must not be \'H\'')
         a = a.T
-        assert cupyx.scipy.sparse.isspmatrix_csr(a)
+        if not cupyx.scipy.sparse.isspmatrix_csr(a):
+            raise TypeError('expected CSR matrix after transpose')
         transa = 1 - transa
         fill_mode = 1 - fill_mode
 
@@ -2065,8 +2138,10 @@ def denseToSparse(x, format='csr'):
     if not check_availability('denseToSparse'):
         raise RuntimeError('denseToSparse is not available.')
 
-    assert x.ndim == 2
-    assert x.dtype.char in 'fdFD'
+    if x.ndim != 2:
+        raise ValueError('expected 2-D matrix')
+    if x.dtype.char not in 'fdFD':
+        raise ValueError('unsupported dtype')
     x = _cupy.asfortranarray(x)
     desc_x = DnMatDescriptor.create(x)
     if format == 'csr':
@@ -2138,12 +2213,15 @@ def sparseToDense(x, out=None):
         raise RuntimeError('sparseToDense is not available.')
 
     dtype = x.dtype
-    assert dtype.char in 'fdFD'
+    if dtype.char not in 'fdFD':
+        raise ValueError('unsupported dtype')
     if out is None:
         out = _cupy.zeros(x.shape, dtype=dtype, order='F')
     else:
-        assert out.flags.f_contiguous
-        assert out.dtype == dtype
+        if not out.flags.f_contiguous:
+            raise ValueError('expected F-contiguous array for out')
+        if out.dtype != dtype:
+            raise ValueError('out dtype mismatch')
 
     desc_x = SpMatDescriptor.create(x)
     desc_out = DnMatDescriptor.create(out)
@@ -2210,7 +2288,8 @@ def spsm(a, b, alpha=1.0, lower=True, unit_diag=False, transa=False):
         pass
     else:
         raise ValueError('a must be CSR, CSC or COO sparse matrix')
-    assert a.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
 
     # Check B's ndim
     if b.ndim == 1:
@@ -2325,7 +2404,8 @@ def spsm(a, b, alpha=1.0, lower=True, unit_diag=False, transa=False):
 
 
 def _cupy_spgemm_int64(a, b, alpha):
-    # TODO(cuSPARSE): remove once CUDA 13.0 int64 SpGEMM verified
+    # TODO(cuSPARSE): remove once all supported CUDA versions have
+    # native int64 SpGEMM (verified working on CUDA 13.0+).
     """Pure-CuPy sort-merge SpGEMM for int64: C = alpha * A * B.
 
     Used on CUDA < 13.0 where cuSPARSE spGEMM lacks int64.
@@ -2403,21 +2483,31 @@ def spgemm(a, b, alpha=1):
         cupyx.scipy.sparse.csr_matrix
 
     """
-    assert a.ndim == b.ndim == 2
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError('expected 2-D matrices')
     if not isinstance(a, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(a)))
     if not isinstance(b, cupyx.scipy.sparse.csr_matrix):
         raise TypeError('unsupported type (actual: {})'.format(type(b)))
 
-    # TODO(cuSPARSE): remove fallback once CUDA 13.0 int64 SpGEMM verified.
+    # TODO(cuSPARSE): remove pure-CuPy fallback when all supported CUDA
+    # versions have native int64 SpGEMM.
+    # cuSPARSE 12.7.9 ships with both CUDA 12.7 and 13.0 but only
+    # CUDA 13.0+ supports int64 SpGEMM (CUSPARSE-2365), so we check
+    # the CUDA runtime version rather than check_availability().
     # Mixed int32/int64 inputs: upcast to int64, prefer cuSPARSE.
     if a.indices.dtype == _cupy.int64 or b.indices.dtype == _cupy.int64:
         if a.shape[1] != b.shape[0]:
             raise ValueError('mismatched shape')
-        if check_availability('spgemm_int64'):
-            # Native int64 available: upcast any int32 index arrays to int64
-            # so cuSPARSE receives uniform int64 (required by the API), then
-            # fall through to the regular cuSPARSE path below.
+        _native_int64 = (
+            not _runtime.is_hip
+            and _runtime.runtimeGetVersion() >= 13000
+            and check_availability('spgemm')
+        ) or check_availability('spgemm_int64')
+        if _native_int64:
+            # Native int64 available: upcast any int32 index arrays to
+            # int64 so cuSPARSE receives uniform int64 (required by the
+            # API), then fall through to the regular cuSPARSE path below.
             if a.indices.dtype != _cupy.int64:
                 a = _with_indices_dtype(a, _cupy.int64)
             if b.indices.dtype != _cupy.int64:
@@ -2429,8 +2519,10 @@ def spgemm(a, b, alpha=1):
     if not check_availability('spgemm'):
         raise RuntimeError('spgemm is not available.')
 
-    assert a.has_canonical_format
-    assert b.has_canonical_format
+    if not a.has_canonical_format:
+        raise ValueError('expected canonical format for a')
+    if not b.has_canonical_format:
+        raise ValueError('expected canonical format for b')
     if a.shape[1] != b.shape[0]:
         raise ValueError('mismatched shape')
 
@@ -2440,9 +2532,12 @@ def spgemm(a, b, alpha=1):
     a, b = _cast_common_type(a, b)
     c_shape = (m, n)
     c_empty_indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
-    c = cupyx.scipy.sparse.csr_matrix(
-        (_cupy.empty(0, a.dtype), _cupy.empty(0, idx_dtype), c_empty_indptr),
-        shape=c_shape)
+    # Use _from_parts to preserve int64 index dtype — the public
+    # constructor would downcast empty int64 arrays to int32 via
+    # check_contents, causing cuSPARSE to reject mixed index types.
+    c = cupyx.scipy.sparse.csr_matrix._from_parts(
+        _cupy.empty(0, a.dtype), _cupy.empty(0, idx_dtype),
+        c_empty_indptr, c_shape)
 
     handle = _device.get_cusparse_handle()
     mat_a = SpMatDescriptor.create(a)
@@ -2511,8 +2606,9 @@ def spgemm(a, b, alpha=1):
     _cusparse.spGEMM_copy(
         handle, op_a, op_b, alpha.data, mat_a.desc, mat_b.desc, beta.data,
         mat_c.desc, cuda_dtype, algo, spgemm_descr)
-    c = cupyx.scipy.sparse.csr_matrix((c_data, c_indices, c_indptr),
-                                      shape=c_shape)
+    c = cupyx.scipy.sparse.csr_matrix._from_parts(
+        c_data, c_indices, c_indptr, c_shape,
+        has_canonical_format=True, has_sorted_indices=True)
 
     _cusparse.spGEMM_destroyDescr(spgemm_descr)
     return c

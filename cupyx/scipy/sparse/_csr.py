@@ -366,8 +366,14 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
             else:
                 self.sum_duplicates()
                 new_data = cupy_op(self.data, other)
-                return csr_matrix((new_data, self.indices, self.indptr),
-                                  shape=self.shape, dtype=dtype)
+                new_data = new_data.astype(dtype, copy=False)
+                return csr_matrix._from_parts(
+                    new_data, self.indices, self.indptr,
+                    self.shape,
+                    has_canonical_format=getattr(
+                        self, '_has_canonical_format', None),
+                    has_sorted_indices=getattr(
+                        self, '_has_sorted_indices', None))
         elif _util.isdense(other):
             self.sum_duplicates()
             other = cupy.atleast_2d(other)
@@ -425,7 +431,8 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
             x_len+1, dtype=idx_dtype)
         x_indptr[row_st+x_len+1:] = x_len
         x_data -= self.diagonal(k=k)[:x_len]
-        y = self + csr_matrix((x_data, x_indices, x_indptr), shape=self.shape)
+        y = self + csr_matrix._from_parts(
+            x_data, x_indices, x_indptr, self.shape)
         self.data = y.data
         self.indices = y.indices
         self.indptr = y.indptr
@@ -1266,51 +1273,65 @@ def dense2csr(a):
         else:
             return cusparse.dense2csr(a)
     m, n = a.shape
-    # TODO(cuSPARSE): template kernels for int64 to remove guard
-    if m * n > numpy.iinfo(numpy.int32).max:
-        raise ValueError(
-            'dense2csr fallback does not support matrices with '
-            'more than INT32_MAX elements for non-float dtypes. '
-            'Convert to float first: csr_matrix(a.astype(float))')
+    mn = m * n
+    idx_dtype = numpy.int64 if mn > numpy.iinfo(numpy.int32).max \
+        else numpy.int32
     a = cupy.ascontiguousarray(a)
-    indptr = cupy.zeros(m + 1, dtype=numpy.int32)
-    info = cupy.zeros(m * n + 1, dtype=numpy.int32)
-    cupy_dense2csr_step1()(m, n, a, indptr, info)
-    indptr = cupy.cumsum(indptr, dtype=numpy.int32)
-    info = cupy.cumsum(info, dtype=numpy.int32)
+    indptr = cupy.zeros(m + 1, dtype=idx_dtype)
+    info = cupy.zeros(mn + 1, dtype=idx_dtype)
+    it = numpy.dtype(idx_dtype).type
+    cupy_dense2csr_step1()(it(m), it(n), a, indptr, info)
+    from cupyx.cusparse import _cumsum_int64
+    _cumsum_int64(indptr)
+    _cumsum_int64(info)
     nnz = int(indptr[-1])
-    indices = cupy.empty(nnz, dtype=numpy.int32)
+    indices = cupy.empty(nnz, dtype=idx_dtype)
     data = cupy.empty(nnz, dtype=a.dtype)
-    cupy_dense2csr_step2()(m, n, a, info, indices, data)
-    return csr_matrix((data, indices, indptr), shape=(m, n))
+    cupy_dense2csr_step2()(it(m), it(n), a, info, indices, data)
+    return csr_matrix._from_parts(
+        data, indices, indptr, (m, n))
+
+
+_DENSE2CSR_ATOMICADD_PREAMBLE = '''
+template <typename I>
+__device__ inline void _d2c_atomic_add(I* addr) {
+    atomicAdd(addr, (I)1);
+}
+template <>
+__device__ inline void _d2c_atomic_add<long long>(long long* addr) {
+    atomicAdd((unsigned long long int*)addr,
+              (unsigned long long int)1);
+}
+'''
 
 
 @cupy._util.memoize(for_each_device=True)
 def cupy_dense2csr_step1():
     return cupy.ElementwiseKernel(
-        'int32 M, int32 N, T A',
+        'I M, I N, T A',
         'raw I INDPTR, raw I INFO',
         '''
-        int row = i / N;
-        int col = i % N;
+        I row = (I)i / N;
+        I col = (I)i % N;
         if (A != static_cast<T>(0)) {
-            atomicAdd( &(INDPTR[row + 1]), 1 );
-            INFO[i + 1] = 1;
+            _d2c_atomic_add( &(INDPTR[row + 1]) );
+            INFO[(I)i + 1] = 1;
         }
         ''',
-        'cupyx_scipy_sparse_dense2csr_step1')
+        'cupyx_scipy_sparse_dense2csr_step1',
+        preamble=_DENSE2CSR_ATOMICADD_PREAMBLE)
 
 
 @cupy._util.memoize(for_each_device=True)
 def cupy_dense2csr_step2():
     return cupy.ElementwiseKernel(
-        'int32 M, int32 N, T A, raw I INFO',
+        'I M, I N, T A, raw I INFO',
         'raw I INDICES, raw T DATA',
         '''
-        int row = i / N;
-        int col = i % N;
+        I row = (I)i / N;
+        I col = (I)i % N;
         if (A != static_cast<T>(0)) {
-            int idx = INFO[i];
+            I idx = INFO[(I)i];
             INDICES[idx] = col;
             DATA[idx] = A;
         }

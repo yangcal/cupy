@@ -818,10 +818,12 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         out_indptr = _cusparse_mod._build_indptr(
             out_major, M, out_idx_dtype)
 
-        # Build output matrix.
+        # Build output matrix.  The lexsort above produces canonical
+        # order (sorted by major then minor).
         return self.__class__._from_parts(
             out_data, out_minor.astype(out_idx_dtype),
             out_indptr, new_shape,
+            has_canonical_format=True,
             has_sorted_indices=True)
 
     def _major_slice(self, idx, copy=False):
@@ -846,8 +848,13 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             if copy:
                 data = data.copy()
                 indices = indices.copy()
+                indptr = indptr.copy()
             return self.__class__._from_parts(
-                data, indices, indptr, new_shape)
+                data, indices, indptr, new_shape,
+                has_canonical_format=getattr(
+                    self, '_has_canonical_format', None),
+                has_sorted_indices=getattr(
+                    self, '_has_sorted_indices', None))
         rows = cupy.arange(start, stop, step, dtype=self.indptr.dtype)
         return self._major_index_fancy(rows)
 
