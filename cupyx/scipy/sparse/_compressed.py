@@ -848,7 +848,8 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             if copy:
                 data = data.copy()
                 indices = indices.copy()
-                indptr = indptr.copy()
+                # indptr is already a new array (Ap[start:stop+1] -
+                # Ap[start]), so no copy needed.
             return self.__class__._from_parts(
                 data, indices, indptr, new_shape,
                 has_canonical_format=getattr(

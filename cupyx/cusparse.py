@@ -92,7 +92,7 @@ def _cumsum_int64(arr):
     the partial sums.  For arrays < 2^32 elements, delegates directly
     to ``cupy.cumsum``.
     """
-    _CHUNK = (1 << 32) - 1  # UINT32_MAX — largest safe CUB scan size
+    _CHUNK = (1 << 32) - 1  # UINT32_MAX -- largest safe CUB scan size
     n = arr.shape[0]
     if n <= _CHUNK:
         _cupy.cumsum(arr, out=arr)
@@ -214,7 +214,7 @@ _available_cusparse_version = {
     # of using check_availability('spgemm_int64').  This dict entry is
     # kept as a fallback for a future cuSPARSE version that bumps past
     # 12709 and also supports int64 SpGEMM.
-    # hipSPARSE entry is (_numpy.inf, None) below — hipSPARSE spGEMM is
+    # hipSPARSE entry is (_numpy.inf, None) below -- hipSPARSE spGEMM is
     # int32-only.
     'spgemm_int64': (13000, None),
 }
@@ -2532,7 +2532,7 @@ def spgemm(a, b, alpha=1):
     a, b = _cast_common_type(a, b)
     c_shape = (m, n)
     c_empty_indptr = _cupy.zeros(m + 1, dtype=idx_dtype)
-    # Use _from_parts to preserve int64 index dtype — the public
+    # Use _from_parts to preserve int64 index dtype -- the public
     # constructor would downcast empty int64 arrays to int32 via
     # check_contents, causing cuSPARSE to reject mixed index types.
     c = cupyx.scipy.sparse.csr_matrix._from_parts(

@@ -428,7 +428,7 @@ def _rejection_sample_indices(mn, k, random_state, tp):
     Fallback for when mn is too large for ``choice(mn, k)``.
     Uses rejection sampling: generate random candidates, deduplicate
     via sort+unique, repeat for any shortfall.  Converges in 1-2
-    iterations for typical sparse densities (collision rate k²/2mn).
+    iterations for typical sparse densities (collision rate k**2 / 2mn).
     """
     flat = cupy.empty(0, dtype=tp)
     remaining = k
