@@ -499,9 +499,10 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             shape=new_shape)
 
     _bincount_kernel = r"""
-    extern "C" __global__
+    template<typename I>
+    __global__
     void bincount_idx_global(const int  n_idx,
-                            const int* __restrict__ idx,
+                            const I* __restrict__ idx,
                             int*       __restrict__ col_cnt)
     {
         int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -510,22 +511,29 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
     }
     """
 
-    _bincount = _core.RawKernel(_bincount_kernel, "bincount_idx_global")
+    _bincount_mod = _core.RawModule(
+        code=_bincount_kernel,
+        options=('-std=c++17',),
+        name_expressions=[
+            f'bincount_idx_global<{t}>' for t in _idx_types
+        ],
+    )
 
     _calc_Bp_kernel = r"""
-    extern "C" __global__
+    template<typename I>
+    __global__
     void row_kept_count(const int  n_row,
-                        const int* __restrict__ Ap,
-                        const int* __restrict__ Aj,
+                        const I* __restrict__ Ap,
+                        const I* __restrict__ Aj,
                         const int* __restrict__ col_cnt,
-                        int*       __restrict__ Bp)
+                        I*       __restrict__ Bp)
 {
     // 1 block = 1 row
     const int row = blockIdx.x;
     if (row >= n_row) return;
 
     int local = 0;
-    for (int p = Ap[row] + threadIdx.x; p < Ap[row + 1]; p += blockDim.x)
+    for (I p = Ap[row] + threadIdx.x; p < Ap[row + 1]; p += blockDim.x)
         local += col_cnt[Aj[p]];
 
     #pragma unroll
@@ -541,37 +549,45 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
             val += __shfl_down_sync(0xffffffff, val, offset);
-        if (threadIdx.x == 0) Bp[row + 1] = val;
+        if (threadIdx.x == 0) Bp[row + 1] = I(val);
     }
 }
 """
 
-    _calc_Bp_minor = _core.RawKernel(_calc_Bp_kernel, "row_kept_count")
+    _calc_Bp_mod = _core.RawModule(
+        code=_calc_Bp_kernel,
+        options=('-std=c++17',),
+        name_expressions=[
+            f'row_kept_count<{t}>' for t in _idx_types
+        ],
+    )
 
     _fill_B_kernel = r"""
-    template<typename T> __global__ void
+    template<typename T, typename I> __global__ void
     fill_B(const int  n_row,
-                        const int* __restrict__ Ap,
-                        const int* __restrict__ Aj,
+                        const I* __restrict__ Ap,
+                        const I* __restrict__ Aj,
                         const   T* __restrict__ Ax,
                         const int* __restrict__ col_offset,
                         const int* __restrict__ col_order,
-                        const int* __restrict__ Bp,
-                        int*       __restrict__ Bj,
+                        const I* __restrict__ Bp,
+                        I*       __restrict__ Bj,
                         T*       __restrict__ Bx)
     {
         // 1 block = 1 row
         const int row = blockIdx.x;
         if (row >= n_row) return;
 
-        // atomic write pointer
-        __shared__ int row_ptr;
-        if (threadIdx.x == 0) row_ptr = Bp[row];
+        // Atomic write pointer — use unsigned long long for atomicAdd
+        // (CUDA supports atomicAdd on unsigned long long but not long long)
+        __shared__ unsigned long long row_ptr;
+        if (threadIdx.x == 0)
+            row_ptr = static_cast<unsigned long long>(Bp[row]);
         __syncthreads();
 
-        for (int p = Ap[row] +threadIdx.x; p < Ap[row + 1]; p +=blockDim.x)
+        for (I p = Ap[row] +threadIdx.x; p < Ap[row + 1]; p +=blockDim.x)
         {
-            int col   = Aj[p];
+            I col     = Aj[p];
             int stop  = col_offset[col];
             int start = (col == 0) ? 0 : col_offset[col - 1];
             int cnt   = stop - start;
@@ -579,10 +595,11 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
             T v = Ax[p];
             // unique slice for this thread
-            int my_out = atomicAdd(&row_ptr, cnt);
+            unsigned long long my_out = atomicAdd(
+                &row_ptr, static_cast<unsigned long long>(cnt));
             for (int k = 0; k < cnt; ++k)
             {
-                Bj[my_out + k] = col_order[start + k];
+                Bj[my_out + k] = I(col_order[start + k]);
                 Bx[my_out + k] = v;
             }
         }
@@ -592,35 +609,37 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
     _fill_B = _core.RawModule(
         code=_fill_B_kernel,
         options=('-std=c++17',),
-        name_expressions=['fill_B<float>',
-                          'fill_B<double>',
-                          ],
+        name_expressions=[
+            f'fill_B<{dt}, {it}>'
+            for dt in ('float', 'double')
+            for it in ('int', 'long long')
+        ],
     )
 
     _fill_B_kernel_complex = r"""
-    template<typename T> __global__ void
+    template<typename T, typename I> __global__ void
     fill_B_complex(const int  n_row,
-                        const int* __restrict__ Ap,
-                        const int* __restrict__ Aj,
+                        const I* __restrict__ Ap,
+                        const I* __restrict__ Aj,
                         const   T* __restrict__ Ax,
                         const int* __restrict__ col_offset,
                         const int* __restrict__ col_order,
-                        const int* __restrict__ Bp,
-                        int*       __restrict__ Bj,
+                        const I* __restrict__ Bp,
+                        I*       __restrict__ Bj,
                         T*       __restrict__ Bx)
     {
         // 1 block = 1 row
         const int row = blockIdx.x;
         if (row >= n_row) return;
 
-        // atomic write pointer
-        __shared__ int row_ptr;
-        if (threadIdx.x == 0) row_ptr = Bp[row];
+        __shared__ unsigned long long row_ptr;
+        if (threadIdx.x == 0)
+            row_ptr = static_cast<unsigned long long>(Bp[row]);
         __syncthreads();
 
-        for (int p = Ap[row] +threadIdx.x; p < Ap[row + 1]; p +=blockDim.x)
+        for (I p = Ap[row] +threadIdx.x; p < Ap[row + 1]; p +=blockDim.x)
         {
-            int col   = Aj[p];
+            I col     = Aj[p];
             int stop  = col_offset[col];
             int start = (col == 0) ? 0 : col_offset[col - 1];
             int cnt   = stop - start;
@@ -628,11 +647,11 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
             T v = Ax[p*2];
             T i = Ax[p*2+1];
-            // unique slice for this thread
-            int my_out = atomicAdd(&row_ptr, cnt);
+            unsigned long long my_out = atomicAdd(
+                &row_ptr, static_cast<unsigned long long>(cnt));
             for (int k = 0; k < cnt; ++k)
             {
-                Bj[my_out + k] = col_order[start + k];
+                Bj[my_out + k] = I(col_order[start + k]);
                 Bx[(my_out + k)*2] = v;
                 Bx[(my_out + k)*2 + 1] = i;
             }
@@ -643,10 +662,18 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
     _fill_B_complex = _core.RawModule(
         code=_fill_B_kernel_complex,
         options=('-std=c++17',),
-        name_expressions=['fill_B_complex<float>',
-                          'fill_B_complex<double>',
-                          ],
+        name_expressions=[
+            f'fill_B_complex<{dt}, {it}>'
+            for dt in ('float', 'double')
+            for it in ('int', 'long long')
+        ],
     )
+
+    @staticmethod
+    def _idx_type_name(dtype):
+        if dtype == cupy.int64:
+            return 'long long'
+        return 'int'
 
     def _minor_index_fancy(self, idx):
         """Index along the minor axis where idx is an array of ints.
@@ -657,17 +684,12 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         if self.nnz == 0 or n_idx == 0:
             return self._empty_like(new_shape)
 
-        # int64 path: sort-based binary-search algorithm.
-        # Avoids the O(N) histogram allocation (col_counts = zeros(N)) which
-        # would be OOM when N > INT32_MAX (e.g. N = 2**32 → 16 GB for int32).
-        # Also fixes dtype truncation: the int32 kernel path silently truncates
-        # self.indices values > INT32_MAX.
-        if self.indices.dtype == cupy.int64:
-            return self._minor_index_fancy_sorted(idx, M, n_idx, new_shape)
+        idx_dtype = self.indices.dtype
+        idx_tname = self._idx_type_name(idx_dtype)
 
         # Create buffers
         col_counts = cupy.zeros(N, dtype=cupy.int32)
-        Bp = cupy.empty(M + 1, dtype=cupy.int32)
+        Bp = cupy.empty(M + 1, dtype=idx_dtype)
         Bp[0] = 0
 
         # Count occurrences of each column
@@ -675,40 +697,46 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         block_count = (n_idx + thread_count - 1) // thread_count
 
-        self._bincount((block_count,),
-                       (thread_count,),
-                       (n_idx, idx, col_counts))
+        bincount_ker = self._bincount_mod.get_function(
+            'bincount_idx_global<{}>'.format(idx_tname))
+        bincount_ker((block_count,),
+                     (thread_count,),
+                     (n_idx, idx, col_counts))
 
         # Compute Bp
-        self._calc_Bp_minor((M,),
-                            (thread_count,),
-                            (M,
-                             self.indptr,
-                             self.indices,
-                             col_counts,
-                             Bp)
-                            )
+        calc_Bp_ker = self._calc_Bp_mod.get_function(
+            'row_kept_count<{}>'.format(idx_tname))
+        calc_Bp_ker((M,),
+                    (thread_count,),
+                    (M,
+                     self.indptr,
+                     self.indices,
+                     col_counts,
+                     Bp)
+                    )
 
         # Compute col_order and col_offset
         col_order = cupy.argsort(idx).astype(cupy.int32)
         col_offset = cupy.cumsum(col_counts, dtype=cupy.int32)
 
         # Compute Bp
-        Bp[1:] = cupy.cumsum(Bp[1:], dtype=cupy.int32)
+        Bp[1:] = cupy.cumsum(Bp[1:], dtype=idx_dtype)
         nnzB = int(Bp[-1].get())
 
-        Bj = cupy.empty(nnzB, dtype=cupy.int32)
+        Bj = cupy.empty(nnzB, dtype=idx_dtype)
         Bx = cupy.empty(nnzB, dtype=self.data.dtype)
 
         # Compute Bj and Bx
         if self.dtype.kind == 'c':
-            ker_name = 'fill_B_complex<{}>'.format(
+            ker_name = 'fill_B_complex<{}, {}>'.format(
                 _scalar.get_typename(self.data.real.dtype),
+                idx_tname,
             )
             fillB = self._fill_B_complex.get_function(ker_name)
         else:
-            ker_name = 'fill_B<{}>'.format(
+            ker_name = 'fill_B<{}, {}>'.format(
                 _scalar.get_typename(self.data.dtype),
+                idx_tname,
             )
             fillB = self._fill_B.get_function(ker_name)
         threads = 32
@@ -731,100 +759,6 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
             shape=new_shape,
         )
         return out
-
-    def _minor_index_fancy_sorted(self, idx, M, n_idx, new_shape):
-        # TODO(cuSPARSE): unify with int32 path when kernels
-        #   support int64 indices (avoids O(N) histogram OOM).
-        """Sort-based fancy minor-axis indexing for int64 indices.
-
-        Uses O(nnz + n_idx) instead of O(N):
-          - Time:  O((nnz + n_idx) log(nnz + n_idx))
-          - Space: O(nnz + n_idx + nnz_out)  [no N-sized buffer]
-
-        It works for both CSR (minor = col) and CSC (minor = row) since the
-        algorithm is expressed entirely in terms of self.indptr/indices and the
-        generic major/minor decomposition.
-        """
-        idx_dtype = self.indices.dtype  # int64
-
-        # Ensure idx is a int64 cupy array so searchsorted dtypes match.
-        idx = cupy.asarray(idx, dtype=idx_dtype)
-
-        # --------------------------------------------------------- #
-        # Step 1: sort the requested indices.                     #
-        # sort_order[k] = j means idx[j] is the k-th smallest    #
-        # requested value.                                        #
-        # --------------------------------------------------------- #
-        sort_order = cupy.argsort(idx)          # shape (n_idx,), int64
-        sorted_idx = idx[sort_order]            # sorted minor-axis requests
-
-        # --------------------------------------------------------- #
-        # Step 2: for each source entry p, find the range         #
-        # [lo[p], hi[p]) in sorted_idx where value equals         #
-        # self.indices[p].                                        #
-        # cnt[p] = output entries generated by source entry p.    #
-        # --------------------------------------------------------- #
-        lo = cupy.searchsorted(sorted_idx, self.indices, side='left')
-        hi = cupy.searchsorted(sorted_idx, self.indices, side='right')
-        cnt = (hi - lo).astype(cupy.int64)
-
-        total_nnz = int(cnt.sum())
-        if total_nnz == 0:
-            return self._empty_like(new_shape)
-
-        # --------------------------------------------------------- #
-        # Step 3: expand source entries to output entries.        #
-        # cum_cnt[p+1] = output entries from source 0..p.        #
-        # For each output position q, out_src[q] is the source   #
-        # entry index.                                            #
-        # --------------------------------------------------------- #
-        cum_cnt = cupy.zeros(self.nnz + 1, dtype=cupy.int64)
-        cupy.cumsum(cnt, out=cum_cnt[1:])
-
-        out_pos = cupy.arange(total_nnz, dtype=cupy.int64)
-        # searchsorted(cum_cnt[1:], q, 'right') gives smallest p where
-        # cum_cnt[p+1] > q, i.e., the source entry responsible for output q.
-        out_src = cupy.searchsorted(
-            cum_cnt[1:], out_pos, side='right').astype(cupy.int64)
-
-        # Offset within source entry p's output range:  q - cum_cnt[p]
-        offset = out_pos - cum_cnt[out_src]
-
-        # --------------------------------------------------------- #
-        # Step 4: gather output minor-axis indices and data.      #
-        # Output minor index =                                    #
-        #   sort_order[lo[src] + offset], in [0, n_idx).          #
-        # --------------------------------------------------------- #
-        out_minor = sort_order[lo[out_src] + offset]   # ∈ [0, n_idx), int64
-        out_data = self.data[out_src]
-
-        # Expand indptr → major-axis index for each source nnz.
-        from cupyx import cusparse as _cusparse_mod
-        major_of_each = _cusparse_mod._indptr_to_coo(
-            self.indptr, self.nnz)
-        out_major = major_of_each[out_src]
-
-        # Sort output by (major, minor) for canonical order.
-        sort_key = cupy.lexsort(cupy.stack([out_minor, out_major]))
-        out_major = out_major[sort_key]
-        out_minor = out_minor[sort_key]
-        out_data = out_data[sort_key]
-
-        # Build output indptr.
-        # Propagate the source's index dtype so that int64
-        # matrices produce int64 results.
-        out_idx_dtype = _sputils.get_index_dtype(
-            arrays=(self.indices,), maxval=max(M, n_idx))
-        out_indptr = _cusparse_mod._build_indptr(
-            out_major, M, out_idx_dtype)
-
-        # Build output matrix.  The lexsort above produces canonical
-        # order (sorted by major then minor).
-        return self.__class__._from_parts(
-            out_data, out_minor.astype(out_idx_dtype),
-            out_indptr, new_shape,
-            has_canonical_format=True,
-            has_sorted_indices=True)
 
     def _major_slice(self, idx, copy=False):
         """Index along the major axis where idx is a slice object.
@@ -873,12 +807,6 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         if N == 0 or self.nnz == 0:
             return self._empty_like(new_shape)
-        if step == 1:
-            return self.__class__._from_parts(
-                *_index._get_csr_submatrix_minor_axis(
-                    self.data, self.indices, self.indptr,
-                    start, stop),
-                shape=new_shape)
         cols = cupy.arange(start, stop, step, dtype=self.indices.dtype)
         return self._minor_index_fancy(cols)
 
