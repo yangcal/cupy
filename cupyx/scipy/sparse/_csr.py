@@ -116,7 +116,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 new_data = op(self.data, scalar)
                 # Keep only True entries (filter explicit False).
                 mask = new_data
-                if mask.all():
+                if mask.all():  # synchronize!
                     return csr_matrix._from_parts(
                         new_data, self.indices.copy(),
                         self.indptr.copy(), self.shape,
@@ -329,7 +329,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
         if self.indices.dtype == cupy.int64:
             # TODO(cuSPARSE): remove when csr2csr_compress supports int64
             mask = self.data != 0
-            if mask.all():
+            if mask.all():  # synchronize!
                 return
             new_data = self.data[mask]
             new_indices = self.indices[mask]
@@ -862,7 +862,7 @@ def multiply_by_csr(a, b):
 
     flags = cupy.cumsum(flags, dtype=a.indptr.dtype)
     d_indptr = cupy.cumsum(nnz_each_row, dtype=a.indptr.dtype)
-    d_nnz = int(d_indptr[-1])
+    d_nnz = int(d_indptr[-1])  # synchronize!
     d_data = cupy.empty(d_nnz, dtype=dtype)
     d_indices = cupy.empty(d_nnz, dtype=a.indices.dtype)
 
@@ -1041,7 +1041,7 @@ def binopt_csr(a, b, op_name):
     a_info = cupy.cumsum(a_info, dtype=a_info.dtype)
     b_info = cupy.cumsum(b_info, dtype=b_info.dtype)
     c_indptr = cupy.cumsum(c_indptr, dtype=c_indptr.dtype)
-    c_nnz = int(c_indptr[-1])
+    c_nnz = int(c_indptr[-1])  # synchronize!
     c_indices = cupy.empty(c_nnz, dtype=idx_dtype)
     c_data = cupy.empty(c_nnz, dtype=out_dtype)
     cupy_binopt_csr_step2(op_name)(
@@ -1284,7 +1284,7 @@ def dense2csr(a):
     from cupyx.cusparse import _cumsum_int64
     _cumsum_int64(indptr)
     _cumsum_int64(info)
-    nnz = int(indptr[-1])
+    nnz = int(indptr[-1])  # synchronize!
     indices = cupy.empty(nnz, dtype=idx_dtype)
     data = cupy.empty(nnz, dtype=a.dtype)
     cupy_dense2csr_step2()(it(m), it(n), a, info, indices, data)

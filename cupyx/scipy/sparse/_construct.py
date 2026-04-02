@@ -522,7 +522,7 @@ def diags(diagonals, offsets=0, shape=None, format=None, dtype=None):
         diagonals = list(map(cupy.atleast_1d, diagonals))
 
     if isinstance(offsets, cupy.ndarray):
-        offsets = offsets.get()
+        offsets = offsets.get()  # synchronize!
     offsets = numpy.atleast_1d(offsets)
 
     # Basic check

@@ -104,7 +104,7 @@ def _cumsum_int64(arr):
         _cupy.cumsum(chunk, out=chunk)
         if start > 0:
             chunk += carry
-        carry = chunk[-1].item()
+        carry = chunk[-1].item()  # synchronize!
         carry = arr.dtype.type(carry)
     return arr
 
@@ -827,7 +827,7 @@ def spgeam(a, b, alpha=1, beta=1):
         c_nnz_arr = _numpy.array(0, dtype='int64')
         _cusparse.spMatGetSize(mat_c.desc, c_num_rows.ctypes.data,
                                c_num_cols.ctypes.data, c_nnz_arr.ctypes.data)
-        c_nnz = int(c_nnz_arr)
+        c_nnz = int(c_nnz_arr)  # synchronize!
 
         c_indices = _cupy.empty(c_nnz, idx_dtype)
         c_data = _cupy.empty(c_nnz, a.dtype)
@@ -2429,7 +2429,7 @@ def _cupy_spgemm_int64(a, b, alpha):
     # Number of B-row-k entries accessible from each nonzero of A at column k.
     b_row_len = _cupy.diff(b_indptr)              # shape (K,)
     products_per_a = b_row_len[a_indices]         # shape (a.nnz,)
-    total_products = int(products_per_a.sum())
+    total_products = int(products_per_a.sum())  # synchronize!
 
     if total_products == 0:
         return cupyx.scipy.sparse.csr_matrix._from_parts(

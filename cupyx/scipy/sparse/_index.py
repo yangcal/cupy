@@ -59,14 +59,12 @@ def _get_csr_submatrix_major_axis(Ax, Aj, Ap, start, stop):
 
     """
     Ap = Ap[start:stop + 1]
-    start_offset, stop_offset = int(Ap[0]), int(Ap[-1])
+    start_offset, stop_offset = int(Ap[0]), int(Ap[-1])  # synchronize!
     Bp = Ap - start_offset
     Bj = Aj[start_offset:stop_offset]
     Bx = Ax[start_offset:stop_offset]
 
     return Bx, Bj, Bp
-
-
 
 
 _csr_row_index_ker = _core.ElementwiseKernel(
@@ -105,7 +103,7 @@ def _csr_row_index(Ax, Aj, Ap, rows):
     Bp = cupy.empty(rows.size + 1, dtype=Ap.dtype)
     Bp[0] = 0
     cupy.cumsum(row_nnz[rows], out=Bp[1:])
-    nnz = int(Bp[-1])
+    nnz = int(Bp[-1])  # synchronize!
 
     out_rows = _csr_indptr_to_coo_rows(nnz, Bp)
 
@@ -441,9 +439,9 @@ class IndexMixin:
         row, col = _unpack_index(key)
 
         if self._is_scalar(row):
-            row = row.item()
+            row = row.item()  # synchronize!
         if self._is_scalar(col):
-            col = col.item()
+            col = col.item()  # synchronize!
 
         # Scipy calls sputils.isintlike() rather than
         # isinstance(x, _int_scalar_types). Comparing directly to int

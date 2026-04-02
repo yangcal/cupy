@@ -316,7 +316,8 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         self.indptr = indptr.astype(idx_dtype, copy=copy)
 
         if shape is None:
-            shape = self._swap(len(indptr) - 1, int(indices.max()) + 1)
+            shape = self._swap(
+                len(indptr) - 1, int(indices.max()) + 1)  # synchronize!
 
         major, minor = self._swap(*shape)
         if len(indptr) != major + 1:
@@ -729,7 +730,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         # Compute Bp
         Bp[1:] = cupy.cumsum(Bp[1:], dtype=idx_dtype)
-        nnzB = int(Bp[-1].get())
+        nnzB = int(Bp[-1])  # synchronize!
 
         Bj = cupy.empty(nnzB, dtype=idx_dtype)
         Bx = cupy.empty(nnzB, dtype=self.data.dtype)
@@ -781,7 +782,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         hi = cupy.searchsorted(sorted_idx, self.indices, side='right')
         cnt = (hi - lo).astype(cupy.int64)
 
-        total_nnz = int(cnt.sum())
+        total_nnz = int(cnt.sum())  # synchronize!
         if total_nnz == 0:
             return self._empty_like(new_shape)
 
@@ -938,7 +939,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         mask = offsets > -1
         self.data[offsets[mask]] = x[mask]
 
-        if mask.all():
+        if mask.all():  # synchronize!
             # only affects existing non-zero cells
             return
 
@@ -981,7 +982,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         # Build output arrays
         cupy.cumsum(new_indptr, out=new_indptr)
-        out_nnz = int(new_indptr[-1])
+        out_nnz = int(new_indptr[-1])  # synchronize!
 
         new_indices = cupy.empty(out_nnz, dtype=idx_dtype)
         new_data = cupy.empty(out_nnz, dtype=self.data.dtype)
@@ -1077,7 +1078,8 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         elif not hasattr(self, '_has_canonical_format'):
             is_canonical = self._has_canonical_format_kern(
                 self.indptr, self.indices, size=self.indptr.size-1)
-            self._has_canonical_format = bool(is_canonical.all())
+            self._has_canonical_format = bool(
+                is_canonical.all())  # synchronize!
         return self._has_canonical_format
 
     def __set_has_canonical_format(self, val):
@@ -1112,7 +1114,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         elif not hasattr(self, '_has_sorted_indices'):
             is_sorted = self._has_sorted_indices_kern(
                 self.indptr, self.indices, size=self.indptr.size-1)
-            self._has_sorted_indices = bool(is_sorted.all())
+            self._has_sorted_indices = bool(is_sorted.all())  # synchronize!
         return self._has_sorted_indices
 
     def __set_sorted(self, val):

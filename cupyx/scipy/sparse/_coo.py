@@ -433,7 +433,7 @@ class coo_matrix(sparse_data._data_matrix):
         src_col = self.col[order]
         diff = self._sum_duplicates_diff(src_row, src_col, size=self.row.size)
 
-        if diff[1:].all():
+        if diff[1:].all():  # synchronize!
             # All elements have different indices.
             data = src_data
             row = src_row
@@ -446,7 +446,7 @@ class coo_matrix(sparse_data._data_matrix):
             # truncate int64 index values > INT32_MAX.
             idx_dtype = self.row.dtype
             index = cupy.cumsum(diff, dtype=idx_dtype)
-            size = int(index[-1]) + 1
+            size = int(index[-1]) + 1  # synchronize!
             data = cupy.zeros(size, dtype=self.data.dtype)
             row = cupy.empty(size, dtype=idx_dtype)
             col = cupy.empty(size, dtype=idx_dtype)

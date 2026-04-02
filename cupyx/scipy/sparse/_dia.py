@@ -73,7 +73,7 @@ class dia_matrix(_data._data_matrix):
                 % (data.shape[0], len(offsets)))
 
         sorted_offsets = cupy.sort(offsets)
-        if (sorted_offsets[:-1] == sorted_offsets[1:]).any():
+        if (sorted_offsets[:-1] == sorted_offsets[1:]).any():  # synchronize!
             raise ValueError('offset array contains duplicate values')
 
         self.data = data
