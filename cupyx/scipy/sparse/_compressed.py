@@ -786,20 +786,19 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         if total_nnz == 0:
             return self._empty_like(new_shape)
 
+        out_src = cupy.repeat(
+            cupy.arange(self.nnz, dtype=cupy.int64), cnt)
+        # offset: position within each repeated group (grouped arange)
         cum_cnt = cupy.zeros(self.nnz + 1, dtype=cupy.int64)
         cupy.cumsum(cnt, out=cum_cnt[1:])
-
-        out_pos = cupy.arange(total_nnz, dtype=cupy.int64)
-        out_src = cupy.searchsorted(
-            cum_cnt[1:], out_pos, side='right').astype(cupy.int64)
-        offset = out_pos - cum_cnt[out_src]
+        offset = cupy.arange(total_nnz, dtype=cupy.int64) \
+            - cum_cnt[out_src]
 
         out_minor = sort_order[lo[out_src] + offset]
         out_data = self.data[out_src]
 
         from cupyx import cusparse as _cusparse_mod
-        major_of_each = _cusparse_mod._indptr_to_coo(
-            self.indptr, self.nnz)
+        major_of_each = _cusparse_mod._indptr_to_coo(self.indptr)
         out_major = major_of_each[out_src]
 
         sort_key = cupy.lexsort(cupy.stack([out_minor, out_major]))

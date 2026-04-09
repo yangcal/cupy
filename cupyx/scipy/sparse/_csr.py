@@ -124,7 +124,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 from cupyx.cusparse import (
                     _indptr_to_coo, _build_indptr)
                 idx_dtype = self.indices.dtype
-                rows = _indptr_to_coo(self.indptr, self.nnz)
+                rows = _indptr_to_coo(self.indptr)
                 rows = rows[mask]
                 cols = self.indices[mask]
                 data = new_data[mask]
@@ -340,8 +340,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 self.indices = new_indices
                 self.indptr = cupy.zeros(nrows + 1, dtype=idx_dtype)
                 return
-            row_of_each = cusparse._indptr_to_coo(
-                self.indptr, self.nnz)
+            row_of_each = cusparse._indptr_to_coo(self.indptr)
             kept_rows = row_of_each[mask]
             new_indptr = cusparse._build_indptr(
                 kept_rows, nrows, idx_dtype)

@@ -65,18 +65,13 @@ def _check_int32_indices(a, func_name):
                 func_name, func_name))
 
 
-def _indptr_to_coo(indptr, nnz, dtype=None):
-    # TODO(cupy): simplify when cupy.repeat accepts ndarray counts
-    """Expand compressed indptr to per-nnz major-axis indices.
-
-    Equivalent to ``repeat(arange(nrows), diff(indptr))`` but uses
-    searchsorted instead.
-    """
+def _indptr_to_coo(indptr, dtype=None):
+    """Expand compressed indptr to per-nnz major-axis indices."""
     if dtype is None:
         dtype = indptr.dtype
-    nnz_range = _cupy.arange(nnz, dtype=dtype)
-    return _cupy.searchsorted(
-        indptr[1:], nnz_range, side='right').astype(dtype)
+    nrows = indptr.shape[0] - 1
+    return _cupy.repeat(
+        _cupy.arange(nrows, dtype=dtype), _cupy.diff(indptr))
 
 
 def _cumsum_int64(arr):
@@ -645,8 +640,8 @@ def _cupy_csrgeam_int64(a, b, alpha, beta):
     a_data = a.data * a.dtype.type(alpha) if alpha != 1 else a.data
     b_data = b.data * b.dtype.type(beta) if beta != 1 else b.data
 
-    a_rows = _indptr_to_coo(a.indptr, a.nnz, idx_dtype)
-    b_rows = _indptr_to_coo(b.indptr, b.nnz, idx_dtype)
+    a_rows = _indptr_to_coo(a.indptr, idx_dtype)
+    b_rows = _indptr_to_coo(b.indptr, idx_dtype)
 
     rows = _cupy.concatenate([a_rows, b_rows])
     cols = _cupy.concatenate([a.indices, b.indices])
@@ -1109,7 +1104,7 @@ def csrsort(x):
 
     if x.indices.dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when xcsrsort supports int64
-        row = _indptr_to_coo(x.indptr, nnz)
+        row = _indptr_to_coo(x.indptr)
         order = _cupy.lexsort(_cupy.stack([x.indices, row]))
         x.indices[:] = x.indices[order]
         x.data[:] = x.data[order]
@@ -1155,7 +1150,7 @@ def cscsort(x):
 
     if x.indices.dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when xcscsort supports int64
-        col = _indptr_to_coo(x.indptr, nnz)
+        col = _indptr_to_coo(x.indptr)
         order = _cupy.lexsort(_cupy.stack([x.indices, col]))
         x.indices[:] = x.indices[order]
         x.data[:] = x.data[order]
@@ -1310,7 +1305,7 @@ def csr2coo(x, data, indices):
 
     if idx_dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when xcsr2coo supports int64
-        row = _indptr_to_coo(x.indptr, nnz)
+        row = _indptr_to_coo(x.indptr)
     else:
         if not check_availability('csr2coo'):
             raise RuntimeError('csr2coo is not available.')
@@ -1352,7 +1347,7 @@ def _cupy_transpose_compressed_int64(x, output_cls, out_dim):
             has_sorted_indices=True)
 
     out_indptr = _build_indptr(x.indices, out_dim, idx_dtype)
-    expanded = _indptr_to_coo(x.indptr, nnz)
+    expanded = _indptr_to_coo(x.indptr)
 
     # Sort by (output major, output minor) for canonical order.
     order = _cupy.lexsort(_cupy.stack([expanded, x.indices]))
@@ -1446,7 +1441,7 @@ def csc2coo(x, data, indices):
 
     if idx_dtype == _cupy.int64:
         # TODO(cuSPARSE): remove when xcsr2coo supports int64
-        col = _indptr_to_coo(x.indptr, nnz)
+        col = _indptr_to_coo(x.indptr)
     else:
         handle = _device.get_cusparse_handle()
         col = _cupy.empty(nnz, idx_dtype)
@@ -2440,17 +2435,17 @@ def _cupy_spgemm_int64(a, b, alpha):
             _cupy.zeros(m + 1, idx_dtype),
             (m, n))
 
-    # TODO(cupy): simplify when cupy.repeat accepts ndarray counts
+    a_src = _cupy.repeat(
+        _cupy.arange(a.nnz, dtype=_cupy.int64), products_per_a)
+    # b_offset: position within each B row (grouped arange)
     cum_prod = _cupy.zeros(a.nnz + 1, dtype=_cupy.int64)
     _cupy.cumsum(products_per_a.astype(_cupy.int64), out=cum_prod[1:])
-    prod_pos = _cupy.arange(total_products, dtype=_cupy.int64)
-    a_src = _cupy.searchsorted(
-        cum_prod[1:], prod_pos, side='right').astype(_cupy.int64)
-    b_offset = prod_pos - cum_prod[a_src]   # offset within the B row
-    del prod_pos, cum_prod                  # free before peak-memory gather
+    b_offset = _cupy.arange(total_products, dtype=_cupy.int64) \
+        - cum_prod[a_src]
+    del cum_prod
 
     # Expand A indptr → row index for each A nonzero.
-    a_rows = _indptr_to_coo(a_indptr, a.nnz)
+    a_rows = _indptr_to_coo(a_indptr)
 
     # Gather the (output_row, output_col, value) triple for each product.
     a_col_k = a_indices[a_src]                       # column of A = row of B
