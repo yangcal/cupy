@@ -672,3 +672,55 @@ class TestFindObjectsBasic:
         if contiguous_type == "strided":
             data = data[::2, ::2]
         return scp.ndimage.find_objects(data)
+
+
+@pytest.mark.slow
+class TestLabelInt32Overflow:
+    """Tests for ndimage.label on arrays large enough to trigger int32 overflow."""
+
+    _CELL_SIZE = 10
+    _RADIUS = 4
+    _INT32_MAX = 2**31 - 1
+
+    def _make_sphere_pack(self, tile_counts):
+        s = self._CELL_SIZE
+        c = s // 2
+        r = self._RADIUS
+        ix, iy, iz = numpy.mgrid[:s, :s, :s]
+        cell = (ix - c) ** 2 + (iy - c) ** 2 + (iz - c) ** 2 <= r ** 2
+        return cupy.tile(cupy.asarray(cell), tile_counts)
+
+    @pytest.mark.parametrize('tile_counts', [
+        ((100, 100, 100)),  # ~1e9 voxels — below int32 limit, baseline correctness
+        ((130, 130, 130)),  # ~2.197e9 voxels — above int32 limit (2^31 = 2,147,483,648)
+    ])
+    @pytest.mark.parametrize('output', [None, numpy.int32, numpy.int64])
+    def test_label_dtype_output(self, tile_counts, output):
+        """Correct label count with dtype-type output argument"""
+        img = self._make_sphere_pack(tile_counts)
+        _, n_labels = cupyx.scipy.ndimage.label(img, output=output)
+        assert n_labels == numpy.prod(tile_counts)
+
+    @pytest.mark.parametrize('tile_counts', [
+        ((100, 100, 100)),
+        ((130, 130, 130)),
+    ])
+    @pytest.mark.parametrize('output_dtype', [numpy.int32, numpy.int64])
+    def test_label_array_output(self, tile_counts, output_dtype):
+        """Correct label count with pre-allocated array output argument"""
+        img = self._make_sphere_pack(tile_counts)
+        out = cupy.empty_like(img, dtype=output_dtype)
+        n_labels = cupyx.scipy.ndimage.label(img, output=out)
+        assert n_labels == numpy.prod(tile_counts)
+
+    def test_label_int32_overflow_error(self):
+        """Raises RuntimeError when n_labels > INT32_MAX with int32 output."""
+        img = cupy.ones((1300, 1300, 1300))
+        assert img.size > self._INT32_MAX
+
+        # every voxel becomes its own component with zero structure
+        structure = numpy.zeros((3, 3, 3), dtype=bool)
+        out = cupy.empty_like(img, dtype=numpy.int32)
+
+        with pytest.raises(RuntimeError):
+            cupyx.scipy.ndimage.label(img, output=out, structure=structure)
