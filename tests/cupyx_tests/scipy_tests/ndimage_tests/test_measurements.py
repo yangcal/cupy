@@ -676,7 +676,7 @@ class TestFindObjectsBasic:
 
 @pytest.mark.slow
 class TestLabelInt32Overflow:
-    """Tests for ndimage.label on arrays large enough to trigger int32 overflow."""
+    """Tests ndimage.label on arrays that trigger int32 overflow."""
 
     _CELL_SIZE = 10
     _RADIUS = 4
@@ -691,8 +691,8 @@ class TestLabelInt32Overflow:
         return cupy.tile(cupy.asarray(cell), tile_counts)
 
     @pytest.mark.parametrize('tile_counts', [
-        ((100, 100, 100)),  # ~1e9 voxels — below int32 limit, baseline correctness
-        ((130, 130, 130)),  # ~2.197e9 voxels — above int32 limit (2^31 = 2,147,483,648)
+        ((100, 100, 100)),  # ~1e9 voxels — below int32 limit
+        ((130, 130, 130)),  # ~2.197e9 voxels — above int32 limit
     ])
     @pytest.mark.parametrize('output', [None, numpy.int32, numpy.int64])
     def test_label_dtype_output(self, tile_counts, output):

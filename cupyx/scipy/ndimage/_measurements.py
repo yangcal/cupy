@@ -61,7 +61,9 @@ def label(input, structure=None, output=None):
     else:
         caller_provided_output = False
         if output is None:
-            output = cupy.empty(input.shape, cupy.intp if need_64bits else cupy.int32)
+            output = cupy.empty(
+                input.shape, cupy.intp if need_64bits else cupy.int32
+            )
         else:
             if output not in (cupy.int32, cupy.int64):
                 # Guard against invalid atomicAdd calls
@@ -86,7 +88,9 @@ def label(input, structure=None, output=None):
         max_label = _label(input, structure, output)
     else:
         # Allocate temporary 64-bit array, then copy results to output buffer
-        tmp_output = cupy.empty(input.shape, cupy.int64 if need_64bits else cupy.int32)
+        tmp_output = cupy.empty(
+            input.shape, cupy.int64 if need_64bits else cupy.int32
+        )
         max_label = _label(input, structure, tmp_output, max_label=2**31 - 1)
         _core.elementwise_copy(tmp_output, output)
 
@@ -121,7 +125,9 @@ def _label(x, structure, y, max_label=None):
     count = cupy.zeros(2, dtype=y.dtype)
 
     _kernel_init()(x, y)
-    atomic_t = "unsigned long long" if y.dtype == cupy.int64 else "unsigned int"
+    atomic_t = (
+        "unsigned long long" if y.dtype == cupy.int64 else "unsigned int"
+    )
     _kernel_connect(atomic_t)(y_shape, dirs, ndirs, x.ndim, y, size=y.size)
     _kernel_count()(y, count, size=y.size)
     nlabels = int(count[0])
