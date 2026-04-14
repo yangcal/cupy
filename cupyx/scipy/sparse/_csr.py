@@ -122,14 +122,14 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                         self.indptr.copy(), self.shape,
                         has_sorted_indices=True)
                 from cupyx.cusparse import (
-                    _indptr_to_coo, _build_indptr)
+                    _indptr_to_coo, _build_indptr_int64)
                 idx_dtype = self.indices.dtype
                 rows = _indptr_to_coo(self.indptr)
                 rows = rows[mask]
                 cols = self.indices[mask]
                 data = new_data[mask]
                 M = self._swap(*self.shape)[0]
-                indptr = _build_indptr(rows, M, idx_dtype)
+                indptr = _build_indptr_int64(rows, M, idx_dtype)
                 return csr_matrix._from_parts(
                     data, cols, indptr, self.shape,
                     has_sorted_indices=True)
@@ -327,7 +327,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
         from cupyx import cusparse
 
         if self.indices.dtype == cupy.int64:
-            # TODO(cuSPARSE): remove when csr2csr_compress supports int64
+            # TODO(eriknw): cuSPARSE--csr2csr_compress doesn't support int64
             mask = self.data != 0
             if mask.all():  # synchronize!
                 return
@@ -342,7 +342,7 @@ class csr_matrix(_compressed._compressed_sparse_matrix):
                 return
             row_of_each = cusparse._indptr_to_coo(self.indptr)
             kept_rows = row_of_each[mask]
-            new_indptr = cusparse._build_indptr(
+            new_indptr = cusparse._build_indptr_int64(
                 kept_rows, nrows, idx_dtype)
             self.data = new_data
             self.indices = new_indices
