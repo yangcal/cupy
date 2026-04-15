@@ -1270,9 +1270,8 @@ def dense2csr(a):
     info = cupy.zeros(mn + 1, dtype=idx_dtype)
     it = numpy.dtype(idx_dtype).type
     cupy_dense2csr_step1()(it(m), it(n), a, indptr, info)
-    from cupyx.cusparse import _cumsum_int64
-    _cumsum_int64(indptr)
-    _cumsum_int64(info)
+    cupy.cumsum(indptr, out=indptr)
+    cupy.cumsum(info, out=info)
     nnz = int(indptr[-1])  # synchronize!
     indices = cupy.empty(nnz, dtype=idx_dtype)
     data = cupy.empty(nnz, dtype=a.dtype)

@@ -74,39 +74,11 @@ def _indptr_to_coo(indptr, dtype=None):
         _cupy.arange(nrows, dtype=dtype), _cupy.diff(indptr))
 
 
-def _cumsum_int64(arr):
-    # TODO(eriknw): remove once https://github.com/cupy/cupy/pull/9810
-    # is merged (widens ``int`` to ``long long`` in the CUB scan
-    # wrapper so cupy.cumsum handles > 2^32 elements natively).
-    """In-place cumulative sum that works for arrays >= 2^32 elements.
-
-    ``cupy.cumsum`` silently produces wrong results when the array
-    has >= 2^32 elements.  This helper splits into chunks and chains
-    the partial sums.  For arrays < 2^32 elements, delegates directly
-    to ``cupy.cumsum``.
-    """
-    _CHUNK = (1 << 32) - 1  # UINT32_MAX -- largest safe CUB scan size
-    n = arr.shape[0]
-    if n <= _CHUNK:
-        _cupy.cumsum(arr, out=arr)
-        return arr
-    carry = arr.dtype.type(0)
-    for start in range(0, n, _CHUNK):
-        end = min(start + _CHUNK, n)
-        chunk = arr[start:end]
-        _cupy.cumsum(chunk, out=chunk)
-        if start > 0:
-            chunk += carry
-        carry = chunk[-1].item()  # synchronize!
-        carry = arr.dtype.type(carry)
-    return arr
-
-
 def _build_indptr_int64(row_indices, n_rows, dtype):
     """Build compressed indptr from per-nnz major-axis assignments."""
     indptr = _cupy.zeros(n_rows + 1, dtype=dtype)
     _cupy.add.at(indptr[1:], row_indices, 1)
-    _cumsum_int64(indptr)
+    _cupy.cumsum(indptr, out=indptr)
     return indptr
 
 
