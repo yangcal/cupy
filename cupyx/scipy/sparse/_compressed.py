@@ -579,7 +579,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
         const int row = blockIdx.x;
         if (row >= n_row) return;
 
-        // Atomic write pointer — use unsigned long long for atomicAdd
+        // Atomic write pointer -- use unsigned long long for atomicAdd
         // (CUDA supports atomicAdd on unsigned long long but not long long)
         __shared__ unsigned long long row_ptr;
         if (threadIdx.x == 0)
@@ -808,7 +808,7 @@ class _compressed_sparse_matrix(sparse_data._data_matrix,
 
         out_idx_dtype = _sputils.get_index_dtype(
             arrays=(self.indices,), maxval=max(M, n_idx))
-        out_indptr = _cusparse_mod._build_indptr_int64(
+        out_indptr = _cusparse_mod._build_indptr(
             out_major, M, out_idx_dtype)
 
         return self.__class__._from_parts(

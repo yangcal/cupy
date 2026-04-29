@@ -90,7 +90,9 @@ class csc_matrix(_compressed._compressed_sparse_matrix):
         elif cupyx.scipy.sparse.isspmatrix_csr(other):
             self.sum_duplicates()
             other.sum_duplicates()
-            if cusparse.check_availability('spgemm'):
+            is_int64 = (self.indices.dtype == cupy.int64
+                        or other.indices.dtype == cupy.int64)
+            if is_int64 or cusparse.check_availability('spgemm'):
                 a = self.tocsr()
                 a.sum_duplicates()
                 return cusparse.spgemm(a, other)
@@ -107,6 +109,16 @@ class csc_matrix(_compressed._compressed_sparse_matrix):
         elif isspmatrix_csc(other):
             self.sum_duplicates()
             other.sum_duplicates()
+            is_int64 = (self.indices.dtype == cupy.int64
+                        or other.indices.dtype == cupy.int64)
+            if is_int64:
+                # csrgemm/csrgemm2 are int32-only; route via spgemm,
+                # which has a pure-CuPy fallback for older cuSPARSE.
+                a = self.tocsr()
+                b = other.tocsr()
+                a.sum_duplicates()
+                b.sum_duplicates()
+                return cusparse.spgemm(a, b)
             if cusparse.check_availability('csrgemm') and not runtime.is_hip:
                 # trans=True is still buggy as of ROCm 4.2.0
                 a = self.T

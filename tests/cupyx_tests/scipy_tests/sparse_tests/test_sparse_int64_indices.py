@@ -1107,6 +1107,75 @@ class TestInt64SpGEMM:
         testing.assert_array_almost_equal(c.data, expected)
 
 
+class TestInt64SpGEMMCscDispatch:
+    """csr * csc, csc * csr, and csc * csc with int64 indices.
+
+    These paths previously fell through to csrgemm/csrgemm2, which are
+    int32-only.  ``__mul__`` now detects int64 operands and routes
+    through ``cusparse.spgemm`` (Generic API on CUDA 13.0+; pure-CuPy
+    ``_cupy_spgemm_int64`` fallback otherwise).
+    """
+
+    def _diag_csr_int64(self, vals):
+        n = len(vals)
+        return sparse.csr_matrix._from_parts(
+            cupy.asarray(vals, dtype=cupy.float64),
+            cupy.arange(n, dtype=cupy.int64),
+            cupy.arange(n + 1, dtype=cupy.int64),
+            (n, n))
+
+    def _diag_csc_int64(self, vals):
+        n = len(vals)
+        return sparse.csc_matrix._from_parts(
+            cupy.asarray(vals, dtype=cupy.float64),
+            cupy.arange(n, dtype=cupy.int64),
+            cupy.arange(n + 1, dtype=cupy.int64),
+            (n, n))
+
+    def test_csr_times_csc_int64(self):
+        # csr_int64 @ csc_int64 used to fall to csrgemm (int32-only)
+        # via __mul__'s csc branch; now routes through spgemm.
+        a = self._diag_csr_int64([1.0, 2.0, 3.0])
+        b = self._diag_csc_int64([4.0, 5.0, 6.0])
+        c = a @ b
+        assert c.indices.dtype == cupy.int64
+        testing.assert_array_almost_equal(
+            c.toarray(), cupy.diag(cupy.array([4.0, 10.0, 18.0])))
+
+    def test_csc_times_csr_int64(self):
+        a = self._diag_csc_int64([1.0, 2.0, 3.0])
+        b = self._diag_csr_int64([4.0, 5.0, 6.0])
+        c = a @ b
+        assert c.indices.dtype == cupy.int64
+        testing.assert_array_almost_equal(
+            c.toarray(), cupy.diag(cupy.array([4.0, 10.0, 18.0])))
+
+    def test_csc_times_csc_int64(self):
+        # Both operands CSC with int64 indices.  This case used to
+        # fall through to the csrgemm path (int32-only) on most CUDA
+        # builds; now routes through spgemm.
+        a = self._diag_csc_int64([1.0, 2.0, 3.0])
+        b = self._diag_csc_int64([4.0, 5.0, 6.0])
+        c = a @ b
+        assert c.indices.dtype == cupy.int64
+        testing.assert_array_almost_equal(
+            c.toarray(), cupy.diag(cupy.array([4.0, 10.0, 18.0])))
+
+    def test_csc_times_csc_mixed_dtypes(self):
+        # int32 csc * int64 csc should also route through spgemm
+        # (mixed-dtype detection picks int64).
+        a32 = sparse.csc_matrix._from_parts(
+            cupy.array([1.0, 2.0, 3.0]),
+            cupy.arange(3, dtype=cupy.int32),
+            cupy.arange(4, dtype=cupy.int32),
+            (3, 3))
+        b64 = self._diag_csc_int64([4.0, 5.0, 6.0])
+        c = a32 @ b64
+        assert c.indices.dtype == cupy.int64
+        testing.assert_array_almost_equal(
+            c.toarray(), cupy.diag(cupy.array([4.0, 10.0, 18.0])))
+
+
 class TestInt64DtypePreservation:
     """_with_data and construction bypass preserve index dtype.
 
