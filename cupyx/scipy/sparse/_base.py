@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numbers
+import warnings
 
 import numpy
 
@@ -33,6 +34,9 @@ class spmatrix:
     """
 
     __array_priority__ = 101
+    # Class default; subclass `__init__`s do not all chain to ``spmatrix``,
+    # so this class attribute is the fallback for ``self.maxprint`` lookups.
+    maxprint = 50
 
     def __init__(self, maxprint=50):
         if self.__class__ == spmatrix:
@@ -60,7 +64,7 @@ class spmatrix:
 
     def __len__(self):
         raise TypeError('sparse matrix length is ambiguous; '
-                        'use getnnz() or shape[0]')
+                        'use shape[0] or .nnz')
 
     def __str__(self):
         # TODO(unno): Do not use get method which is only available when scipy
@@ -215,10 +219,13 @@ class spmatrix:
     def A(self):
         """Dense ndarray representation of this matrix.
 
-        This property is equivalent to
-        :meth:`~cupyx.scipy.sparse.spmatrix.toarray` method.
+        .. deprecated:: 15.0
+           Use :meth:`~cupyx.scipy.sparse.spmatrix.toarray` instead.
 
         """
+        warnings.warn(
+            "`spmatrix.A` is deprecated; use `.toarray()` instead.",
+            DeprecationWarning, stacklevel=2)
         return self.toarray()
 
     @property
@@ -227,7 +234,16 @@ class spmatrix:
 
     @property
     def H(self):
-        return self.getH()
+        """Hermitian (conjugate) transpose of this matrix.
+
+        .. deprecated:: 15.0
+           Use ``.T.conj()`` instead.
+
+        """
+        warnings.warn(
+            "`spmatrix.H` is deprecated; use `.T.conj()` instead.",
+            DeprecationWarning, stacklevel=2)
+        return self.transpose().conj()
 
     @property
     def ndim(self):
@@ -247,7 +263,9 @@ class spmatrix:
 
     @shape.setter
     def shape(self, value):
-        self.set_shape(value)
+        # Bypass the deprecated ``set_shape`` so ``m.shape = ...`` does not
+        # emit a warning.
+        self.reshape(value)
 
     def asformat(self, format):
         """Return this matrix in a given sparse format.
@@ -269,7 +287,14 @@ class spmatrix:
         Returns:
             cupyx.scipy.sparse.spmatrix: A matrix with float type.
 
+        .. deprecated:: 15.0
+           Use ``.astype(numpy.promote_types(self.dtype, 'f'))`` instead.
+
         """
+        warnings.warn(
+            "`spmatrix.asfptype` is deprecated; "
+            "use `.astype(numpy.promote_types(self.dtype, 'f'))` instead.",
+            DeprecationWarning, stacklevel=2)
         if self.dtype.kind == 'f':
             return self
         else:
@@ -355,9 +380,27 @@ class spmatrix:
     # TODO(unno): Implement getcol
 
     def getformat(self):
+        """Return the format of this matrix (e.g., ``'csr'``).
+
+        .. deprecated:: 15.0
+           Use ``.format`` instead.
+
+        """
+        warnings.warn(
+            "`spmatrix.getformat` is deprecated; use `.format` instead.",
+            DeprecationWarning, stacklevel=2)
         return self.format
 
     def getmaxprint(self):
+        """Return the maximum number of stored values shown in ``__str__``.
+
+        .. deprecated:: 15.0
+           Use ``.maxprint`` instead.
+
+        """
+        warnings.warn(
+            "`spmatrix.getmaxprint` is deprecated; use `.maxprint` instead.",
+            DeprecationWarning, stacklevel=2)
         return self.maxprint
 
     def getnnz(self, axis=None):
@@ -471,6 +514,16 @@ class spmatrix:
         return self.tocoo().reshape(shape, order=order)
 
     def set_shape(self, shape):
+        """Set the shape of the matrix in-place.
+
+        .. deprecated:: 15.0
+           Assign to ``.shape`` or use ``.reshape`` instead.
+
+        """
+        warnings.warn(
+            "`spmatrix.set_shape` is deprecated; "
+            "assign to `.shape` or use `.reshape` instead.",
+            DeprecationWarning, stacklevel=2)
         self.reshape(shape)
 
     def setdiag(self, values, k=0):

@@ -535,6 +535,7 @@ class TestCsrMatrixScipyComparison:
         assert len(rows) == 3
         return xp.concatenate([r.toarray() for r in rows])
 
+    @pytest.mark.filterwarnings("ignore:.*asfptype.*:DeprecationWarning")
     @testing.numpy_cupy_array_equal(sp_name='sp')
     def test_asfptype(self, xp, sp):
         m = self.make(xp, sp, self.dtype)
