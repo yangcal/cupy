@@ -88,24 +88,24 @@ class TestDiaMatrix(unittest.TestCase):
 
     @testing.with_requires('scipy>=1.14')
     def test_str(self):
+        # scipy 1.17 changed the DIA ``__str__`` coord ordering.  Assert
+        # the stable parts (header + each (row, col)/value line appears)
+        # plus the delegation invariant ``str(self) == str(self.get())``.
         dtype_name = numpy.dtype(self.dtype).name
-        if numpy.dtype(self.dtype).kind == 'f':
-            expect = f'''<DIAgonal sparse matrix of dtype '{dtype_name}'
-\twith 5 stored elements (2 diagonals) and shape (3, 4)>
-  Coords\tValues
-  (1, 1)\t1.0
-  (2, 2)\t2.0
-  (1, 0)\t3.0
-  (2, 1)\t4.0'''  # NOQA
+        s = str(self.m)
+        assert s == str(self.m.get())
+        assert (f"<DIAgonal sparse matrix of dtype '{dtype_name}'"
+                in s)
+        assert "with 5 stored elements (2 diagonals) and shape (3, 4)" in s
+        kind = numpy.dtype(self.dtype).kind
+        if kind == 'f':
+            for coord, val in [('(1, 1)', '1.0'), ('(2, 2)', '2.0'),
+                               ('(1, 0)', '3.0'), ('(2, 1)', '4.0')]:
+                assert f"{coord}\t{val}" in s
         else:
-            expect = f'''<DIAgonal sparse matrix of dtype '{dtype_name}'
-\twith 5 stored elements (2 diagonals) and shape (3, 4)>
-  Coords\tValues
-  (1, 1)\t(1+0j)
-  (2, 2)\t(2+0j)
-  (1, 0)\t(3+0j)
-  (2, 1)\t(4+0j)'''  # NOQA
-        assert str(self.m) == expect
+            for coord, val in [('(1, 1)', '(1+0j)'), ('(2, 2)', '(2+0j)'),
+                               ('(1, 0)', '(3+0j)'), ('(2, 1)', '(4+0j)')]:
+                assert f"{coord}\t{val}" in s
 
     def test_toarray(self):
         m = self.m.toarray()
@@ -234,6 +234,15 @@ class TestDiaMatrixScipyComparison(unittest.TestCase):
 
     @testing.numpy_cupy_equal(sp_name='sp')
     def test_nnz_axis(self, xp, sp):
+        if self.make_method == '_make_empty':
+            # scipy 1.17 (gh-23055) bounded DIA nnz of empty data by
+            # data.shape[1]; CuPy still returns the diagonal length.
+            # Skip the cross-backend equality check under scipy >= 1.17.
+            from numpy.lib import NumpyVersion
+            import scipy as _sp
+            if NumpyVersion(_sp.__version__) >= '1.17.0.dev0':
+                pytest.skip(
+                    'scipy 1.17 changed empty-DIA nnz semantics (gh-23055)')
         m = self.make(xp, sp, self.dtype)
         return m.nnz
 

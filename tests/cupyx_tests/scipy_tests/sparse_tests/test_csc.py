@@ -481,7 +481,6 @@ class TestCscMatrixScipyComparison:
             with pytest.raises(TypeError):
                 len(m)
 
-    @pytest.mark.filterwarnings("ignore:.*asfptype.*:DeprecationWarning")
     @testing.numpy_cupy_array_equal(sp_name='sp')
     def test_asfptype(self, xp, sp):
         m = self.make(xp, sp, self.dtype)

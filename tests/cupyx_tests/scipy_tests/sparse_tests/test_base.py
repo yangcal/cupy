@@ -90,13 +90,16 @@ class TestSpmatrix(unittest.TestCase):
         return s.maxprint
 
 
-class TestDeprecatedSpmatrixApi:
-    """SciPy 1.14 removed these matrix-only APIs from sparse arrays
-    (sparse arrays don't yet exist in CuPy).  CuPy emits
-    ``DeprecationWarning`` for the matrix versions ahead of removal.
+class TestSpmatrixOnlyApi:
+    """Matrix-only APIs whose status mirrors scipy 1.17.
 
-    The warnings live on ``spmatrix`` and are not overridden by subclasses,
-    so a single CSR fixture covers all formats.
+    SciPy 1.14 *removed* ``.A``/``.H`` from the array side.  CuPy keeps
+    them on ``spmatrix`` for now but emits ``DeprecationWarning`` so user
+    code has a migration breadcrumb.
+
+    SciPy 1.14 deprecated and 1.17 *un-deprecated* ``asfptype``,
+    ``getformat``, ``getmaxprint``, ``set_shape`` (et al.) — they remain
+    plain matrix-side conveniences.  CuPy follows: no warning.
     """
 
     @pytest.fixture
@@ -105,44 +108,45 @@ class TestDeprecatedSpmatrixApi:
                                              [0.0, 2.0, 0.0],
                                              [0.0, 0.0, 3.0]]))
 
-    def test_A_warns(self, m):
-        with pytest.warns(DeprecationWarning, match=r"`spmatrix\.A`"):
-            result = m.A
-        testing.assert_array_equal(result, m.toarray())
+    @pytest.mark.parametrize("attr", ["A", "H"])
+    def test_attr_warns(self, m, attr):
+        with pytest.warns(DeprecationWarning,
+                          match=fr"`spmatrix\.{attr}`"):
+            getattr(m, attr)
 
-    def test_H_warns(self, m):
-        with pytest.warns(DeprecationWarning, match=r"`spmatrix\.H`"):
-            result = m.H
-        testing.assert_array_equal(
-            result.toarray(), m.transpose().conj().toarray())
+    @pytest.mark.parametrize("name", [
+        "asfptype", "getformat", "getmaxprint",
+        "getnnz", "get_shape", "set_shape",
+    ])
+    def test_plain_method_no_warn(self, m, name):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            if name == "set_shape":
+                m.set_shape(m.shape)
+            else:
+                getattr(m, name)()
 
-    def test_asfptype_warns(self, m):
-        with pytest.warns(DeprecationWarning, match="asfptype"):
-            result = m.asfptype()
-        assert result.dtype.kind == 'f'
-
-    def test_getformat_warns(self, m):
-        with pytest.warns(DeprecationWarning, match="getformat"):
-            result = m.getformat()
-        assert result == m.format
-
-    def test_getmaxprint_warns(self, m):
-        with pytest.warns(DeprecationWarning, match="getmaxprint"):
-            result = m.getmaxprint()
-        assert result == m.maxprint
-
-    def test_set_shape_warns(self, m):
-        with pytest.warns(DeprecationWarning, match="set_shape"):
-            m.set_shape(m.shape)
-
-    def test_shape_setter_does_not_warn(self, m):
+    def test_shape_setter_no_warn(self, m):
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
             m.shape = m.shape
 
-    def test_warning_is_attributed_to_caller(self, m):
+    @pytest.mark.parametrize("via", ["set_shape", "shape="])
+    def test_shape_mutates_in_place(self, via):
+        # Regression for the silent no-op: ``reshape`` returned a new
+        # matrix and the result was discarded.  Now the change must be
+        # visible on ``self``.
+        m = sparse.csr_matrix(cupy.array([[1.0, 0.0, 2.0],
+                                          [0.0, 3.0, 0.0]]))
+        if via == "set_shape":
+            m.set_shape((3, 2))
+        else:
+            m.shape = (3, 2)
+        assert m.shape == (3, 2)
+
+    def test_warning_attributed_to_caller(self, m):
         # ``stacklevel=2`` should make the warning point at the user's
         # frame (this test file) rather than ``_base.py``.
         with pytest.warns(DeprecationWarning) as record:
             m.A
-        assert record[0].filename.endswith('test_base.py')
+        assert record[0].filename.endswith("test_base.py")

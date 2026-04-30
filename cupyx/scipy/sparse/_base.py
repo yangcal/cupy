@@ -34,8 +34,10 @@ class spmatrix:
     """
 
     __array_priority__ = 101
-    # Class default; subclass `__init__`s do not all chain to ``spmatrix``,
-    # so this class attribute is the fallback for ``self.maxprint`` lookups.
+    # ``_data_matrix.__init__`` (and therefore the format subclasses
+    # built on it: csr/csc/coo/dia) does not chain through to
+    # ``spmatrix.__init__``, so instances never get ``self.maxprint``
+    # set as an instance attribute.  This class default is the fallback.
     maxprint = 50
 
     def __init__(self, maxprint=50):
@@ -263,9 +265,7 @@ class spmatrix:
 
     @shape.setter
     def shape(self, value):
-        # Bypass the deprecated ``set_shape`` so ``m.shape = ...`` does not
-        # emit a warning.
-        self.reshape(value)
+        self.set_shape(value)
 
     def asformat(self, format):
         """Return this matrix in a given sparse format.
@@ -287,14 +287,7 @@ class spmatrix:
         Returns:
             cupyx.scipy.sparse.spmatrix: A matrix with float type.
 
-        .. deprecated:: 15.0
-           Use ``.astype(numpy.promote_types(self.dtype, 'f'))`` instead.
-
         """
-        warnings.warn(
-            "`spmatrix.asfptype` is deprecated; "
-            "use `.astype(numpy.promote_types(self.dtype, 'f'))` instead.",
-            DeprecationWarning, stacklevel=2)
         if self.dtype.kind == 'f':
             return self
         else:
@@ -380,27 +373,11 @@ class spmatrix:
     # TODO(unno): Implement getcol
 
     def getformat(self):
-        """Return the format of this matrix (e.g., ``'csr'``).
-
-        .. deprecated:: 15.0
-           Use ``.format`` instead.
-
-        """
-        warnings.warn(
-            "`spmatrix.getformat` is deprecated; use `.format` instead.",
-            DeprecationWarning, stacklevel=2)
+        """Return the format of this matrix (e.g., ``'csr'``)."""
         return self.format
 
     def getmaxprint(self):
-        """Return the maximum number of stored values shown in ``__str__``.
-
-        .. deprecated:: 15.0
-           Use ``.maxprint`` instead.
-
-        """
-        warnings.warn(
-            "`spmatrix.getmaxprint` is deprecated; use `.maxprint` instead.",
-            DeprecationWarning, stacklevel=2)
+        """Return the maximum number of stored values shown in ``__str__``."""
         return self.maxprint
 
     def getnnz(self, axis=None):
@@ -514,17 +491,13 @@ class spmatrix:
         return self.tocoo().reshape(shape, order=order)
 
     def set_shape(self, shape):
-        """Set the shape of the matrix in-place.
-
-        .. deprecated:: 15.0
-           Assign to ``.shape`` or use ``.reshape`` instead.
-
-        """
-        warnings.warn(
-            "`spmatrix.set_shape` is deprecated; "
-            "assign to `.shape` or use `.reshape` instead.",
-            DeprecationWarning, stacklevel=2)
-        self.reshape(shape)
+        """Set the shape of the matrix in-place."""
+        # ``self.reshape(shape)`` builds a new matrix and returns it
+        # (it's the immutable form).  To make the change visible on the
+        # original object, build the reshaped matrix in the same format
+        # and swap ``__dict__``. Mirrors scipy 1.17's implementation.
+        new_self = self.reshape(shape).asformat(self.format)
+        self.__dict__ = new_self.__dict__
 
     def setdiag(self, values, k=0):
         """Set diagonal or off-diagonal elements of the array.

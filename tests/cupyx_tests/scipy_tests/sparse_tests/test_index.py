@@ -601,5 +601,7 @@ class TestIndexingValueError(IndexingTestBase):
     def test_indexing_value_error(self):
         for xp, sp in [(numpy, scipy.sparse), (cupy, sparse)]:
             a = self._make_matrix(sp, numpy.float32)
-            with pytest.raises(ValueError):
+            # scipy 1.17 raises IndexError; older scipy and CuPy raise
+            # ValueError.  Accept either to keep the cross-backend assertion.
+            with pytest.raises((ValueError, IndexError)):
                 a[self.indices]
