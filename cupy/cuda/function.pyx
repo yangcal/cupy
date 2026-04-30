@@ -28,7 +28,7 @@ IF CUPY_CUDA_VERSION > 0:
     # Windows: cupy_cufilt.dll (a /MT trampoline) is loaded at runtime
     #          to avoid the /MT vs /MD CRT mismatch with cufilt.lib.
     cdef extern from *:
-        """
+        r"""
         #ifdef _WIN32
         #include <windows.h>
         #include <cstddef>
@@ -59,8 +59,8 @@ IF CUPY_CUDA_VERSION > 0:
                 return 0;
             if (!GetModuleFileNameA(hSelf, path, MAX_PATH))
                 return 0;
-            sep = strrchr(path, '\\\\');
-            if (sep) *(sep + 1) = '\\0';
+            sep = strrchr(path, '\\');
+            if (sep) *(sep + 1) = '\0';
             strcat(path, "cupy_cufilt.dll");
 
             hDll = LoadLibraryA(path);
@@ -398,7 +398,7 @@ cdef class Module:
                 return  # Already built
 
             cdef vector.vector[driver.Function] function_handles
-            cdef unsigned int i, num_functions
+            cdef Py_ssize_t i, num_functions
             cdef const char* mangled_cstr
 
             cdef dict mapping = {}
@@ -410,8 +410,8 @@ cdef class Module:
 
             try:
                 num_functions = driver.moduleGetFunctionCount(self.ptr)
-                function_handles = driver.moduleEnumerateFunctions(
-                    self.ptr, num_functions)
+                driver.moduleEnumerateFunctions(
+                    self.ptr, num_functions, function_handles)
 
                 for i in range(function_handles.size()):
                     mangled_cstr = driver.funcGetName(

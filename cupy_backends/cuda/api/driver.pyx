@@ -258,7 +258,7 @@ cpdef intptr_t moduleGetGlobal(intptr_t module, str varname) except? 0:
     return <intptr_t>var
 
 
-cdef unsigned int moduleGetFunctionCount(intptr_t module) except +:
+cdef unsigned int moduleGetFunctionCount(intptr_t module):
     """Get the number of functions in a module (CUDA driver 12.4+)."""
     initialize()
     cdef unsigned int count = 0
@@ -268,31 +268,30 @@ cdef unsigned int moduleGetFunctionCount(intptr_t module) except +:
     return count
 
 
-cdef vector.vector[Function] moduleEnumerateFunctions(
-        intptr_t module, unsigned int count) except +:
+cdef int moduleEnumerateFunctions(
+        intptr_t module, unsigned int count,
+        vector.vector[Function]& result) except? -1:
     """Enumerate functions in a module (CUDA driver 12.4+).
 
     Args:
         module: Module handle.
         count: Number of function handles to retrieve (must match
                the value returned by :func:`moduleGetFunctionCount`).
-
-    Returns:
-        Vector of function handles.
+        result: Output vector; cleared and resized internally.
     """
     initialize()
-    cdef vector.vector[Function] result
+    result.clear()
     result.resize(count)
 
     if count == 0:
-        return result
+        return 0
 
     with nogil:
         status = cuModuleEnumerateFunctions(
             result.data(), count, <Module>module)
     check_status(status)
 
-    return result
+    return 0
 
 
 cdef const char* funcGetName(intptr_t func) except? NULL:
