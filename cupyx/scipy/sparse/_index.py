@@ -6,6 +6,7 @@ from __future__ import annotations
 import cupy
 from cupy import _core
 
+from cupyx.scipy.sparse._base import issparse
 from cupyx.scipy.sparse._base import isspmatrix
 from cupyx.scipy.sparse._base import spmatrix
 
@@ -382,7 +383,12 @@ class IndexMixin:
 
         if isinstance(row, _int_scalar_types) and\
                 isinstance(col, _int_scalar_types):
-            x = cupy.asarray(x, dtype=self.dtype)
+            # A 1x1 sparse RHS (cupy/scipy sparse) is a valid scalar
+            # source — densify it before checking size.
+            if issparse(x):
+                x = cupy.asarray(x.toarray(), dtype=self.dtype)
+            else:
+                x = cupy.asarray(x, dtype=self.dtype)
             if x.size != 1:
                 raise ValueError('Trying to assign a sequence to an item')
             self._set_intXint(row, col, x.flat[0])

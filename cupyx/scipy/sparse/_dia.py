@@ -131,20 +131,38 @@ class dia_matrix(_data._data_matrix):
                 'getnnz over an axis is not implemented for DIA format')
 
         m, n = self.shape
+        # Bound by the actual data buffer length so an "empty" DIA
+        # (data.shape[1] == 0 with non-empty offsets) reports 0,
+        # matching scipy 1.17 (gh-23055).
+        L = min(self.data.shape[1], n)
         it = self.offsets.dtype.type
         # Use int64 accumulator: per-diagonal counts fit int32, but the
         # sum across (m + n - 1) diagonals can exceed INT32_MAX even when
         # the offsets dtype is int32 (e.g., a dense 2**15 x 2**15 matrix).
         nnz = _core.ReductionKernel(
-            'I offsets, I m, I n', 'int64 nnz',
-            'offsets > 0 ? min(m, n - offsets) : min(m + offsets, n)',
+            'I offsets, I m, I L', 'int64 nnz',
+            'max(min(m + offsets, L) - max(offsets, (I)0), (I)0)',
             'a + b', 'nnz = a', '0', 'dia_nnz')(
-                self.offsets, it(m), it(n))
+                self.offsets, it(m), it(L))
         return int(nnz)
 
     def toarray(self, order=None, out=None):
         """Returns a dense matrix representing the same value."""
         return self.tocsc().toarray(order=order, out=out)
+
+    def todia(self, copy=False):
+        """Return this object unchanged (already in DIA format).
+
+        The base ``_spbase.todia`` would round-trip via CSR, which is
+        unnecessary work and currently raises ``NotImplementedError``
+        because :meth:`csr_matrix.todia` is unimplemented.
+
+        Args:
+            copy (bool): If ``True``, return a copy.
+        """
+        if copy:
+            return self.copy()
+        return self
 
     def tocsc(self, copy=False):
         """Converts the matrix to Compressed Sparse Column format.
@@ -182,8 +200,14 @@ class dia_matrix(_data._data_matrix):
                 self.offsets[:, None].astype(idx_dtype, copy=False),
                 it(num_rows), it(num_cols), self.data)
         indptr = cupy.zeros(num_cols + 1, dtype=idx_dtype)
-        indptr[1: offset_len + 1] = cupy.cumsum(mask.sum(axis=0))
-        indptr[offset_len + 1:] = indptr[offset_len]
+        # When ``offset_len`` exceeds ``num_cols`` (data buffer wider
+        # than the matrix), the trailing columns lie outside the matrix
+        # and their mask entries are all False, so truncate to
+        # ``num_cols`` for the indptr write.
+        col_counts = mask.sum(axis=0)
+        eff_len = min(offset_len, num_cols)
+        indptr[1: eff_len + 1] = cupy.cumsum(col_counts[:eff_len])
+        indptr[eff_len + 1:] = indptr[eff_len]
         indices = row.T[mask.T].astype(idx_dtype, copy=False)
         data = self.data.T[mask.T]
         return _csc.csc_matrix(

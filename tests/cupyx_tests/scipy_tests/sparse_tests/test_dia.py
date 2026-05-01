@@ -88,24 +88,18 @@ class TestDiaMatrix(unittest.TestCase):
 
     @testing.with_requires('scipy>=1.14')
     def test_str(self):
+        # CuPy's ``__str__`` delegates to ``str(self.get())``, so the
+        # exact output is whatever scipy produces.  scipy 1.17 changed
+        # the DIA listing order (diagonal-major -> row-major), so
+        # comparing against a hardcoded string would break across
+        # versions.  Compare against scipy's own output instead.
         dtype_name = numpy.dtype(self.dtype).name
-        if numpy.dtype(self.dtype).kind == 'f':
-            expect = f'''<DIAgonal sparse matrix of dtype '{dtype_name}'
-\twith 5 stored elements (2 diagonals) and shape (3, 4)>
-  Coords\tValues
-  (1, 1)\t1.0
-  (2, 2)\t2.0
-  (1, 0)\t3.0
-  (2, 1)\t4.0'''  # NOQA
-        else:
-            expect = f'''<DIAgonal sparse matrix of dtype '{dtype_name}'
-\twith 5 stored elements (2 diagonals) and shape (3, 4)>
-  Coords\tValues
-  (1, 1)\t(1+0j)
-  (2, 2)\t(2+0j)
-  (1, 0)\t(3+0j)
-  (2, 1)\t(4+0j)'''  # NOQA
-        assert str(self.m) == expect
+        s = str(self.m)
+        # Sanity check: the header line is owned by scipy and is
+        # version-stable -- assert it explicitly.
+        assert s.splitlines()[0] == (
+            f"<DIAgonal sparse matrix of dtype '{dtype_name}'")
+        assert str(self.m) == str(self.m.get())
 
     def test_toarray(self):
         m = self.m.toarray()
@@ -138,6 +132,36 @@ class TestDiaMatrix(unittest.TestCase):
             self.m.diagonal(2), cupy.array([0, 0], self.dtype))
         testing.assert_array_equal(
             self.m.diagonal(3), cupy.array([0], self.dtype))
+
+    def test_todia_returns_self(self):
+        # Base ``_spbase.todia`` round-trips via CSR which raises
+        # NotImplementedError for csr_matrix.todia, so DIA must override.
+        assert self.m.todia() is self.m
+        assert self.m.todia(copy=True) is not self.m
+        cupy.testing.assert_array_equal(
+            self.m.todia(copy=True).toarray(), self.m.toarray())
+
+    def test_empty_data_nnz(self):
+        # gh-23055: an "empty" DIA buffer (data.shape[1] == 0) with
+        # non-empty offsets should report nnz=0, not over-count.
+        m = sparse.dia_matrix(
+            (cupy.zeros((1, 0), self.dtype), cupy.array([0])),
+            shape=(2, 2))
+        assert m.nnz == 0
+
+    def test_tocsc_data_wider_than_matrix(self):
+        # When the DIA data buffer is wider than the matrix, columns
+        # beyond ``num_cols`` lie outside the matrix.  ``tocsc`` must
+        # truncate the indptr write rather than crashing on a broadcast
+        # mismatch.
+        m = sparse.dia_matrix(
+            (cupy.ones((1, 5), self.dtype), cupy.array([0])),
+            shape=(2, 2))
+        c = m.tocsc()
+        assert c.shape == (2, 2)
+        assert c.nnz == 2
+        cupy.testing.assert_array_equal(
+            c.toarray(), cupy.eye(2, dtype=self.dtype))
 
 
 @testing.parameterize(*testing.product({
@@ -234,6 +258,14 @@ class TestDiaMatrixScipyComparison(unittest.TestCase):
 
     @testing.numpy_cupy_equal(sp_name='sp')
     def test_nnz_axis(self, xp, sp):
+        # CuPy fixes scipy gh-23055 (DIA nnz with empty data buffer)
+        # ahead of scipy: bound the diagonal length by the actual data
+        # buffer.  scipy < 1.17 over-counts empty DIAs, so the
+        # comparison would disagree for the empty variant; skip it.
+        if self.make_method == '_make_empty':
+            from packaging.version import parse as _v
+            if _v(scipy.__version__) < _v('1.17'):
+                pytest.skip('scipy < 1.17 over-counts empty DIA nnz')
         m = self.make(xp, sp, self.dtype)
         return m.nnz
 

@@ -3322,11 +3322,13 @@ class TestInt64Regressions:
         assert not m.T.has_canonical_format
 
     def test_dia_nnz_empty_data(self):
-        """DIA nnz comes from offsets/shape, not data width."""
+        """DIA nnz reflects what is actually stored: when the data
+        buffer is empty (data.shape[1] == 0), nnz must be 0 even if
+        the offsets list non-empty diagonals (scipy gh-23055)."""
         data = cupy.array([[]], dtype=cupy.float32)
         offsets = cupy.array([0], dtype=cupy.int32)
         m = sparse.dia_matrix((data, offsets), shape=(3, 4))
-        assert m.nnz == 3
+        assert m.nnz == 0
 
 
 class TestFromPartsValidation:
@@ -3413,15 +3415,23 @@ class TestBmatIndexDtypeDetection:
         assert result.row.dtype == cupy.int64
         assert result.col.dtype == cupy.int64
 
+    @testing.slow
     def test_bmat_int64_dia_natural_large_shape(self):
         # End-to-end check with a legitimately int64 DIA (shape large
         # enough that the constructor preserves int64 offsets without
-        # any force-assign).  data shape (1, 1) keeps memory minimal.
+        # any force-assign).  data shape (1, 1) keeps the input small,
+        # but bmat routes through CSC -> COO via ``_indptr_to_coo``,
+        # which materialises an ``arange(num_rows)`` of int64 — that's
+        # ~17 GB for shape ``(2**31 + 1, 1)``.  Marked ``slow`` so the
+        # default CI run excludes it; OOM-skip for hosts under 17 GB.
         data = cupy.ones((1, 1), dtype=cupy.float64)
         offsets = cupy.array([0], dtype=cupy.int32)
         d = sparse.dia_matrix((data, offsets), shape=(2**31 + 1, 1))
         assert d.offsets.dtype == cupy.int64
-        result = sparse.bmat([[d]])
+        try:
+            result = sparse.bmat([[d]])
+        except cupy.cuda.memory.OutOfMemoryError:
+            pytest.skip('not enough GPU memory for arange(2**31+1)')
         assert result.row.dtype == cupy.int64
         assert result.shape == (2**31 + 1, 1)
         assert result.nnz == 1

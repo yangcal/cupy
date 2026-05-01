@@ -485,7 +485,13 @@ class spmatrix:
         return self.tocoo().reshape(shape, order=order)
 
     def set_shape(self, shape):
-        self.reshape(shape)
+        """Set the shape of the matrix in-place."""
+        # ``self.reshape(shape)`` builds a new matrix and returns it
+        # (it's the immutable form).  To make the change visible on the
+        # original object, build the reshaped matrix in the same format
+        # and swap ``__dict__``.  Mirrors scipy 1.17's implementation.
+        new_self = self.reshape(shape).asformat(self.format)
+        self.__dict__ = new_self.__dict__
 
     def setdiag(self, values, k=0):
         """Set diagonal or off-diagonal elements of the array.
