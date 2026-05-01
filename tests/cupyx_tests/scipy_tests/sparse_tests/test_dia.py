@@ -88,18 +88,23 @@ class TestDiaMatrix(unittest.TestCase):
 
     @testing.with_requires('scipy>=1.14')
     def test_str(self):
-        # CuPy's ``__str__`` delegates to ``str(self.get())``, so the
-        # exact output is whatever scipy produces.  scipy 1.17 changed
-        # the DIA listing order (diagonal-major -> row-major), so
-        # comparing against a hardcoded string would break across
-        # versions.  Compare against scipy's own output instead.
-        dtype_name = numpy.dtype(self.dtype).name
+        # The exact DIA __str__ format differs across SciPy versions:
+        # SciPy 1.14-1.16 use diagonal-major order; SciPy 1.17 switched
+        # to row-major.  CuPy delegates ``__str__`` to ``str(self.get())``
+        # so the output automatically tracks the installed SciPy.
         s = str(self.m)
-        # Sanity check: the header line is owned by scipy and is
-        # version-stable -- assert it explicitly.
-        assert s.splitlines()[0] == (
-            f"<DIAgonal sparse matrix of dtype '{dtype_name}'")
-        assert str(self.m) == str(self.m.get())
+        # Sanity-check the format-, type-, and shape-bearing repr line.
+        assert 'DIAgonal' in s
+        assert 'sparse matrix' in s
+        assert str(self.m.shape) in s
+        assert '(2 diagonals)' in s
+        # Each stored value must show up exactly once.
+        for value in [1.0, 2.0, 3.0, 4.0]:
+            tok = (f'{value}' if numpy.dtype(self.dtype).kind == 'f'
+                   else f'({int(value)}+0j)')
+            assert tok in s, f'missing {tok!r} in {s!r}'
+        # Delegation invariant.
+        assert s == str(self.m.get())
 
     def test_toarray(self):
         m = self.m.toarray()

@@ -3322,13 +3322,20 @@ class TestInt64Regressions:
         assert not m.T.has_canonical_format
 
     def test_dia_nnz_empty_data(self):
-        """DIA nnz reflects what is actually stored: when the data
-        buffer is empty (data.shape[1] == 0), nnz must be 0 even if
-        the offsets list non-empty diagonals (scipy gh-23055)."""
+        """DIA nnz is bounded by the actual data buffer length.
+
+        Matches scipy 1.17 (gh-23055): an empty data array
+        (``data.shape[1] == 0``) gives nnz == 0 even when offsets
+        indicate diagonals exist.
+        """
         data = cupy.array([[]], dtype=cupy.float32)
         offsets = cupy.array([0], dtype=cupy.int32)
         m = sparse.dia_matrix((data, offsets), shape=(3, 4))
         assert m.nnz == 0
+        # Non-empty data shorter than the diagonal still works:
+        data = cupy.array([[1.0, 2.0]], dtype=cupy.float32)
+        m2 = sparse.dia_matrix((data, offsets), shape=(3, 4))
+        assert m2.nnz == 2
 
 
 class TestFromPartsValidation:
