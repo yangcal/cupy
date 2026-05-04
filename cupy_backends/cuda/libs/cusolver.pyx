@@ -286,73 +286,83 @@ IF CUPY_USE_CUDA_PYTHON:
         struct cusparseMatDescr;
         typedef struct cusparseMatDescr *cusparseMatDescr_t;
 
+        #ifndef CUSOLVERAPI
+        #ifdef _WIN32
+        #define CUSOLVERAPI __stdcall
+        #else
+        #define CUSOLVERAPI
+        #endif
+        #endif
+
         extern "C" {
-        int cusolverSpCreate(cusolverSpHandle_t *handle);
-        int cusolverSpDestroy(cusolverSpHandle_t handle);
-        int cusolverSpSetStream(cusolverSpHandle_t handle, cudaStream_t streamId);
-        int cusolverSpGetStream(cusolverSpHandle_t handle, cudaStream_t *streamId);
+        int CUSOLVERAPI cusolverSpCreate(cusolverSpHandle_t *handle);
+        int CUSOLVERAPI cusolverSpDestroy(cusolverSpHandle_t handle);
+        int CUSOLVERAPI cusolverSpSetStream(
+            cusolverSpHandle_t handle, cudaStream_t streamId);
+        int CUSOLVERAPI cusolverSpGetStream(
+            cusolverSpHandle_t handle, cudaStream_t *streamId);
 
-        int cusolverSpScsrlsvchol(
+        int CUSOLVERAPI cusolverSpScsrlsvchol(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const float *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, const float *b,
             float tol, int reorder, float *x, int *singularity);
-        int cusolverSpDcsrlsvchol(
+        int CUSOLVERAPI cusolverSpDcsrlsvchol(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const double *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, const double *b,
             double tol, int reorder, double *x, int *singularity);
-        int cusolverSpCcsrlsvchol(
+        int CUSOLVERAPI cusolverSpCcsrlsvchol(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const cuComplex *csrVal,
             const int *csrRowPtr, const int *csrColInd, const cuComplex *b,
             float tol, int reorder, cuComplex *x, int *singularity);
-        int cusolverSpZcsrlsvchol(
+        int CUSOLVERAPI cusolverSpZcsrlsvchol(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const cuDoubleComplex *csrVal,
             const int *csrRowPtr, const int *csrColInd,
             const cuDoubleComplex *b, double tol, int reorder,
             cuDoubleComplex *x, int *singularity);
 
-        int cusolverSpScsrlsvqr(
+        int CUSOLVERAPI cusolverSpScsrlsvqr(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const float *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, const float *b,
             float tol, int reorder, float *x, int *singularity);
-        int cusolverSpDcsrlsvqr(
+        int CUSOLVERAPI cusolverSpDcsrlsvqr(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const double *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, const double *b,
             double tol, int reorder, double *x, int *singularity);
-        int cusolverSpCcsrlsvqr(
+        int CUSOLVERAPI cusolverSpCcsrlsvqr(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const cuComplex *csrVal,
             const int *csrRowPtr, const int *csrColInd, const cuComplex *b,
             float tol, int reorder, cuComplex *x, int *singularity);
-        int cusolverSpZcsrlsvqr(
+        int CUSOLVERAPI cusolverSpZcsrlsvqr(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const cuDoubleComplex *csrVal,
             const int *csrRowPtr, const int *csrColInd,
             const cuDoubleComplex *b, double tol, int reorder,
             cuDoubleComplex *x, int *singularity);
 
-        int cusolverSpScsreigvsi(
+        int CUSOLVERAPI cusolverSpScsreigvsi(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const float *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, float mu0,
             const float *x0, int maxite, float eps, float *mu, float *x);
-        int cusolverSpDcsreigvsi(
+        int CUSOLVERAPI cusolverSpDcsreigvsi(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const double *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, double mu0,
             const double *x0, int maxite, double eps, double *mu, double *x);
-        int cusolverSpCcsreigvsi(
+        int CUSOLVERAPI cusolverSpCcsreigvsi(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const cuComplex *csrValA,
             const int *csrRowPtrA, const int *csrColIndA, cuComplex mu0,
             const cuComplex *x0, int maxite, float eps,
             cuComplex *mu, cuComplex *x);
-        int cusolverSpZcsreigvsi(
+        int CUSOLVERAPI cusolverSpZcsreigvsi(
             cusolverSpHandle_t handle, int m, int nnz,
             const cusparseMatDescr_t descrA, const cuDoubleComplex *csrValA,
             const int *csrRowPtrA, const int *csrColIndA,
