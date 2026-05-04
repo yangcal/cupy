@@ -77,7 +77,7 @@ IF CUPY_USE_CUDA_PYTHON:
             cusolver.Handle handle, char jobu, char jobvt, int m, int n,
             solver_dtype* A, void* s_ptr, solver_dtype* U,
             solver_dtype* VT, solver_dtype* Work, int buffersize,
-            int* devInfo, int batch_size) noexcept nogil:
+            int* devInfo, int batch_size) except * nogil:
         cdef int i, status = 0
         cdef int k = m if m < n else n
         cdef float* S_float = <float*>s_ptr
@@ -117,7 +117,7 @@ IF CUPY_USE_CUDA_PYTHON:
     cdef int geqrf_loop_internal(
             cusolver.Handle handle, int m, int n, solver_dtype* A, int lda,
             solver_dtype* Tau, solver_dtype* Work, int buffersize,
-            int* devInfo, int batch_size) noexcept nogil:
+            int* devInfo, int batch_size) except * nogil:
         cdef int i, status = 0
         cdef int k = m if m < n else n
 
@@ -145,7 +145,7 @@ IF CUPY_USE_CUDA_PYTHON:
             cusolver.Handle handle, int m, int n, int k, solver_dtype* A,
             int lda, const solver_dtype* Tau, solver_dtype* Work,
             int buffersize, int* devInfo, int batch_size,
-            int origin_n) noexcept nogil:
+            int origin_n) except * nogil:
         cdef int i, status = 0
 
         for i in range(batch_size):
@@ -173,7 +173,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, char jobu, char jobvt, int m, int n, intptr_t A,
             intptr_t s_ptr, intptr_t u_ptr, intptr_t vt_ptr,
             intptr_t w_ptr, int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return gesvd_loop_internal(
             <cusolver.Handle>handle, jobu, jobvt, m, n, <float*>A,
             <void*>s_ptr, <float*>u_ptr, <float*>vt_ptr, <float*>w_ptr,
@@ -183,7 +183,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, char jobu, char jobvt, int m, int n, intptr_t A,
             intptr_t s_ptr, intptr_t u_ptr, intptr_t vt_ptr,
             intptr_t w_ptr, int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return gesvd_loop_internal(
             <cusolver.Handle>handle, jobu, jobvt, m, n, <double*>A,
             <void*>s_ptr, <double*>u_ptr, <double*>vt_ptr, <double*>w_ptr,
@@ -193,7 +193,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, char jobu, char jobvt, int m, int n, intptr_t A,
             intptr_t s_ptr, intptr_t u_ptr, intptr_t vt_ptr,
             intptr_t w_ptr, int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return gesvd_loop_internal(
             <cusolver.Handle>handle, jobu, jobvt, m, n, <cuComplex*>A,
             <void*>s_ptr, <cuComplex*>u_ptr, <cuComplex*>vt_ptr,
@@ -203,7 +203,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, char jobu, char jobvt, int m, int n, intptr_t A,
             intptr_t s_ptr, intptr_t u_ptr, intptr_t vt_ptr,
             intptr_t w_ptr, int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return gesvd_loop_internal(
             <cusolver.Handle>handle, jobu, jobvt, m, n, <cuDoubleComplex*>A,
             <void*>s_ptr, <cuDoubleComplex*>u_ptr, <cuDoubleComplex*>vt_ptr,
@@ -213,7 +213,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return geqrf_loop_internal(
             <cusolver.Handle>handle, m, n, <float*>a_ptr, lda,
             <float*>tau_ptr, <float*>w_ptr,
@@ -223,7 +223,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return geqrf_loop_internal(
             <cusolver.Handle>handle, m, n, <double*>a_ptr, lda,
             <double*>tau_ptr, <double*>w_ptr,
@@ -233,7 +233,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return geqrf_loop_internal(
             <cusolver.Handle>handle, m, n, <cuComplex*>a_ptr, lda,
             <cuComplex*>tau_ptr, <cuComplex*>w_ptr,
@@ -243,7 +243,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size) noexcept nogil:
+            int batch_size) except * nogil:
         return geqrf_loop_internal(
             <cusolver.Handle>handle, m, n, <cuDoubleComplex*>a_ptr, lda,
             <cuDoubleComplex*>tau_ptr, <cuDoubleComplex*>w_ptr,
@@ -253,7 +253,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, int k, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size, int origin_n) noexcept nogil:
+            int batch_size, int origin_n) except * nogil:
         return orgqr_loop_internal(
             <cusolver.Handle>handle, m, n, k, <float*>a_ptr, lda,
             <float*>tau_ptr, <float*>w_ptr,
@@ -263,7 +263,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, int k, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size, int origin_n) noexcept nogil:
+            int batch_size, int origin_n) except * nogil:
         return orgqr_loop_internal(
             <cusolver.Handle>handle, m, n, k, <double*>a_ptr, lda,
             <double*>tau_ptr, <double*>w_ptr,
@@ -273,7 +273,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, int k, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size, int origin_n) noexcept nogil:
+            int batch_size, int origin_n) except * nogil:
         return orgqr_loop_internal(
             <cusolver.Handle>handle, m, n, k, <cuComplex*>a_ptr, lda,
             <cuComplex*>tau_ptr, <cuComplex*>w_ptr,
@@ -283,7 +283,7 @@ IF CUPY_USE_CUDA_PYTHON:
             intptr_t handle, int m, int n, int k, intptr_t a_ptr, int lda,
             intptr_t tau_ptr, intptr_t w_ptr,
             int buffersize, intptr_t info_ptr,
-            int batch_size, int origin_n) noexcept nogil:
+            int batch_size, int origin_n) except * nogil:
         return orgqr_loop_internal(
             <cusolver.Handle>handle, m, n, k, <cuDoubleComplex*>a_ptr, lda,
             <cuDoubleComplex*>tau_ptr, <cuDoubleComplex*>w_ptr,
@@ -475,11 +475,11 @@ ELSE:
 
 ctypedef int(*gesvd_ptr)(intptr_t, char, char, int, int, intptr_t,
                          intptr_t, intptr_t, intptr_t,
-                         intptr_t, int, intptr_t, int) noexcept nogil
+                         intptr_t, int, intptr_t, int) except * nogil
 ctypedef int(*geqrf_ptr)(intptr_t, int, int, intptr_t, int, intptr_t,
-                         intptr_t, int, intptr_t, int) noexcept nogil
+                         intptr_t, int, intptr_t, int) except * nogil
 ctypedef int(*orgqr_ptr)(intptr_t, int, int, int, intptr_t, int, intptr_t,
-                         intptr_t, int, intptr_t, int, int) noexcept nogil
+                         intptr_t, int, intptr_t, int, int) except * nogil
 
 
 _available_cuda_version = {
