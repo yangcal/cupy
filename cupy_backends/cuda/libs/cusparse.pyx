@@ -1069,12 +1069,6 @@ cdef void _setStream(intptr_t handle) except *:
 
 
 ########################################
-# cuSPARSE Level1 Function
-
-########################################
-# cuSPARSE Level3 Function
-
-########################################
 # cuSPARSE Extra Function
 
 cpdef size_t scsrgeam2_bufferSizeExt(
