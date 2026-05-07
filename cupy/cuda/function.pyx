@@ -33,6 +33,7 @@ IF CUPY_CUDA_VERSION > 0:
         #include <windows.h>
         #include <cstddef>
         #include <cstring>
+        #include <mutex>
 
         typedef char* (*cupy_demangle_fn)(
             const char*, char*, size_t*, int*);
@@ -40,42 +41,44 @@ IF CUPY_CUDA_VERSION > 0:
 
         static cupy_demangle_fn _cupy_demangle = NULL;
         static cupy_free_fn _cupy_dfree = NULL;
-        static int _cupy_cufilt_loaded = 0;
+        static std::once_flag _cupy_cufilt_flag;
 
-        static int _cupy_cufilt_init(void) {
+        static void _cupy_cufilt_do_init(void) {
             HMODULE hSelf, hDll;
-            char path[MAX_PATH];
-            char *sep;
-
-            if (_cupy_cufilt_loaded)
-                return (_cupy_demangle != NULL);
-            _cupy_cufilt_loaded = 1;
+            wchar_t path[MAX_PATH];
+            wchar_t *sep;
+            DWORD len;
 
             /* Locate cupy_cufilt.dll next to this extension module. */
-            if (!GetModuleHandleExA(
+            if (!GetModuleHandleExW(
                     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
                     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    (LPCSTR)&_cupy_cufilt_init, &hSelf))
-                return 0;
-            if (!GetModuleFileNameA(hSelf, path, MAX_PATH))
-                return 0;
-            sep = strrchr(path, '\\');
-            if (sep) *(sep + 1) = '\0';
-            strcat(path, "cupy_cufilt.dll");
+                    (LPCWSTR)&_cupy_cufilt_do_init, &hSelf))
+                return;
+            len = GetModuleFileNameW(hSelf, path, MAX_PATH);
+            if (len == 0 || len >= MAX_PATH)
+                return;
+            sep = wcsrchr(path, L'\\');
+            if (sep) *(sep + 1) = L'\0';
+            wcscat(path, L"cupy_cufilt.dll");
 
-            hDll = LoadLibraryA(path);
-            if (!hDll) return 0;
+            hDll = LoadLibraryW(path);
+            if (!hDll) return;
             _cupy_demangle = (cupy_demangle_fn)GetProcAddress(
                 hDll, "cupy_cu_demangle");
             _cupy_dfree = (cupy_free_fn)GetProcAddress(
                 hDll, "cupy_free");
-            return (_cupy_demangle && _cupy_dfree) ? 1 : 0;
+            if (!_cupy_demangle || !_cupy_dfree) {
+                _cupy_demangle = NULL;
+                _cupy_dfree = NULL;
+            }
         }
 
         static char* cupy_demangle(
                 const char* id, char* buf,
                 size_t* len, int* status) {
-            if (!_cupy_cufilt_init()) {
+            std::call_once(_cupy_cufilt_flag, _cupy_cufilt_do_init);
+            if (!_cupy_demangle) {
                 if (status) *status = -1;
                 return NULL;
             }
@@ -425,7 +428,8 @@ cdef class Module:
             except Exception:
                 pass
             else:
-                self._set_mapping(mapping)
+                if len(mapping) == len(name_expressions):
+                    self._set_mapping(mapping)
         ELSE:
             raise NotImplementedError(
                 'Function enumeration is not supported on HIP/ROCm')
