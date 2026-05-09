@@ -357,6 +357,20 @@ class spmatrix:
         """
         return self.tocsr().diagonal(k=k)
 
+    def trace(self, offset=0):
+        """Returns the sum along diagonals of the sparse matrix.
+
+        Args:
+            offset (int): Which diagonal to get. Default: 0.
+
+        Returns:
+            cupy.ndarray: Sum along diagonal.
+
+        .. seealso::
+           :meth:`scipy.sparse.spmatrix.trace`
+        """
+        return self.diagonal(k=offset).sum()
+
     def dot(self, other):
         """Ordinary dot product"""
         if numpy.isscalar(other):
@@ -495,7 +509,7 @@ class spmatrix:
         # ``self.reshape(shape)`` builds a new matrix and returns it
         # (it's the immutable form).  To make the change visible on the
         # original object, build the reshaped matrix in the same format
-        # and swap ``__dict__``. Mirrors scipy 1.17's implementation.
+        # and swap ``__dict__``.  Mirrors scipy 1.17's implementation.
         new_self = self.reshape(shape).asformat(self.format)
         self.__dict__ = new_self.__dict__
 

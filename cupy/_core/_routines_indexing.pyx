@@ -7,6 +7,7 @@ import cupy
 import cupy._core.core as core
 from cupy.exceptions import AxisError
 from cupy._core._kernel import ElementwiseKernel, _get_warpsize
+from cupy._core._kernel cimport _full_mask_hex
 from cupy._core._ufuncs import elementwise_copy
 
 from libcpp cimport vector
@@ -490,7 +491,7 @@ def _nonzero_kernel_incomplete_scan(block_size, warp_size=32):
         S x = 0;
         if (i < a.size()) x = a[i];
         for (int j = 1; j < ${warp_size}; j *= 2) {
-            S tmp = __shfl_up_sync(0xffffffff, x, j, ${warp_size});
+            S tmp = __shfl_up_sync(${full_mask}, x, j, ${warp_size});
             if (lane_id - j >= 0) x += tmp;
         }
         if (lane_id == ${warp_size} - 1) smem[warp_id] = x;
@@ -499,7 +500,7 @@ def _nonzero_kernel_incomplete_scan(block_size, warp_size=32):
             S y = 0;
             if (lane_id < n_warp) y = smem[lane_id];
             for (int j = 1; j < n_warp; j *= 2) {
-                S tmp = __shfl_up_sync(0xffffffff, y, j, ${warp_size});
+                S tmp = __shfl_up_sync(${full_mask}, y, j, ${warp_size});
                 if (lane_id - j >= 0) y += tmp;
             }
             int block_id = i / ${block_size};
@@ -510,7 +511,7 @@ def _nonzero_kernel_incomplete_scan(block_size, warp_size=32):
         }
         __syncthreads();
         x += smem[warp_id];
-        S x0 = __shfl_up_sync(0xffffffff, x, 1, ${warp_size});
+        S x0 = __shfl_up_sync(${full_mask}, x, 1, ${warp_size});
         if (lane_id == 0) {
             x0 = smem[warp_id];
         }
@@ -523,7 +524,8 @@ def _nonzero_kernel_incomplete_scan(block_size, warp_size=32):
                 j = j_next;
             }
         }
-    """).substitute(block_size=block_size, warp_size=warp_size)
+    """).substitute(block_size=block_size, warp_size=warp_size,
+                    full_mask=_full_mask_hex())
     return cupy.ElementwiseKernel(in_params, out_params, loop_body,
                                   'cupy_nonzero_kernel_incomplete_scan',
                                   loop_prep=loop_prep)
@@ -923,15 +925,18 @@ cdef _scatter_op_single(
         _scatter_update_kernel(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'add':
-        # There is constraints on types because atomicAdd() in CUDA 7.5
-        # only supports int32, uint32, uint64, and float32.
+        # CUDA natively supports atomicAdd for int32, uint32, uint64,
+        # float32, float64.  CuPy's atomics.cuh provides an int64
+        # (long long) overload via reinterpret_cast to unsigned long long.
         if not issubclass(v.dtype.type,
-                          (numpy.int32, numpy.float16, numpy.float32,
-                           numpy.float64, numpy.uint32, numpy.uint64,
-                           numpy.intc, numpy.uintc, numpy.ulonglong)):
+                          (numpy.int32, numpy.int64,
+                           numpy.float16, numpy.float32, numpy.float64,
+                           numpy.uint32, numpy.uint64,
+                           numpy.intc, numpy.uintc,
+                           numpy.longlong, numpy.ulonglong)):
             raise TypeError(
-                'cupy.add.at only supports int32, float16, float32, float64, '
-                'uint32, uint64, as data type')
+                'cupy.add.at only supports int32, int64, float16, float32, '
+                'float64, uint32, uint64 as data type')
         _scatter_add_kernel(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'sub':
@@ -944,22 +949,26 @@ cdef _scatter_op_single(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'max':
         if not issubclass(v.dtype.type,
-                          (numpy.int32, numpy.float32, numpy.float64,
+                          (numpy.int32, numpy.int64,
+                           numpy.float32, numpy.float64,
                            numpy.uint32, numpy.uint64,
-                           numpy.intc, numpy.uintc, numpy.ulonglong)):
+                           numpy.intc, numpy.uintc,
+                           numpy.longlong, numpy.ulonglong)):
             raise TypeError(
-                'cupy.maximum.at only supports int32, float32, float64, '
-                'uint32, uint64 as data type')
+                'cupy.maximum.at only supports int32, int64, float32, '
+                'float64, uint32, uint64 as data type')
         _scatter_max_kernel(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'min':
         if not issubclass(v.dtype.type,
-                          (numpy.int32, numpy.float32, numpy.float64,
+                          (numpy.int32, numpy.int64,
+                           numpy.float32, numpy.float64,
                            numpy.uint32, numpy.uint64,
-                           numpy.intc, numpy.uintc, numpy.ulonglong)):
+                           numpy.intc, numpy.uintc,
+                           numpy.longlong, numpy.ulonglong)):
             raise TypeError(
-                'cupy.minimum.at only supports int32, float32, float64, '
-                'uint32, uint64 as data type')
+                'cupy.minimum.at only supports int32, int64, float32, '
+                'float64, uint32, uint64 as data type')
         _scatter_min_kernel(
             v, indices, cdim, rdim, adim, a.reduced_view())
     elif op == 'and':
