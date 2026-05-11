@@ -25,10 +25,12 @@ IF CUPY_USE_CUDA_PYTHON:
         gesvdjInfo_t as GesvdjInfo,
         syevjInfo_t as SyevjInfo,
     )
-
-    cdef extern from *:
-        ctypedef void* SpHandle 'cusolverSpHandle_t'
-        ctypedef void* MatDescr 'cusparseMatDescr_t'
+    from nvmath.bindings.cycusolverSp cimport (
+        cusolverSpHandle_t as SpHandle,
+    )
+    from nvmath.bindings.cycusparse cimport (
+        cusparseMatDescr_t as MatDescr,
+    )
 ELSE:
     cdef extern from *:
         ctypedef int DataType 'cudaDataType'
