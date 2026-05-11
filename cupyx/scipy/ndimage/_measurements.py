@@ -65,10 +65,9 @@ def label(input, structure=None, output=None):
                 input.shape, cupy.intp if need_64bits else cupy.int32
             )
         else:
-            if output not in (cupy.int32, cupy.int64):
-                # Guard against invalid atomicAdd calls
-                raise TypeError("output dtype must be int32 or int64")
             output = cupy.empty(input.shape, output)
+    if output.dtype.kind not in 'iu':
+        raise TypeError("output dtype must be an integer type")
 
     # handle scalars, 0-D arrays
     if input.ndim == 0 or input.size == 0:
@@ -84,12 +83,16 @@ def label(input, structure=None, output=None):
         else:
             return output, maxlabel
 
-    if not need_64bits or output.dtype == cupy.int64:
+    tmp_dtype = cupy.int64 if need_64bits else cupy.int32
+    if output.dtype == tmp_dtype or output.dtype == cupy.int64:
         max_label = _label(input, structure, output)
     else:
-        # Allocate temporary 64-bit array, then copy results to output buffer
-        tmp_output = cupy.empty(input.shape, cupy.int64)
-        max_label = _label(input, structure, tmp_output, max_label=2**31 - 1)
+        tmp_output = cupy.empty(input.shape, tmp_dtype)
+        max_label = _label(input, structure, tmp_output)
+        try:
+            output.dtype.type(max_label)
+        except (OverflowError, ValueError):
+            raise ValueError("insufficient bit-depth in output type")
         _core.elementwise_copy(tmp_output, output)
 
     if caller_provided_output:
@@ -109,7 +112,7 @@ def _generate_binary_structure(rank, connectivity):
     return output <= connectivity
 
 
-def _label(x, structure, y, max_label=None):
+def _label(x, structure, y):
     elems = numpy.where(structure != 0)
     vecs = [elems[dm] - 1 for dm in range(x.ndim)]
     offset = vecs[0]
@@ -126,8 +129,6 @@ def _label(x, structure, y, max_label=None):
     _kernel_connect()(y_shape, dirs, ndirs, x.ndim, y, size=y.size)
     _kernel_count()(y, count, size=y.size)
     nlabels = int(count[0])
-    if max_label and nlabels > max_label:
-        raise RuntimeError("insufficient bit-depth in requested output type")
     labels = cupy.empty(nlabels, dtype=y.dtype)
     _kernel_labels()(y, count, labels, size=y.size)
     _kernel_finalize()(nlabels, cupy.sort(labels), y, size=y.size)
