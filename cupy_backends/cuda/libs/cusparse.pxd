@@ -110,7 +110,6 @@ IF CUPY_CUDA_VERSION == 0:
         ctypedef void* csrsv2Info_t
         ctypedef void* csrsm2Info_t
         ctypedef void* csrgemm2Info_t
-
 # TODO(eriknw): cuSPARSE--remove stubs when SpGEAM ships in a public release.
 # The #ifndef guard auto-deactivates when the real header defines these.
 cdef extern from *:
