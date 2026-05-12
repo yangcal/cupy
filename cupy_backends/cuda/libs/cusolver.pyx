@@ -35,7 +35,7 @@ IF CUPY_USE_CUDA_PYTHON:
         cusolverDnCreateParams,
         cusolverDnDestroyParams,
 
-        ###########################################################################
+        #######################################################################
         # Dense LAPACK Functions (Linear Solver)
         # Cholesky factorization
         cusolverDnSpotrf_bufferSize,
@@ -284,7 +284,7 @@ IF CUPY_USE_CUDA_PYTHON:
         cusolverSpGetStream,
         cusolverSpSetStream,
 
-        ###########################################################################
+        #######################################################################
         # Sparse LAPACK Functions
         #######################################################################
 
@@ -352,8 +352,9 @@ ELSE:
                                         double* A, int lda, int* lwork)
         int cusolverDnCpotrf_bufferSize(Handle handle, FillMode uplo, int n,
                                         cuComplex* A, int lda, int* lwork)
-        int cusolverDnZpotrf_bufferSize(Handle handle, FillMode uplo, int n,
-                                        cuDoubleComplex* A, int lda, int* lwork)
+        int cusolverDnZpotrf_bufferSize(
+            Handle handle, FillMode uplo, int n,
+            cuDoubleComplex* A, int lda, int* lwork)
 
         int cusolverDnSpotrf(Handle handle, FillMode uplo, int n,
                              float* A, int lda,
@@ -406,10 +407,11 @@ ELSE:
                                     int nrhs, cuComplex** Aarray, int lda,
                                     cuComplex** Barray, int ldb,
                                     int* devInfo, int batchSize)
-        int cusolverDnZpotrsBatched(Handle handle, FillMode uplo, int n,
-                                    int nrhs, cuDoubleComplex** Aarray, int lda,
-                                    cuDoubleComplex** Barray, int ldb,
-                                    int* devInfo, int batchSize)
+        int cusolverDnZpotrsBatched(
+            Handle handle, FillMode uplo, int n,
+            int nrhs, cuDoubleComplex** Aarray, int lda,
+            cuDoubleComplex** Barray, int ldb,
+            int* devInfo, int batchSize)
 
         # LU factorization
         int cusolverDnSgetrf_bufferSize(Handle handle, int m, int n,
@@ -418,8 +420,9 @@ ELSE:
                                         double* A, int lda, int* lwork)
         int cusolverDnCgetrf_bufferSize(Handle handle, int m, int n,
                                         cuComplex* A, int lda, int* lwork)
-        int cusolverDnZgetrf_bufferSize(Handle handle, int m, int n,
-                                        cuDoubleComplex* A, int lda, int* lwork)
+        int cusolverDnZgetrf_bufferSize(
+            Handle handle, int m, int n,
+            cuDoubleComplex* A, int lda, int* lwork)
 
         int cusolverDnSgetrf(Handle handle, int m, int n,
                              float* A, int lda,
@@ -446,9 +449,10 @@ ELSE:
         int cusolverDnCgetrs(Handle handle, Operation trans, int n, int nrhs,
                              const cuComplex* A, int lda, const int* devIpiv,
                              cuComplex* B, int ldb, int* devInfo)
-        int cusolverDnZgetrs(Handle handle, Operation trans, int n, int nrhs,
-                             const cuDoubleComplex* A, int lda, const int* devIpiv,
-                             cuDoubleComplex* B, int ldb, int* devInfo)
+        int cusolverDnZgetrs(
+            Handle handle, Operation trans, int n, int nrhs,
+            const cuDoubleComplex* A, int lda, const int* devIpiv,
+            cuDoubleComplex* B, int ldb, int* devInfo)
 
         # QR factorization
         int cusolverDnSgeqrf_bufferSize(Handle handle, int m, int n,
@@ -457,8 +461,9 @@ ELSE:
                                         double* A, int lda, int* lwork)
         int cusolverDnCgeqrf_bufferSize(Handle handle, int m, int n,
                                         cuComplex* A, int lda, int* lwork)
-        int cusolverDnZgeqrf_bufferSize(Handle handle, int m, int n,
-                                        cuDoubleComplex* A, int lda, int* lwork)
+        int cusolverDnZgeqrf_bufferSize(
+            Handle handle, int m, int n,
+            cuDoubleComplex* A, int lda, int* lwork)
 
         int cusolverDnSgeqrf(Handle handle, int m, int n,
                              float* A, int lda, float* tau,
@@ -548,12 +553,11 @@ ELSE:
                              const cuComplex* tau,
                              cuComplex* C, int ldc, cuComplex* work,
                              int lwork, int* devInfo)
-        int cusolverDnZunmqr(Handle handle, SideMode side, Operation trans,
-                             int m, int n, int k,
-                             const cuDoubleComplex* A, int lda,
-                             const cuDoubleComplex* tau,
-                             cuDoubleComplex* C, int ldc, cuDoubleComplex* work,
-                             int lwork, int* devInfo)
+        int cusolverDnZunmqr(
+            Handle handle, SideMode side, Operation trans,
+            int m, int n, int k, const cuDoubleComplex* A, int lda,
+            const cuDoubleComplex* tau, cuDoubleComplex* C, int ldc,
+            cuDoubleComplex* work, int lwork, int* devInfo)
 
         # L*D*L**T,U*D*U**T factorization
         int cusolverDnSsytrf_bufferSize(Handle handle, int n,
@@ -562,8 +566,9 @@ ELSE:
                                         double* A, int lda, int* lwork)
         int cusolverDnCsytrf_bufferSize(Handle handle, int n,
                                         cuComplex* A, int lda, int* lwork)
-        int cusolverDnZsytrf_bufferSize(Handle handle, int n,
-                                        cuDoubleComplex* A, int lda, int* lwork)
+        int cusolverDnZsytrf_bufferSize(
+            Handle handle, int n,
+            cuDoubleComplex* A, int lda, int* lwork)
 
         int cusolverDnSsytrf(Handle handle, FillMode uplo, int n,
                              float* A, int lda, int* ipiv,
@@ -579,26 +584,30 @@ ELSE:
                              cuDoubleComplex* work, int lwork, int* devInfo)
 
         # Solve A * X = B using iterative refinement
-        int cusolverDnZZgesv_bufferSize(Handle handle, int n, int nrhs,
-                                        cuDoubleComplex *dA, int ldda, int *dipiv,
-                                        cuDoubleComplex *dB, int lddb,
-                                        cuDoubleComplex *dX, int lddx,
-                                        void *dWorkspace, size_t *lwork_bytes)
-        int cusolverDnZCgesv_bufferSize(Handle handle, int n, int nrhs,
-                                        cuDoubleComplex *dA, int ldda, int *dipiv,
-                                        cuDoubleComplex *dB, int lddb,
-                                        cuDoubleComplex *dX, int lddx,
-                                        void *dWorkspace, size_t *lwork_bytes)
-        int cusolverDnZYgesv_bufferSize(Handle handle, int n, int nrhs,
-                                        cuDoubleComplex *dA, int ldda, int *dipiv,
-                                        cuDoubleComplex *dB, int lddb,
-                                        cuDoubleComplex *dX, int lddx,
-                                        void *dWorkspace, size_t *lwork_bytes)
-        int cusolverDnZKgesv_bufferSize(Handle handle, int n, int nrhs,
-                                        cuDoubleComplex *dA, int ldda, int *dipiv,
-                                        cuDoubleComplex *dB, int lddb,
-                                        cuDoubleComplex *dX, int lddx,
-                                        void *dWorkspace, size_t *lwork_bytes)
+        int cusolverDnZZgesv_bufferSize(
+            Handle handle, int n, int nrhs,
+            cuDoubleComplex *dA, int ldda, int *dipiv,
+            cuDoubleComplex *dB, int lddb,
+            cuDoubleComplex *dX, int lddx,
+            void *dWorkspace, size_t *lwork_bytes)
+        int cusolverDnZCgesv_bufferSize(
+            Handle handle, int n, int nrhs,
+            cuDoubleComplex *dA, int ldda, int *dipiv,
+            cuDoubleComplex *dB, int lddb,
+            cuDoubleComplex *dX, int lddx,
+            void *dWorkspace, size_t *lwork_bytes)
+        int cusolverDnZYgesv_bufferSize(
+            Handle handle, int n, int nrhs,
+            cuDoubleComplex *dA, int ldda, int *dipiv,
+            cuDoubleComplex *dB, int lddb,
+            cuDoubleComplex *dX, int lddx,
+            void *dWorkspace, size_t *lwork_bytes)
+        int cusolverDnZKgesv_bufferSize(
+            Handle handle, int n, int nrhs,
+            cuDoubleComplex *dA, int ldda, int *dipiv,
+            cuDoubleComplex *dB, int lddb,
+            cuDoubleComplex *dX, int lddx,
+            void *dWorkspace, size_t *lwork_bytes)
         int cusolverDnCCgesv_bufferSize(Handle handle, int n, int nrhs,
                                         cuComplex *dA, int ldda, int *dipiv,
                                         cuComplex *dB, int lddb,
@@ -892,15 +901,19 @@ ELSE:
                              void *dWorkspace, size_t lwork_bytes,
                              int *iter, int *dInfo)
 
-        ###########################################################################
+        #######################################################################
         # Dense LAPACK Functions (Eigenvalue Solver)
-        ###########################################################################
+        #######################################################################
 
         # Bidiagonal factorization
-        int cusolverDnSgebrd_bufferSize(Handle handle, int m, int n, int* lwork)
-        int cusolverDnDgebrd_bufferSize(Handle handle, int m, int n, int* lwork)
-        int cusolverDnCgebrd_bufferSize(Handle handle, int m, int n, int* lwork)
-        int cusolverDnZgebrd_bufferSize(Handle handle, int m, int n, int* lwork)
+        int cusolverDnSgebrd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
+        int cusolverDnDgebrd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
+        int cusolverDnCgebrd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
+        int cusolverDnZgebrd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
 
         int cusolverDnSgebrd(Handle handle, int m, int n,
                              float* A, int lda,
@@ -924,35 +937,36 @@ ELSE:
                              cuDoubleComplex* Work, int lwork, int* devInfo)
 
         # Singular value decomposition, A = U * Sigma * V^H
-        int cusolverDnSgesvd_bufferSize(Handle handle, int m, int n, int* lwork)
-        int cusolverDnDgesvd_bufferSize(Handle handle, int m, int n, int* lwork)
-        int cusolverDnCgesvd_bufferSize(Handle handle, int m, int n, int* lwork)
-        int cusolverDnZgesvd_bufferSize(Handle handle, int m, int n, int* lwork)
+        int cusolverDnSgesvd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
+        int cusolverDnDgesvd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
+        int cusolverDnCgesvd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
+        int cusolverDnZgesvd_bufferSize(
+            Handle handle, int m, int n, int* lwork)
 
-        int cusolverDnSgesvd(Handle handle, char jobu, char jobvt, int m, int n,
-                             float* A, int lda, float* S,
-                             float* U, int ldu,
-                             float* VT, int ldvt,
-                             float* Work, int lwork,
-                             float* rwork, int* devInfo)
-        int cusolverDnDgesvd(Handle handle, char jobu, char jobvt, int m, int n,
-                             double* A, int lda, double* S,
-                             double* U, int ldu,
-                             double* VT, int ldvt,
-                             double* Work, int lwork,
-                             double* rwork, int* devInfo)
-        int cusolverDnCgesvd(Handle handle, char jobu, char jobvt, int m, int n,
-                             cuComplex* A, int lda, float* S,
-                             cuComplex* U, int ldu,
-                             cuComplex* VT, int ldvt,
-                             cuComplex* Work, int lwork,
-                             float* rwork, int* devInfo)
-        int cusolverDnZgesvd(Handle handle, char jobu, char jobvt, int m, int n,
-                             cuDoubleComplex* A, int lda, double* S,
-                             cuDoubleComplex* U, int ldu,
-                             cuDoubleComplex* VT, int ldvt,
-                             cuDoubleComplex* Work, int lwork,
-                             double* rwork, int* devInfo)
+        int cusolverDnSgesvd(
+            Handle handle, char jobu, char jobvt,
+            int m, int n, float* A, int lda, float* S,
+            float* U, int ldu, float* VT, int ldvt,
+            float* Work, int lwork, float* rwork, int* devInfo)
+        int cusolverDnDgesvd(
+            Handle handle, char jobu, char jobvt,
+            int m, int n, double* A, int lda, double* S,
+            double* U, int ldu, double* VT, int ldvt,
+            double* Work, int lwork, double* rwork, int* devInfo)
+        int cusolverDnCgesvd(
+            Handle handle, char jobu, char jobvt,
+            int m, int n, cuComplex* A, int lda, float* S,
+            cuComplex* U, int ldu, cuComplex* VT, int ldvt,
+            cuComplex* Work, int lwork, float* rwork, int* devInfo)
+        int cusolverDnZgesvd(
+            Handle handle, char jobu, char jobvt,
+            int m, int n, cuDoubleComplex* A, int lda, double* S,
+            cuDoubleComplex* U, int ldu, cuDoubleComplex* VT, int ldvt,
+            cuDoubleComplex* Work, int lwork,
+            double* rwork, int* devInfo)
 
         # gesvdj ... Singular value decomposition using Jacobi method
         int cusolverDnCreateGesvdjInfo(GesvdjInfo *info)
@@ -966,45 +980,51 @@ ELSE:
         int cusolverDnXgesvdjGetSweeps(Handle handle, GesvdjInfo info,
                                        int* executed_sweeps)
 
-        int cusolverDnSgesvdj_bufferSize(Handle handle, EigMode jobz, int econ,
-                                         int m, int n, const float* A, int lda,
-                                         const float* S, const float* U, int ldu,
-                                         const float* V, int ldv, int* lwork,
-                                         GesvdjInfo params)
-        int cusolverDnDgesvdj_bufferSize(Handle handle, EigMode jobz, int econ,
-                                         int m, int n, const double* A, int lda,
-                                         const double* S, const double* U, int ldu,
-                                         const double* V, int ldv, int* lwork,
-                                         GesvdjInfo params)
-        int cusolverDnCgesvdj_bufferSize(Handle handle, EigMode jobz, int econ,
-                                         int m, int n, const cuComplex* A, int lda,
-                                         const float* S, const cuComplex* U,
-                                         int ldu, const cuComplex* V, int ldv,
-                                         int* lwork, GesvdjInfo params)
-        int cusolverDnZgesvdj_bufferSize(Handle handle, EigMode jobz, int econ,
-                                         int m, int n, const cuDoubleComplex* A,
-                                         int lda, const double* S,
-                                         const cuDoubleComplex* U, int ldu,
-                                         const cuDoubleComplex* V, int ldv,
-                                         int* lwork, GesvdjInfo params)
+        int cusolverDnSgesvdj_bufferSize(
+            Handle handle, EigMode jobz, int econ, int m, int n,
+            const float* A, int lda, const float* S,
+            const float* U, int ldu, const float* V, int ldv,
+            int* lwork, GesvdjInfo params)
+        int cusolverDnDgesvdj_bufferSize(
+            Handle handle, EigMode jobz, int econ, int m, int n,
+            const double* A, int lda, const double* S,
+            const double* U, int ldu, const double* V, int ldv,
+            int* lwork, GesvdjInfo params)
+        int cusolverDnCgesvdj_bufferSize(
+            Handle handle, EigMode jobz, int econ, int m, int n,
+            const cuComplex* A, int lda, const float* S,
+            const cuComplex* U, int ldu, const cuComplex* V, int ldv,
+            int* lwork, GesvdjInfo params)
+        int cusolverDnZgesvdj_bufferSize(
+            Handle handle, EigMode jobz, int econ, int m, int n,
+            const cuDoubleComplex* A, int lda, const double* S,
+            const cuDoubleComplex* U, int ldu, const cuDoubleComplex* V,
+            int ldv, int* lwork, GesvdjInfo params)
 
-        int cusolverDnSgesvdj(Handle handle, EigMode jobz, int econ, int m, int n,
-                              float *A, int lda, float *S, float *U, int ldu,
-                              float *V, int ldv, float *work, int lwork, int *info,
-                              GesvdjInfo params)
-        int cusolverDnDgesvdj(Handle handle, EigMode jobz, int econ, int m, int n,
-                              double *A, int lda, double *S, double *U, int ldu,
-                              double *V, int ldv, double *work, int lwork,
-                              int *info, GesvdjInfo params)
-        int cusolverDnCgesvdj(Handle handle, EigMode jobz, int econ, int m, int n,
-                              cuComplex *A, int lda, float *S, cuComplex *U,
-                              int ldu, cuComplex *V, int ldv, cuComplex *work,
-                              int lwork, int *info, GesvdjInfo params)
-        int cusolverDnZgesvdj(Handle handle, EigMode jobz, int econ, int m, int n,
-                              cuDoubleComplex *A, int lda, double *S,
-                              cuDoubleComplex *U, int ldu, cuDoubleComplex *V,
-                              int ldv, cuDoubleComplex *work, int lwork, int *info,
-                              GesvdjInfo params)
+        int cusolverDnSgesvdj(
+            Handle handle, EigMode jobz, int econ,
+            int m, int n, float *A, int lda, float *S,
+            float *U, int ldu, float *V, int ldv,
+            float *work, int lwork, int *info,
+            GesvdjInfo params)
+        int cusolverDnDgesvdj(
+            Handle handle, EigMode jobz, int econ,
+            int m, int n, double *A, int lda, double *S,
+            double *U, int ldu, double *V, int ldv,
+            double *work, int lwork, int *info,
+            GesvdjInfo params)
+        int cusolverDnCgesvdj(
+            Handle handle, EigMode jobz, int econ,
+            int m, int n, cuComplex *A, int lda, float *S,
+            cuComplex *U, int ldu, cuComplex *V, int ldv,
+            cuComplex *work, int lwork,
+            int *info, GesvdjInfo params)
+        int cusolverDnZgesvdj(
+            Handle handle, EigMode jobz, int econ,
+            int m, int n, cuDoubleComplex *A, int lda, double *S,
+            cuDoubleComplex *U, int ldu, cuDoubleComplex *V, int ldv,
+            cuDoubleComplex *work, int lwork,
+            int *info, GesvdjInfo params)
 
         int cusolverDnSgesvdjBatched_bufferSize(
             Handle handle, EigMode jobz, int m, int n, float* A, int lda,
@@ -1019,86 +1039,101 @@ ELSE:
             float* S, cuComplex* U, int ldu, cuComplex* V, int ldv,
             int* lwork, GesvdjInfo params, int batchSize)
         int cusolverDnZgesvdjBatched_bufferSize(
-            Handle handle, EigMode jobz, int m, int n, cuDoubleComplex* A, int lda,
-            double* S, cuDoubleComplex* U, int ldu, cuDoubleComplex* V, int ldv,
+            Handle handle, EigMode jobz, int m, int n,
+            cuDoubleComplex* A, int lda, double* S,
+            cuDoubleComplex* U, int ldu, cuDoubleComplex* V, int ldv,
             int* lwork, GesvdjInfo params, int batchSize)
         int cusolverDnSgesvdjBatched(
-            Handle handle, EigMode jobz, int m, int n, float* A, int lda, float* S,
-            float* U, int ldu, float* V, int ldv, float* work, int lwork,
+            Handle handle, EigMode jobz, int m, int n,
+            float* A, int lda, float* S, float* U, int ldu,
+            float* V, int ldv, float* work, int lwork,
             int* info, GesvdjInfo params, int batchSize)
         int cusolverDnDgesvdjBatched(
-            Handle handle, EigMode jobz, int m, int n, double* A, int lda,
-            double* S, double* U, int ldu, double* V, int ldv,
-            double* work, int lwork,
-            int* info, GesvdjInfo params, int batchSize)
+            Handle handle, EigMode jobz, int m, int n,
+            double* A, int lda, double* S,
+            double* U, int ldu, double* V, int ldv,
+            double* work, int lwork, int* info,
+            GesvdjInfo params, int batchSize)
         int cusolverDnCgesvdjBatched(
-            Handle handle, EigMode jobz, int m, int n, cuComplex* A, int lda,
-            float* S, cuComplex* U, int ldu, cuComplex* V, int ldv,
-            cuComplex* work, int lwork,
-            int* info, GesvdjInfo params, int batchSize)
+            Handle handle, EigMode jobz, int m, int n,
+            cuComplex* A, int lda, float* S,
+            cuComplex* U, int ldu, cuComplex* V, int ldv,
+            cuComplex* work, int lwork, int* info,
+            GesvdjInfo params, int batchSize)
         int cusolverDnZgesvdjBatched(
-            Handle handle, EigMode jobz, int m, int n, cuDoubleComplex* A, int lda,
-            double* S, cuDoubleComplex* U, int ldu, cuDoubleComplex* V, int ldv,
-            cuDoubleComplex* work, int lwork,
-            int* info, GesvdjInfo params, int batchSize)
+            Handle handle, EigMode jobz, int m, int n,
+            cuDoubleComplex* A, int lda, double* S,
+            cuDoubleComplex* U, int ldu, cuDoubleComplex* V, int ldv,
+            cuDoubleComplex* work, int lwork, int* info,
+            GesvdjInfo params, int batchSize)
 
         # gesvda ... Approximate singular value decomposition
         int cusolverDnSgesvdaStridedBatched_bufferSize(
-            Handle handle, EigMode jobz, int rank, int m, int n, const float *d_A,
-            int lda, long long int strideA, const float *d_S,
-            long long int strideS, const float *d_U, int ldu,
-            long long int strideU, const float *d_V, int ldv,
-            long long int strideV, int *lwork, int batchSize)
+            Handle handle, EigMode jobz, int rank, int m, int n,
+            const float *d_A, int lda, long long int strideA,
+            const float *d_S, long long int strideS,
+            const float *d_U, int ldu, long long int strideU,
+            const float *d_V, int ldv, long long int strideV,
+            int *lwork, int batchSize)
 
         int cusolverDnDgesvdaStridedBatched_bufferSize(
-            Handle handle, EigMode jobz, int rank, int m, int n, const double *d_A,
-            int lda, long long int strideA, const double *d_S,
-            long long int strideS, const double *d_U, int ldu,
-            long long int strideU, const double *d_V, int ldv,
-            long long int strideV, int *lwork, int batchSize)
+            Handle handle, EigMode jobz, int rank, int m, int n,
+            const double *d_A, int lda, long long int strideA,
+            const double *d_S, long long int strideS,
+            const double *d_U, int ldu, long long int strideU,
+            const double *d_V, int ldv, long long int strideV,
+            int *lwork, int batchSize)
 
         int cusolverDnCgesvdaStridedBatched_bufferSize(
             Handle handle, EigMode jobz, int rank, int m, int n,
-            const cuComplex *d_A, int lda, long long int strideA, const float *d_S,
-            long long int strideS, const cuComplex *d_U, int ldu,
-            long long int strideU, const cuComplex *d_V, int ldv,
-            long long int strideV, int *lwork, int batchSize)
+            const cuComplex *d_A, int lda, long long int strideA,
+            const float *d_S, long long int strideS,
+            const cuComplex *d_U, int ldu, long long int strideU,
+            const cuComplex *d_V, int ldv, long long int strideV,
+            int *lwork, int batchSize)
 
         int cusolverDnZgesvdaStridedBatched_bufferSize(
             Handle handle, EigMode jobz, int rank, int m, int n,
             const cuDoubleComplex *d_A, int lda, long long int strideA,
-            const double *d_S, long long int strideS, const cuDoubleComplex *d_U,
-            int ldu, long long int strideU, const cuDoubleComplex *d_V, int ldv,
-            long long int strideV, int *lwork, int batchSize)
+            const double *d_S, long long int strideS,
+            const cuDoubleComplex *d_U, int ldu,
+            long long int strideU, const cuDoubleComplex *d_V,
+            int ldv, long long int strideV, int *lwork, int batchSize)
 
         int cusolverDnSgesvdaStridedBatched(
-            Handle handle, EigMode jobz, int rank, int m, int n, const float *d_A,
-            int lda, long long int strideA, float *d_S, long long int strideS,
-            float *d_U, int ldu, long long int strideU, float *d_V, int ldv,
-            long long int strideV, float *d_work, int lwork, int *d_info,
+            Handle handle, EigMode jobz, int rank, int m, int n,
+            const float *d_A, int lda, long long int strideA,
+            float *d_S, long long int strideS,
+            float *d_U, int ldu, long long int strideU,
+            float *d_V, int ldv, long long int strideV,
+            float *d_work, int lwork, int *d_info,
             double *h_R_nrmF, int batchSize)
 
         int cusolverDnDgesvdaStridedBatched(
-            Handle handle, EigMode jobz, int rank, int m, int n, const double *d_A,
-            int lda, long long int strideA, double *d_S, long long int strideS,
-            double *d_U, int ldu, long long int strideU, double *d_V, int ldv,
-            long long int strideV, double *d_work, int lwork, int *d_info,
+            Handle handle, EigMode jobz, int rank, int m, int n,
+            const double *d_A, int lda, long long int strideA,
+            double *d_S, long long int strideS,
+            double *d_U, int ldu, long long int strideU,
+            double *d_V, int ldv, long long int strideV,
+            double *d_work, int lwork, int *d_info,
             double *h_R_nrmF, int batchSize)
 
         int cusolverDnCgesvdaStridedBatched(
             Handle handle, EigMode jobz, int rank, int m, int n,
-            const cuComplex *d_A, int lda, long long int strideA, float *d_S,
-            long long int strideS, cuComplex *d_U, int ldu, long long int strideU,
-            cuComplex *d_V, int ldv, long long int strideV, cuComplex *d_work,
-            int lwork, int *d_info, double *h_R_nrmF, int batchSize)
+            const cuComplex *d_A, int lda, long long int strideA,
+            float *d_S, long long int strideS,
+            cuComplex *d_U, int ldu, long long int strideU,
+            cuComplex *d_V, int ldv, long long int strideV,
+            cuComplex *d_work, int lwork, int *d_info,
+            double *h_R_nrmF, int batchSize)
 
         int cusolverDnZgesvdaStridedBatched(
             Handle handle, EigMode jobz, int rank, int m, int n,
             const cuDoubleComplex *d_A, int lda, long long int strideA,
             double *d_S, long long int strideS, cuDoubleComplex *d_U, int ldu,
             long long int strideU, cuDoubleComplex *d_V, int ldv,
-            long long int strideV, cuDoubleComplex *d_work, int lwork, int *d_info,
-            double *h_R_nrmF, int batchSize)
+            long long int strideV, cuDoubleComplex *d_work,
+            int lwork, int *d_info, double *h_R_nrmF, int batchSize)
 
         # Standard symmetric eigenvalue solver
         int cusolverDnSsyevd_bufferSize(Handle handle,
@@ -1219,29 +1254,33 @@ ELSE:
 
         # 64bit
         int cusolverDnXsyevd_bufferSize(
-            Handle handle, Params params, EigMode jobz, FillMode uplo, int64_t n,
-            DataType dataTypeA, void *A, int64_t lda,
-            DataType dataTypeW, void *W, DataType computeType,
+            Handle handle, Params params, EigMode jobz,
+            FillMode uplo, int64_t n, DataType dataTypeA,
+            void *A, int64_t lda, DataType dataTypeW,
+            void *W, DataType computeType,
             size_t *workspaceInBytesOnDevice, size_t *workspaceInBytesOnHost)
         int cusolverDnXsyevd(
-            Handle handle, Params params, EigMode jobz, FillMode uplo, int64_t n,
-            DataType dataTypeA, void *A, int64_t lda,
-            DataType dataTypeW, void *W, DataType computeType,
+            Handle handle, Params params, EigMode jobz,
+            FillMode uplo, int64_t n, DataType dataTypeA,
+            void *A, int64_t lda, DataType dataTypeW,
+            void *W, DataType computeType,
             void *bufferOnDevice, size_t workspaceInBytesOnDevice,
             void *bufferOnHost, size_t workspaceInBytesOnHost, int *info)
 
-        ###########################################################################
+        #######################################################################
         # Sparse LAPACK Functions
-        ###########################################################################
+        #######################################################################
 
         int cusolverSpScsrlsvchol(
             SpHandle handle, int m, int nnz, const MatDescr descrA,
-            const float* csrValA, const int* csrRowPtrA, const int* csrColIndA,
-            const float* b, float tol, int reorder, float* x, int* singularity)
+            const float* csrValA, const int* csrRowPtrA,
+            const int* csrColIndA, const float* b,
+            float tol, int reorder, float* x, int* singularity)
         int cusolverSpDcsrlsvchol(
             SpHandle handle, int m, int nnz, const MatDescr descrA,
-            const double* csrValA, const int* csrRowPtrA, const int* csrColIndA,
-            const double* b, double tol, int reorder, double* x, int* singularity)
+            const double* csrValA, const int* csrRowPtrA,
+            const int* csrColIndA, const double* b,
+            double tol, int reorder, double* x, int* singularity)
         int cusolverSpCcsrlsvchol(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const cuComplex *csrVal,
@@ -1250,17 +1289,20 @@ ELSE:
         int cusolverSpZcsrlsvchol(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const cuDoubleComplex *csrVal,
-            const int *csrRowPtr, const int *csrColInd, const cuDoubleComplex *b,
-            double tol, int reorder, cuDoubleComplex *x, int *singularity)
+            const int *csrRowPtr, const int *csrColInd,
+            const cuDoubleComplex *b, double tol, int reorder,
+            cuDoubleComplex *x, int *singularity)
 
         int cusolverSpScsrlsvqr(
             SpHandle handle, int m, int nnz, const MatDescr descrA,
-            const float* csrValA, const int* csrRowPtrA, const int* csrColIndA,
-            const float* b, float tol, int reorder, float* x, int* singularity)
+            const float* csrValA, const int* csrRowPtrA,
+            const int* csrColIndA, const float* b,
+            float tol, int reorder, float* x, int* singularity)
         int cusolverSpDcsrlsvqr(
             SpHandle handle, int m, int nnz, const MatDescr descrA,
-            const double* csrValA, const int* csrRowPtrA, const int* csrColIndA,
-            const double* b, double tol, int reorder, double* x, int* singularity)
+            const double* csrValA, const int* csrRowPtrA,
+            const int* csrColIndA, const double* b,
+            double tol, int reorder, double* x, int* singularity)
         int cusolverSpCcsrlsvqr(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const cuComplex *csrVal,
@@ -1269,33 +1311,35 @@ ELSE:
         int cusolverSpZcsrlsvqr(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const cuDoubleComplex *csrVal,
-            const int *csrRowPtr, const int *csrColInd, const cuDoubleComplex *b,
-            double tol, int reorder, cuDoubleComplex *x, int *singularity)
+            const int *csrRowPtr, const int *csrColInd,
+            const cuDoubleComplex *b, double tol, int reorder,
+            cuDoubleComplex *x, int *singularity)
 
         int cusolverSpScsreigvsi(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const float *csrValA,
-            const int *csrRowPtrA, const int *csrColIndA, float mu0,
-            const float *x0, int maxite, float eps, float *mu, float *x)
+            const int *csrRowPtrA, const int *csrColIndA,
+            float mu0, const float *x0, int maxite,
+            float eps, float *mu, float *x)
         int cusolverSpDcsreigvsi(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const double *csrValA,
-            const int *csrRowPtrA, const int *csrColIndA, double mu0,
-            const double *x0, int maxite, double eps, double *mu, double *x)
+            const int *csrRowPtrA, const int *csrColIndA,
+            double mu0, const double *x0, int maxite,
+            double eps, double *mu, double *x)
         int cusolverSpCcsreigvsi(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const cuComplex *csrValA,
-            const int *csrRowPtrA, const int *csrColIndA, cuComplex mu0,
-            const cuComplex *x0, int maxite, float eps, cuComplex *mu,
-            cuComplex *x)
+            const int *csrRowPtrA, const int *csrColIndA,
+            cuComplex mu0, const cuComplex *x0,
+            int maxite, float eps, cuComplex *mu, cuComplex *x)
         int cusolverSpZcsreigvsi(
             SpHandle handle, int m, int nnz,
             const MatDescr descrA, const cuDoubleComplex *csrValA,
-            const int *csrRowPtrA, const int *csrColIndA, cuDoubleComplex mu0,
-            const cuDoubleComplex *x0, int maxite, double eps, cuDoubleComplex *mu,
+            const int *csrRowPtrA, const int *csrColIndA,
+            cuDoubleComplex mu0, const cuDoubleComplex *x0,
+            int maxite, double eps, cuDoubleComplex *mu,
             cuDoubleComplex *x)
-
-
 
     ctypedef int (*f_type)(...) noexcept nogil  # NOQA
 
@@ -1311,7 +1355,8 @@ ELSE:
     cdef SoftLink _lib = SoftLink(_libname, 'cusolver', handle=_handle)
     # cuSOLVER 11.7+ (CUDA 12.6.2+)
     cdef f_type cusolverDnXgeev = <f_type>_lib.get('DnXgeev')
-    cdef f_type cusolverDnXgeev_bufferSize = <f_type>_lib.get('DnXgeev_bufferSize')
+    cdef f_type cusolverDnXgeev_bufferSize = (
+        <f_type>_lib.get('DnXgeev_bufferSize'))
 
 
 ###############################################################################
