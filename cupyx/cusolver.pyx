@@ -168,7 +168,6 @@ IF CUPY_USE_CUDA_PYTHON:
             devInfo += 1
         return status
 
-
     cdef int sgesvd_loop(
             intptr_t handle, char jobu, char jobvt, int m, int n, intptr_t A,
             intptr_t s_ptr, intptr_t u_ptr, intptr_t vt_ptr,
