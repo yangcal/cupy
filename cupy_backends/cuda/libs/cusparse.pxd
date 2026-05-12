@@ -72,6 +72,20 @@ IF CUPY_CUDA_VERSION == 0:
         ctypedef void* csrsv2Info_t
         ctypedef void* csrsm2Info_t
         ctypedef void* csrgemm2Info_t
+# TODO(eriknw): cuSPARSE--remove stubs when SpGEAM ships in a public release.
+# The #ifndef guard auto-deactivates when the real header defines these.
+cdef extern from *:
+    """
+    #ifndef CUSPARSE_SPGEAM_ALG_DEFAULT
+    /* SpGEAM not in this cuSPARSE; provide opaque forward decls. */
+    typedef void* cusparseSpGEAMDescr_t;
+    typedef int cusparseSpGEAMAlg_t;
+    #define CUSPARSE_SPGEAM_ALG_DEFAULT 0
+    #define CUSPARSE_SPGEAM_ALG1 1
+    #endif
+    """
+    ctypedef void* SpGEAMDescr 'cusparseSpGEAMDescr_t'
+    ctypedef int SpGEAMAlg 'cusparseSpGEAMAlg_t'
 
 cpdef enum:
     CUSPARSE_POINTER_MODE_HOST = 0
@@ -152,6 +166,10 @@ cpdef enum:
     CUSPARSE_SPGEMM_ALG1 = 3  # Default, fastest algorithm
     CUSPARSE_SPGEMM_ALG2 = 4  # Balance between memory and time
     CUSPARSE_SPGEMM_ALG3 = 5  # Low memory requirement, chunk computation
+
+    # cusparseSpGEAMAlg_t
+    CUSPARSE_SPGEAM_ALG_DEFAULT = 0
+    CUSPARSE_SPGEAM_ALG1 = 1
 
     # cusparseSparseToDenseAlg_t
     CUSPARSE_SPARSETODENSE_ALG_DEFAULT = 0
