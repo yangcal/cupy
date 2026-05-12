@@ -20,17 +20,13 @@ cdef extern from *:
     ctypedef int PointerMode 'cusparsePointerMode_t'
 
     ctypedef int Action 'cusparseAction_t'
-    ctypedef int AlgMode 'cusparseAlgMode_t'
 
     ctypedef void* cusparseHandle_t
     ctypedef void* cusparseMatDescr_t
-    ctypedef void* csrsv2Info_t
-    ctypedef void* csrsm2Info_t
     ctypedef void* csric02Info_t
     ctypedef void* bsric02Info_t
     ctypedef void* csrilu02Info_t
     ctypedef void* bsrilu02Info_t
-    ctypedef void* csrgemm2Info_t
 
     # Declarations for cuSparse generic API
     ctypedef int cusparseStatus_t
@@ -68,6 +64,14 @@ cdef extern from *:
 
     # CSR2CSC
     ctypedef int Csr2CscAlg 'cusparseCsr2CscAlg_t'
+
+# Types removed in CUDA 12.0+
+IF CUPY_CUDA_VERSION == 0:
+    cdef extern from *:
+        ctypedef int AlgMode 'cusparseAlgMode_t'
+        ctypedef void* csrsv2Info_t
+        ctypedef void* csrsm2Info_t
+        ctypedef void* csrgemm2Info_t
 
 cpdef enum:
     CUSPARSE_POINTER_MODE_HOST = 0
