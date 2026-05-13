@@ -180,8 +180,8 @@ _available_cusparse_version = {
     'csc2csr': (8000, 11000),  # the entity is csr2csc
     'csr2cscEx2': (10200, None),
     'csc2csrEx2': (10200, None),  # the entity is csr2cscEx2
-    'dense2csc': (8000, None),
-    'dense2csr': (8000, None),
+    'dense2csc': (8000, 12000),
+    'dense2csr': (8000, 12000),
     'csr2csr_compress': (8000, None),
     'csrsm2': (9020, 12000),
     'csrilu02': (8000, None),
@@ -264,7 +264,12 @@ def _get_avail_version_from_spec(x):
 def check_availability(name):
     if not _runtime.is_hip:
         available_version = _available_cusparse_version
-        version = _cusparse.get_build_version()
+        if _cusparse.is_cuda_python_build():
+            # In the CUDA_PYTHON build, cusparse is not required at build time,
+            # all symbols are loaded at runtime.
+            version = getVersion()
+        else:
+            version = _cusparse.getVersion()
     else:
         available_version = _available_hipsparse_version
         version = _driver.get_build_version()  # = HIP_VERSION
