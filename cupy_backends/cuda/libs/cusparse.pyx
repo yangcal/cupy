@@ -1243,6 +1243,10 @@ cpdef int getVersion(intptr_t handle) except? -1:
     return version
 
 
+def is_cuda_python_build():
+    return CUPY_USE_CUDA_PYTHON
+
+
 def get_build_version():
     # In the CUPY_USE_CUDA_PYTHON mode
     # cusparse is not required at build time
