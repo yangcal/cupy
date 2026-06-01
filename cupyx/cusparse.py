@@ -269,7 +269,7 @@ def check_availability(name):
             # all symbols are loaded at runtime.
             version = getVersion()
         else:
-            version = _cusparse.getVersion()
+            version = _cusparse.get_build_version()
     else:
         available_version = _available_hipsparse_version
         version = _driver.get_build_version()  # = HIP_VERSION
