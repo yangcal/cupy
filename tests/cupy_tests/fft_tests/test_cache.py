@@ -12,6 +12,7 @@ import cupy
 from cupy import testing
 from cupy.cuda import cufft
 from cupy.cuda import device
+from cupy.cuda import driver
 from cupy.cuda import runtime
 from cupy.fft import config
 
@@ -26,6 +27,24 @@ def intercept_stdout(func):
 
 
 n_devices = runtime.getDeviceCount()
+is_cuda_python = driver._is_cuda_python()
+
+
+class _ExplicitFreePlan:
+    gpus = None
+    work_area = None
+
+    def __init__(self, fail_on_free=False):
+        self.free_count = 0
+        self.fail_on_free = fail_on_free
+
+    def free(self):
+        self.free_count += 1
+        if self.fail_on_free:
+            raise RuntimeError('free failed')
+
+    def _cupy_fft_cache_cleanup(self):
+        self.free()
 
 
 class TestPlanCache(unittest.TestCase):
@@ -111,6 +130,66 @@ class TestPlanCache(unittest.TestCase):
         # check if the first plan is indeed not cached
         for _, node in cache:
             assert plan is not node.plan
+
+    @prepare_and_restore_caches()
+    def test_explicit_free_plan_lifecycle(self):
+        cache = config.get_plan_cache()
+        plan1 = _ExplicitFreePlan()
+        plan2 = _ExplicitFreePlan()
+        plan3 = _ExplicitFreePlan()
+
+        cache[('explicit-free', 1)] = plan1
+        cache[('explicit-free', 2)] = plan2
+        assert cache.get_curr_memsize() == 0
+        assert 'plan type: nvmath FFT' in str(cache)
+
+        # Reassigning the same object only refreshes its LRU position.
+        cache[('explicit-free', 2)] = plan2
+        assert plan2.free_count == 0
+
+        # Inserting a third plan evicts and explicitly frees the LRU plan.
+        cache[('explicit-free', 3)] = plan3
+        assert plan1.free_count == 1
+        assert plan2.free_count == 0
+        assert plan3.free_count == 0
+
+        del cache[('explicit-free', 2)]
+        assert plan2.free_count == 1
+
+        plan4 = _ExplicitFreePlan()
+        cache[('explicit-free', 3)] = plan4
+        assert plan3.free_count == 1
+
+        cache.clear()
+        assert plan4.free_count == 1
+
+    @prepare_and_restore_caches()
+    def test_zero_memsize_frees_zero_weight_plan(self):
+        cache = config.get_plan_cache()
+        plan = _ExplicitFreePlan()
+        cache[('explicit-free',)] = plan
+
+        cache.set_memsize(0)
+
+        assert plan.free_count == 1
+        assert cache.get_curr_size() == 0
+        assert cache.get_curr_memsize() == 0
+
+    @prepare_and_restore_caches()
+    def test_clear_recovers_from_explicit_free_failure(self):
+        cache = config.get_plan_cache()
+        bad_plan = _ExplicitFreePlan(fail_on_free=True)
+        good_plan = _ExplicitFreePlan()
+        cache[('explicit-free', 1)] = bad_plan
+        cache[('explicit-free', 2)] = good_plan
+
+        with pytest.raises(RuntimeError, match='free failed'):
+            cache.clear()
+
+        assert bad_plan.free_count == 1
+        assert good_plan.free_count == 1
+        assert cache.get_curr_size() == 0
+        assert cache.get_curr_memsize() == 0
 
     @prepare_and_restore_caches()
     def test_LRU_cache4(self):
@@ -340,8 +419,12 @@ class TestPlanCache(unittest.TestCase):
         assert cache.get_curr_size() == 2 <= cache.get_size()
         iterator = iter(cache)
 
-        # the cached order is 1. PlanNd, 2. Plan1d
-        assert isinstance(next(iterator)[1].plan, cufft.PlanNd)
+        # The N-D entry is most recent, followed by the 1-D entry.
+        plan = next(iterator)[1].plan
+        if is_cuda_python:
+            assert callable(plan._cupy_fft_cache_cleanup)
+        else:
+            assert isinstance(plan, cufft.PlanNd)
         assert isinstance(next(iterator)[1].plan, cufft.Plan1d)
 
     @prepare_and_restore_caches()
@@ -354,12 +437,12 @@ class TestPlanCache(unittest.TestCase):
         a = testing.shaped_random((10,), cupy, cupy.float32)
         cupy.fft.fft(a)
         assert cache.get_curr_size() == 1 <= cache.get_size()
-        memsize += next(iter(cache))[1].plan.work_area.mem.size
+        memsize += next(iter(cache))[1].memsize
 
         a = testing.shaped_random((48,), cupy, cupy.complex64)
         cupy.fft.fft(a)
         assert cache.get_curr_size() == 2 <= cache.get_size()
-        memsize += next(iter(cache))[1].plan.work_area.mem.size
+        memsize += next(iter(cache))[1].memsize
 
         assert memsize == cache.get_curr_memsize()
 
@@ -380,7 +463,7 @@ class TestPlanCache(unittest.TestCase):
         assert cache.get_curr_size() == 1 <= cache.get_size()
         node1 = next(iter(cache))[1]
         curr_size += 1
-        curr_memsize += node1.plan.work_area.mem.size
+        curr_memsize += node1.memsize
         stdout = intercept_stdout(cache.show_info)
         assert '{} / {} (counts)'.format(curr_size, size) in stdout
         assert '{} / {} (bytes)'.format(curr_memsize, memsize) in stdout
@@ -391,7 +474,7 @@ class TestPlanCache(unittest.TestCase):
         assert cache.get_curr_size() == 2 <= cache.get_size()
         node2 = next(iter(cache))[1]
         curr_size += 1
-        curr_memsize += node2.plan.work_area.mem.size
+        curr_memsize += node2.memsize
         stdout = intercept_stdout(cache.show_info)
         assert '{} / {} (counts)'.format(curr_size, size) in stdout
         assert '{} / {} (bytes)'.format(curr_memsize, memsize) in stdout
@@ -402,7 +485,7 @@ class TestPlanCache(unittest.TestCase):
         del cache[key]
         assert cache.get_curr_size() == 1 <= cache.get_size()
         curr_size -= 1
-        curr_memsize -= node2.plan.work_area.mem.size
+        curr_memsize -= node2.memsize
         stdout = intercept_stdout(cache.show_info)
         assert '{} / {} (counts)'.format(curr_size, size) in stdout
         assert '{} / {} (bytes)'.format(curr_memsize, memsize) in stdout
@@ -473,6 +556,8 @@ class TestPlanCache(unittest.TestCase):
         assert cache1.get_curr_size() == 0 <= cache1.get_size()
 
     @unittest.skipIf(runtime.is_hip, "rocFFT has different plan sizes")
+    @unittest.skipIf(
+        is_cuda_python, "nvmath plans release and do not account workspaces")
     @unittest.skipIf(runtime.runtimeGetVersion() >= 11080,
                      "CUDA 11.8 has different plan size")
     @prepare_and_restore_caches()
@@ -517,3 +602,117 @@ class TestPlanCache(unittest.TestCase):
         assert cache.get_curr_memsize() == 2048 == cache.get_memsize()
         plan2 = next(iter(cache))[1].plan
         assert plan2 is not plan
+
+
+@pytest.mark.skipif(
+    not is_cuda_python, reason='requires a CUDA-Python build')
+class TestNvmathFFTCache:
+
+    @pytest.fixture(autouse=True)
+    def prepare_cache(self):
+        cache = config.get_plan_cache()
+        old_size = cache.get_size()
+        old_memsize = cache.get_memsize()
+        cache.clear()
+        cache.set_size(16)
+        cache.set_memsize(-1)
+        try:
+            yield
+        finally:
+            cache.clear()
+            cache.set_size(old_size)
+            cache.set_memsize(old_memsize)
+
+    def test_cached_lifecycle(self, monkeypatch):
+        import nvmath.fft
+
+        execute_release_workspace = []
+        reset_count = 0
+        release_count = 0
+        free_count = 0
+
+        original_execute = nvmath.fft.FFT.execute
+        original_free = nvmath.fft.FFT.free
+        original_release = nvmath.fft.FFT.release_operand
+        original_reset = nvmath.fft.FFT.reset_operand_unchecked
+
+        def execute(self, *args, **kwargs):
+            execute_release_workspace.append(kwargs.get('release_workspace'))
+            return original_execute(self, *args, **kwargs)
+
+        def release(self):
+            nonlocal release_count
+            release_count += 1
+            return original_release(self)
+
+        def free(self):
+            nonlocal free_count
+            free_count += 1
+            return original_free(self)
+
+        def reset(self, *args, **kwargs):
+            nonlocal reset_count
+            reset_count += 1
+            return original_reset(self, *args, **kwargs)
+
+        monkeypatch.setattr(nvmath.fft.FFT, 'execute', execute)
+        monkeypatch.setattr(nvmath.fft.FFT, 'free', free)
+        monkeypatch.setattr(nvmath.fft.FFT, 'release_operand', release)
+        monkeypatch.setattr(
+            nvmath.fft.FFT, 'reset_operand_unchecked', reset)
+
+        a = testing.shaped_random((3, 16), cupy, cupy.complex64)
+        cupy.fft.fft(a, axis=-1)
+
+        cache = config.get_plan_cache()
+        assert cache.get_curr_size() == 1
+        assert cache.get_curr_memsize() == 0
+        _, node = next(iter(cache))
+        plan = node.plan
+
+        b = testing.shaped_random((3, 16), cupy, cupy.complex64)
+        cupy.fft.fft(b, axis=-1)
+        assert next(iter(cache))[1].plan is plan
+        assert reset_count == 1
+        assert release_count == 2
+        assert execute_release_workspace == [True, True]
+
+        cache.clear()
+        assert free_count == 1
+
+    def test_cache_is_separated_by_stream(self):
+        stream1 = cupy.cuda.Stream(non_blocking=True)
+        stream2 = cupy.cuda.Stream(non_blocking=True)
+
+        cache = config.get_plan_cache()
+        assert cache.get_curr_size() == 0
+
+        with stream1:
+            a1 = testing.shaped_random((16,), cupy, cupy.complex64)
+            cupy.fft.fft(a1)
+        with stream2:
+            a2 = testing.shaped_random((16,), cupy, cupy.complex64)
+            cupy.fft.fft(a2)
+
+        assert cache.get_curr_size() == 2
+
+    def test_disabled_cache_frees_ephemeral_plan(self, monkeypatch):
+        import nvmath.fft
+
+        free_count = 0
+        original_free = nvmath.fft.FFT.free
+
+        def free(self):
+            nonlocal free_count
+            free_count += 1
+            return original_free(self)
+
+        monkeypatch.setattr(nvmath.fft.FFT, 'free', free)
+        cache = config.get_plan_cache()
+        cache.set_size(0)
+
+        a = testing.shaped_random((16,), cupy, cupy.complex64)
+        cupy.fft.fft(a)
+
+        assert free_count == 1
+        assert cache.get_curr_size() == 0

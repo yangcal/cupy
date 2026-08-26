@@ -61,6 +61,16 @@ cdef inline Py_ssize_t _get_plan_memsize(plan, int curr_dev=-1) except -1:
     return memsize
 
 
+# Plans that need more than reference-counted destruction opt in here.
+cdef inline bint _plan_has_explicit_cleanup(plan) except -1:
+    return hasattr(plan, '_cupy_fft_cache_cleanup')
+
+
+cdef inline void _cleanup_plan_if_needed(plan) except*:
+    if _plan_has_explicit_cleanup(plan):
+        plan._cupy_fft_cache_cleanup()
+
+
 cdef class _Node:
     # Unfortunately cython cdef class cannot be nested, so the node class
     # has to live outside of the linked list...
@@ -98,6 +108,8 @@ cdef class _Node:
             plan_type = plan_type.split('.')[1]
             plan_type = plan_type[:6]
             plan_type += ' (static)'
+        elif _plan_has_explicit_cleanup(self.plan):
+            plan_type = 'nvmath FFT'
         else:
             raise TypeError('unrecognized plan type: {}'.format(
                 type(self.plan)))
@@ -113,9 +125,18 @@ cpdef _clear_LinkedList(_LinkedList ll):
     finalizer, as __del__ has no effect for cdef classes (cupy/cupy#3999).
     """
     cdef _Node curr = ll.head
+    cdef object first_error = None
 
     while curr.next is not ll.tail:
-        ll.remove_node(curr.next)
+        curr = curr.next
+        ll.remove_node(curr)
+        try:
+            _cleanup_plan_if_needed(curr.plan)
+        except Exception as e:
+            # Continue cleanup so one failure does not leak later plans.
+            if first_error is None:
+                first_error = e
+        curr = ll.head
     assert ll.count == 0
 
     # remove head and tail too
@@ -126,6 +147,8 @@ cpdef _clear_LinkedList(_LinkedList ll):
 
     # make the memory released asap
     gc.collect()
+    if first_error is not None:
+        raise first_error
 
 
 cdef class _LinkedList:
@@ -423,12 +446,21 @@ cdef class PlanCache:
         self.lru.append_node(node)
 
     cdef void _add_plan(self, tuple key, plan) except*:
-        cdef _Node node = _Node(key, plan, self.dev)
+        cdef _Node node
         cdef _Node unwanted_node
 
-        # Now we ensure we have room to insert, check if the key already exists
+        # An existing key with the same plan is an LRU refresh, not disposal.
         unwanted_node = self.cache.get(key)
         if unwanted_node is not None:
+            if unwanted_node.plan is plan:
+                self._move_plan_to_end(key=None, node=unwanted_node)
+                return
+
+        # Here the key is either new, or it maps to a different plan.
+        # Build the new node first so failure leaves any old entry intact.
+        node = _Node(key, plan, self.dev)
+        if unwanted_node is not None:
+            # Replace the distinct old plan, relinquishing cache ownership.
             self._remove_plan(key=None, node=unwanted_node)
 
         # See if the plan can fit in, if not we remove least used ones
@@ -454,6 +486,8 @@ cdef class PlanCache:
         del self.cache[key]
         self.curr_size -= 1
         self.curr_memsize -= node.memsize
+        # Dispose only after removing ownership and updating bookkeeping.
+        _cleanup_plan_if_needed(node.plan)
 
     cdef int _eject_until_fit(
             self, Py_ssize_t size, Py_ssize_t memsize) except -1:
@@ -490,7 +524,8 @@ cdef class PlanCache:
 
     cpdef set_memsize(self, Py_ssize_t memsize):
         self._validate_size_memsize(self.size, memsize)
-        self._eject_until_fit(self.size, memsize)
+        # A zero memory limit must also evict zero-weight plans.
+        self._eject_until_fit(0 if memsize == 0 else self.size, memsize)
         self._set_size_memsize(self.size, memsize)
 
     cpdef Py_ssize_t get_memsize(self):
@@ -512,8 +547,11 @@ cdef class PlanCache:
         return plan
 
     cpdef clear(self):
-        self._cleanup()
-        self._reset()
+        try:
+            self._cleanup()
+        finally:
+            # Keep bookkeeping valid even if explicit plan cleanup fails.
+            self._reset()
 
     cpdef show_info(self):
         print(self)

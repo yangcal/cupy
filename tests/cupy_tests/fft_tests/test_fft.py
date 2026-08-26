@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 import cupy
+from cupy.cuda import driver
 from cupy.fft import config
 from cupy.fft._fft import (_default_fft_func, _fft, _fftn,
                            _size_last_transform_axis)
@@ -1243,3 +1244,23 @@ class TestThreading:
 
         new_thread = threading.Thread(target=thread_do_fft)
         new_thread.start()
+
+
+@pytest.mark.parametrize(
+    'ndim, axes, expected',
+    [
+        (3, None, (0, 1, 2)),
+        (3, -1, (2,)),
+        (3, np.int64(-1), (2,)),
+        (3, (-3, -1), (0, 2)),
+        (3, (0, -3), None),
+        (4, (0, 1, 2, 3), None),
+        (2, (2,), None),
+    ],
+)
+@pytest.mark.skipif(
+    not driver._is_cuda_python(), reason='requires a CUDA-Python build')
+def test_nvmath_normalize_axes(ndim, axes, expected):
+    from cupy.fft._fft_nvmath import _normalize_axes
+
+    assert _normalize_axes(ndim, axes) == expected
