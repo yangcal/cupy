@@ -1085,6 +1085,9 @@ class TestPlanCtxManagerRfftn:
         testing.product({'norm': [None, 'backward', 'ortho', 'forward']})
     )
 ))
+@pytest.mark.skipif(
+    driver._is_cuda_python(),
+    reason='nvmath FFT uses an optimized output layout')
 @pytest.mark.thread_unsafe(reason="`nd_planning_states` is not thread-safe")
 class TestRfftnContiguity:
 

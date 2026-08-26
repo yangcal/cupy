@@ -114,11 +114,12 @@ def _try_use_nvmath(
             f'Invalid norm value {norm}, should be "backward", "ortho", '
             'or "forward".')
 
+    # TODO: verify that there is no strides requirement for cupy.fft
     options = nvmath_fft.FFTOptions(
         fft_type=fft_type,
         inplace=False,
         last_axis_parity='even',
-        result_layout='natural',
+        result_layout='optimized',
     )
     element_strides = tuple(
         stride // operand.itemsize for stride in operand.strides)
