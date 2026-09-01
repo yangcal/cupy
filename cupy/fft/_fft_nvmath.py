@@ -76,6 +76,27 @@ def _scale_result(out, operand, axes, norm, fft_type, fft_direction):
         out /= size
 
 
+def _create_key_from_operand(operand, axes, options):
+    element_strides = tuple(
+        stride // operand.itemsize for stride in operand.strides)
+    return nvmath_fft.FFT.create_key_from_metadata(
+        tuple(operand.shape),
+        operand.dtype.name,
+        'cuda',
+        strides=element_strides,
+        axes=axes,
+        options=options,
+        execution='cuda',
+    )
+
+
+def _invert_permutation(permutation):
+    inverse = [None] * len(permutation)
+    for new_axis, old_axis in enumerate(permutation):
+        inverse[old_axis] = new_axis
+    return tuple(inverse)
+
+
 def _try_use_nvmath(
         operand, requested_shape, axes, norm, *, fft_type, fft_direction):
     """Execute with nvmath, or return None to use CuPy's native path.
@@ -114,28 +135,33 @@ def _try_use_nvmath(
             f'Invalid norm value {norm}, should be "backward", "ortho", '
             'or "forward".')
 
-    # TODO: verify that there is no strides requirement for cupy.fft
     options = nvmath_fft.FFTOptions(
         fft_type=fft_type,
         inplace=False,
         last_axis_parity='even',
         result_layout='optimized',
     )
-    element_strides = tuple(
-        stride // operand.itemsize for stride in operand.strides)
+    result_permutation = None
 
     try:
-        nvmath_key = nvmath_fft.FFT.create_key_from_metadata(
-            tuple(operand.shape),
-            operand.dtype.name,
-            'cuda',
-            strides=element_strides,
-            axes=axes,
-            options=options,
-            execution='cuda',
-        )
-    # TODO: Support more cases with layout changes.
-    except (nvmath_fft.UnsupportedLayoutError, ValueError):
+        nvmath_key = _create_key_from_operand(operand, axes, options)
+    except nvmath_fft.UnsupportedLayoutError as e:
+        permutation = tuple(e.permutation)
+        operand = operand.transpose(permutation).copy()
+        axes = tuple(e.axes)
+        result_permutation = _invert_permutation(permutation)
+        if fft_type == 'C2C':
+            options = nvmath_fft.FFTOptions(
+                fft_type=fft_type,
+                inplace=True,
+                last_axis_parity='even',
+                result_layout='optimized',
+            )
+        try:
+            nvmath_key = _create_key_from_operand(operand, axes, options)
+        except ValueError:
+            return None
+    except ValueError:
         return None
 
     stream = cupy.cuda.get_current_stream()
@@ -198,4 +224,6 @@ def _try_use_nvmath(
         else:
             plan.free()
 
+    if result_permutation is not None:
+        out = out.transpose(result_permutation)
     return out
