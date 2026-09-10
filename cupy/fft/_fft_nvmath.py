@@ -76,11 +76,30 @@ def _scale_result(out, operand, axes, norm, fft_type, fft_direction):
         out /= size
 
 
-def _create_key_from_operand(operand, axes, options):
-    element_strides = tuple(
-        stride // operand.itemsize for stride in operand.strides)
+def _c_contiguous_element_strides(shape):
+    strides = [1] * len(shape)
+    for axis in range(len(shape) - 1, 0, -1):
+        strides[axis - 1] = strides[axis] * shape[axis]
+    return tuple(strides)
+
+
+def _create_key_from_operand(operand, axes, options, permutation=None):
+    """Build the nvmath key from operand metadata.
+
+    When ``permutation`` is given, the key describes the not-yet-materialized
+    ``operand.transpose(permutation).copy()`` instead of ``operand`` itself, so
+    that the recommended layout only has to be materialized once the key is
+    known to be usable.
+    """
+    if permutation is None:
+        shape = tuple(operand.shape)
+        element_strides = tuple(
+            stride // operand.itemsize for stride in operand.strides)
+    else:
+        shape = tuple(operand.shape[axis] for axis in permutation)
+        element_strides = _c_contiguous_element_strides(shape)
     return nvmath_fft.FFT.create_key_from_metadata(
-        tuple(operand.shape),
+        shape,
         operand.dtype.name,
         'cuda',
         strides=element_strides,
@@ -141,24 +160,23 @@ def _try_use_nvmath(
         last_axis_parity='even',
         result_layout='optimized',
     )
+    permutation = None
     result_permutation = None
 
     try:
         nvmath_key = _create_key_from_operand(operand, axes, options)
     except nvmath_fft.UnsupportedLayoutError as e:
         permutation = tuple(e.permutation)
-        operand = operand.transpose(permutation).copy()
         axes = tuple(e.axes)
         result_permutation = _invert_permutation(permutation)
-        if fft_type == 'C2C':
-            options = nvmath_fft.FFTOptions(
-                fft_type=fft_type,
-                inplace=True,
-                last_axis_parity='even',
-                result_layout='optimized',
-            )
+        # The copy below could be transformed in place, but nvmath's key does
+        # not encode `inplace`: for a dense C2C layout the in-place and
+        # out-of-place keys are identical, so an in-place plan would share a
+        # cache entry with the out-of-place plan for the same layout and could
+        # later be handed a caller's array to overwrite. Stay out-of-place.
         try:
-            nvmath_key = _create_key_from_operand(operand, axes, options)
+            nvmath_key = _create_key_from_operand(
+                operand, axes, options, permutation)
         except ValueError:
             return None
     except ValueError:
@@ -171,6 +189,12 @@ def _try_use_nvmath(
     cache = get_plan_cache()
     plan = cache.get(key)
     cache_miss = plan is None
+
+    if permutation is not None:
+        # Materialize the layout nvmath recommended, matching the C-contiguous
+        # metadata the key was built from. This has to happen before the
+        # operand is bound to a plan on either the hit or the miss path.
+        operand = operand.transpose(permutation).copy()
 
     if cache_miss:
         try:
