@@ -21,6 +21,17 @@ _DIRECTIONS = {
     'forward': nvmath_fft.FFTDirection.FORWARD,
     'inverse': nvmath_fft.FFTDirection.INVERSE,
 }
+# The options only vary with the FFT type, and nvmath never mutates these options
+# so it's safe to reuse the same options across different FFT plans.
+_FFT_OPTIONS = {
+    fft_type: nvmath_fft.FFTOptions(
+        fft_type=fft_type,
+        inplace=False,
+        last_axis_parity='even',
+        result_layout='optimized',
+    )
+    for fft_type in ('C2C', 'R2C', 'C2R')
+}
 
 
 class CachedFFT(nvmath_fft.FFT):
@@ -154,12 +165,7 @@ def _try_use_nvmath(
             f'Invalid norm value {norm}, should be "backward", "ortho", '
             'or "forward".')
 
-    options = nvmath_fft.FFTOptions(
-        fft_type=fft_type,
-        inplace=False,
-        last_axis_parity='even',
-        result_layout='optimized',
-    )
+    options = _FFT_OPTIONS[fft_type]
     permutation = None
     result_permutation = None
 
