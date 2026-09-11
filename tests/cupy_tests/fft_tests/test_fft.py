@@ -1085,11 +1085,20 @@ class TestPlanCtxManagerRfftn:
         testing.product({'norm': [None, 'backward', 'ortho', 'forward']})
     )
 ))
-@pytest.mark.skipif(
-    driver._is_cuda_python(),
-    reason='nvmath FFT uses an optimized output layout')
 @pytest.mark.thread_unsafe(reason="`nd_planning_states` is not thread-safe")
 class TestRfftnContiguity:
+
+    @pytest.fixture(autouse=True)
+    def use_native_path(self):
+        # These assertions describe CuPy's own N-D plans. nvmath picks an
+        # optimized output layout instead, which CuPy does not guarantee
+        # either way, so pin the path rather than the layout.
+        use_nvmath = config.use_nvmath
+        config.use_nvmath = False
+        try:
+            yield
+        finally:
+            config.use_nvmath = use_nvmath
 
     @nd_planning_states([True])
     @testing.for_float_dtypes()
@@ -1267,3 +1276,37 @@ def test_nvmath_normalize_axes(ndim, axes, expected):
     from cupy.fft._fft_nvmath import _normalize_axes
 
     assert _normalize_axes(ndim, axes) == expected
+
+
+@pytest.mark.skipif(
+    not driver._is_cuda_python(), reason='requires a CUDA-Python build')
+@pytest.mark.thread_unsafe(reason='mutates the global fft config')
+class TestNvmathConfig:
+
+    @pytest.fixture(autouse=True)
+    def restore_config(self):
+        use_nvmath = config.use_nvmath
+        cache = config.get_plan_cache()
+        try:
+            yield
+        finally:
+            config.use_nvmath = use_nvmath
+            cache.clear()
+
+    def test_use_nvmath_selects_the_path(self):
+        cache = config.get_plan_cache()
+        a = testing.shaped_random((16,), cupy, cupy.complex64)
+
+        cache.clear()
+        config.use_nvmath = True
+        cupy.fft.fft(a)
+        assert cache.get_curr_size() == 1
+        # The nvmath plan releases its workspace after every execution.
+        assert cache.get_curr_memsize() == 0
+
+        cache.clear()
+        config.use_nvmath = False
+        cupy.fft.fft(a)
+        assert cache.get_curr_size() == 1
+        # The native Plan1d owns a work area for as long as it is cached.
+        assert cache.get_curr_memsize() > 0

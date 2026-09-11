@@ -43,6 +43,8 @@ class _FFTConfig:
         'cupy.fft.config.use_multi_gpus', default=False)
     _devices = contextvars.ContextVar(
         'cupy.fft.config.devices', default=None)
+    _use_nvmath = contextvars.ContextVar(
+        'cupy.fft.config.use_nvmath', default=True)
 
     def set_cufft_gpus(self, gpus):
         '''Set the GPUs to be used in multi-GPU FFT.
@@ -100,6 +102,19 @@ class _FFTConfig:
     @property
     def devices(self):
         return self._devices.get() if self._use_multi_gpus.get() else None
+
+    @property
+    def use_nvmath(self):
+        """Whether ``cupy.fft`` may execute transforms with nvmath-python.
+
+        When `False`, all transforms take CuPy's native cuFFT path. Has no
+        effect on builds where nvmath-python is unavailable.
+        """
+        return self._use_nvmath.get()
+
+    @use_nvmath.setter
+    def use_nvmath(self, value):
+        self._use_nvmath.set(bool(value))
 
 
 config = _FFTConfig()

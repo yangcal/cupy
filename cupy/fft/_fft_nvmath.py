@@ -21,8 +21,8 @@ _DIRECTIONS = {
     'forward': nvmath_fft.FFTDirection.FORWARD,
     'inverse': nvmath_fft.FFTDirection.INVERSE,
 }
-# The options only vary with the FFT type, and nvmath never mutates these options
-# so it's safe to reuse the same options across different FFT plans.
+# The options only vary with the FFT type, and nvmath never mutates these
+# options, so it's safe to reuse the same options across different FFT plans.
 _FFT_OPTIONS = {
     fft_type: nvmath_fft.FFTOptions(
         fft_type=fft_type,
@@ -134,6 +134,8 @@ def _try_use_nvmath(
     Fallbacks cover shape changes, multi-GPU execution, callbacks or explicit
     plans, and unsupported operands, axes, dtypes, or layouts.
     """
+    if not config.use_nvmath:
+        return None
     if not isinstance(operand, cupy.ndarray):
         return None
     if requested_shape is not None:
