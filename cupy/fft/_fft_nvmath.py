@@ -35,6 +35,10 @@ _FFT_OPTIONS = {
 
 
 class CachedFFT(nvmath_fft.FFT):
+    # How PlanCache.show_info() labels these entries, alongside the Plan1d
+    # and PlanNd labels it uses for CuPy's own plans.
+    _cupy_fft_cache_name = 'nvmath FFT'
+
     def _cupy_fft_cache_cleanup(self):
         """Release resources when PlanCache relinquishes ownership."""
         self.free()
@@ -167,6 +171,12 @@ def _try_use_nvmath(
             f'Invalid norm value {norm}, should be "backward", "ortho", '
             'or "forward".')
 
+    try:
+        direction = _DIRECTIONS[fft_direction]
+    except KeyError:
+        raise ValueError(
+            f'Unsupported FFT direction: {fft_direction!r}') from None
+
     options = _FFT_OPTIONS[fft_type]
     permutation = None
     result_permutation = None
@@ -222,12 +232,6 @@ def _try_use_nvmath(
         plan.reset_operand_unchecked(operand, stream=stream)
 
     try:
-        direction = _DIRECTIONS[fft_direction]
-    except KeyError:
-        raise ValueError(
-            f'Unsupported FFT direction: {fft_direction!r}') from None
-
-    try:
         try:
             out = plan.execute(
                 direction=direction,
@@ -244,16 +248,15 @@ def _try_use_nvmath(
         raise
 
     if cache_miss:
-        # Either zero limit disables PlanCache, even for zero-weight plans.
-        cache_enabled = (
-            cache.get_size() != 0 and cache.get_memsize() != 0)
-        if cache_enabled:
+        if cache.is_enabled:
             try:
                 cache[key] = plan
             except Exception:
                 plan.free()
                 raise
         else:
+            # A disabled cache drops the insertion silently, so the plan has
+            # no owner and has to be released here.
             plan.free()
 
     if result_permutation is not None:

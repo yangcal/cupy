@@ -141,7 +141,7 @@ class TestPlanCache(unittest.TestCase):
         cache[('explicit-free', 1)] = plan1
         cache[('explicit-free', 2)] = plan2
         assert cache.get_curr_memsize() == 0
-        assert 'plan type: nvmath FFT' in str(cache)
+        assert 'plan type: _ExplicitFreePlan' in str(cache)
 
         # Reassigning the same object only refreshes its LRU position.
         cache[('explicit-free', 2)] = plan2
@@ -667,6 +667,7 @@ class TestNvmathFFTCache:
         cache = config.get_plan_cache()
         assert cache.get_curr_size() == 1
         assert cache.get_curr_memsize() == 0
+        assert 'plan type: nvmath FFT' in str(cache)
         _, node = next(iter(cache))
         plan = node.plan
 

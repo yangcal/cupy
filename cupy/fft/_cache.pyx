@@ -109,7 +109,10 @@ cdef class _Node:
             plan_type = plan_type[:6]
             plan_type += ' (static)'
         elif _plan_has_explicit_cleanup(self.plan):
-            plan_type = 'nvmath FFT'
+            # Any plan type may opt into explicit cleanup, so let it label
+            # itself instead of assuming where it came from.
+            plan_type = getattr(
+                self.plan, '_cupy_fft_cache_name', type(self.plan).__name__)
         else:
             raise TypeError('unrecognized plan type: {}'.format(
                 type(self.plan)))
@@ -124,11 +127,11 @@ cpdef _clear_LinkedList(_LinkedList ll):
     This serves for the purpose of destructor and is invoked by weakref's
     finalizer, as __del__ has no effect for cdef classes (cupy/cupy#3999).
     """
-    cdef _Node curr = ll.head
+    cdef _Node curr
     cdef object first_error = None
 
-    while curr.next is not ll.tail:
-        curr = curr.next
+    while ll.head.next is not ll.tail:
+        curr = ll.head.next
         ll.remove_node(curr)
         try:
             _cleanup_plan_if_needed(curr.plan)
@@ -136,7 +139,6 @@ cpdef _clear_LinkedList(_LinkedList ll):
             # Continue cleanup so one failure does not leak later plans.
             if first_error is None:
                 first_error = e
-        curr = ll.head
     assert ll.count == 0
 
     # remove head and tail too
@@ -269,7 +271,7 @@ cdef class PlanCache:
     cdef size_t misses
 
     # whether the cache is enabled (True) or disabled (False)
-    cdef bint is_enabled
+    cdef readonly bint is_enabled
 
     # the ID of the device on which the cached plans are allocated
     cdef int dev
