@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import math
 import operator
+import warnings
 
 import nvmath.fft as nvmath_fft
-import numpy
 
 import cupy
 from cupy.fft import config
@@ -12,11 +12,6 @@ from cupy.fft._cache import get_plan_cache
 
 
 _VALID_NORMS = ('backward', 'ortho', 'forward')
-_SUPPORTED_DTYPES = {
-    'C2C': (numpy.dtype('complex64'), numpy.dtype('complex128')),
-    'R2C': (numpy.dtype('float32'), numpy.dtype('float64')),
-    'C2R': (numpy.dtype('complex64'), numpy.dtype('complex128')),
-}
 _DIRECTIONS = {
     'forward': nvmath_fft.FFTDirection.FORWARD,
     'inverse': nvmath_fft.FFTDirection.INVERSE,
@@ -76,8 +71,14 @@ def _normalize_axes(ndim, axes):
     return axes if len(set(axes)) == len(axes) else None
 
 
-def _is_supported_dtype(dtype, fft_type):
-    return dtype in _SUPPORTED_DTYPES[fft_type]
+def _warn_fallback(exc):
+    warnings.warn(
+        f'nvmath-python rejected this FFT and it will run on cuFFT instead: '
+        f'{exc!r}',
+        RuntimeWarning,
+        # 1 is this frame, 2 is _try_use_nvmath, 3 is the public API function.
+        stacklevel=4,
+    )
 
 
 def _scale_result(out, operand, axes, norm, fft_type, fft_direction):
@@ -135,8 +136,11 @@ def _try_use_nvmath(
         operand, requested_shape, axes, norm, *, fft_type, fft_direction):
     """Execute with nvmath, or return None to use CuPy's native path.
 
-    Fallbacks cover shape changes, multi-GPU execution, callbacks or explicit
-    plans, and unsupported operands, axes, dtypes, or layouts.
+    Shape changes, multi-GPU execution, callbacks and explicit plans fall back
+    silently. Anything nvmath rejects while building or planning also falls
+    back, but warns, since which operands, dtypes and layouts nvmath accepts is
+    nvmath's to decide and changes between versions. Failures once the plan is
+    live propagate instead: see the comments on those blocks.
     """
     if not config.use_nvmath:
         return None
@@ -161,7 +165,7 @@ def _try_use_nvmath(
         return None
     if not axes:
         return operand if fft_type == 'C2C' else None
-    if operand.size == 0 or not _is_supported_dtype(operand.dtype, fft_type):
+    if operand.size == 0:
         return None
 
     if norm is None:
@@ -192,12 +196,10 @@ def _try_use_nvmath(
         # out-of-place keys are identical, so an in-place plan would share a
         # cache entry with the out-of-place plan for the same layout and could
         # later be handed a caller's array to overwrite. Stay out-of-place.
-        try:
-            nvmath_key = _create_key_from_operand(
-                operand, axes, options, permutation)
-        except ValueError:
-            return None
-    except ValueError:
+        nvmath_key = _create_key_from_operand(
+            operand, axes, options, permutation)
+    except Exception as e:
+        _warn_fallback(e)
         return None
 
     stream = cupy.cuda.get_current_stream()
@@ -224,10 +226,11 @@ def _try_use_nvmath(
                 stream=stream,
             )
             plan.plan(stream=stream)
-        except Exception:
+        except Exception as e:
             if plan is not None:
                 plan.free()
-            raise
+            _warn_fallback(e)
+            return None
     else:
         plan.reset_operand_unchecked(operand, stream=stream)
 
