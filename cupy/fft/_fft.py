@@ -6,12 +6,17 @@ import math
 import numpy as np
 
 import cupy
+from cupy.cuda import driver
 from cupy.fft import config
 from cupy.fft._cache import get_plan_cache
 
 
 _reduce = functools.reduce
 _prod = cupy._core.internal.prod
+_is_cuda_python_build = driver._is_cuda_python()
+
+if _is_cuda_python_build:
+    from cupy.fft._fft_nvmath import _try_use_nvmath
 
 _R2C_OUTPUT_DTYPES = {
     np.dtype(np.float32): np.dtype(np.complex64),
@@ -735,6 +740,11 @@ def fft(a, n=None, axis=-1, norm=None):
 
     .. seealso:: :func:`numpy.fft.fft`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, n, axis, norm, fft_type='C2C', fft_direction='forward')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
     return _fft(a, (n,), (axis,), norm, cufft.CUFFT_FORWARD)
 
@@ -759,6 +769,11 @@ def ifft(a, n=None, axis=-1, norm=None):
 
     .. seealso:: :func:`numpy.fft.ifft`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, n, axis, norm, fft_type='C2C', fft_direction='inverse')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
     return _fft(a, (n,), (axis,), norm, cufft.CUFFT_INVERSE)
 
@@ -783,6 +798,11 @@ def fft2(a, s=None, axes=(-2, -1), norm=None):
 
     .. seealso:: :func:`numpy.fft.fft2`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='C2C', fft_direction='forward')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     func = _default_fft_func(a, s, axes)
@@ -809,6 +829,11 @@ def ifft2(a, s=None, axes=(-2, -1), norm=None):
 
     .. seealso:: :func:`numpy.fft.ifft2`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='C2C', fft_direction='inverse')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     func = _default_fft_func(a, s, axes)
@@ -835,6 +860,11 @@ def fftn(a, s=None, axes=None, norm=None):
 
     .. seealso:: :func:`numpy.fft.fftn`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='C2C', fft_direction='forward')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     func = _default_fft_func(a, s, axes)
@@ -861,6 +891,11 @@ def ifftn(a, s=None, axes=None, norm=None):
 
     .. seealso:: :func:`numpy.fft.ifftn`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='C2C', fft_direction='inverse')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     func = _default_fft_func(a, s, axes)
@@ -888,6 +923,11 @@ def rfft(a, n=None, axis=-1, norm=None):
 
     .. seealso:: :func:`numpy.fft.rfft`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, n, axis, norm, fft_type='R2C', fft_direction='forward')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     return _fft(a, (n,), (axis,), norm, cufft.CUFFT_FORWARD, 'R2C')
@@ -916,6 +956,11 @@ def irfft(a, n=None, axis=-1, norm=None):
 
     .. seealso:: :func:`numpy.fft.irfft`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, n, axis, norm, fft_type='C2R', fft_direction='inverse')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, (axis,))
@@ -943,6 +988,11 @@ def rfft2(a, s=None, axes=(-2, -1), norm=None):
 
     .. seealso:: :func:`numpy.fft.rfft2`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='R2C', fft_direction='forward')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     func = _default_fft_func(a, s, axes, value_type='R2C')
@@ -972,6 +1022,11 @@ def irfft2(a, s=None, axes=(-2, -1), norm=None):
 
     .. seealso:: :func:`numpy.fft.irfft2`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='C2R', fft_direction='inverse')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, axes)
@@ -1000,6 +1055,11 @@ def rfftn(a, s=None, axes=None, norm=None):
 
     .. seealso:: :func:`numpy.fft.rfftn`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='R2C', fft_direction='forward')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     func = _default_fft_func(a, s, axes, value_type='R2C')
@@ -1038,6 +1098,11 @@ def irfftn(a, s=None, axes=None, norm=None):
 
     .. seealso:: :func:`numpy.fft.irfftn`
     """
+    if _is_cuda_python_build:
+        out = _try_use_nvmath(
+            a, s, axes, norm, fft_type='C2R', fft_direction='inverse')
+        if out is not None:
+            return out
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, axes)
