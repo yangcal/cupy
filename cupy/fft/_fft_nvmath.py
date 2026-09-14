@@ -73,8 +73,8 @@ def _normalize_axes(ndim, axes):
 
 def _warn_fallback(exc):
     warnings.warn(
-        f'nvmath-python rejected this FFT and it will run on cuFFT instead: '
-        f'{exc!r}',
+        f'nvmath-python rejected this FFT, so it will run on CuPy native '
+        f'cuFFT plans instead: {exc!r}',
         RuntimeWarning,
         # 1 is this frame, 2 is _try_use_nvmath, 3 is the public API function.
         stacklevel=4,
