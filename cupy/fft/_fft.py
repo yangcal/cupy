@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import math
+from time import perf_counter_ns as _profile_perf
 
 import numpy as np
 
@@ -14,6 +15,53 @@ from cupy.fft._cache import get_plan_cache
 _reduce = functools.reduce
 _prod = cupy._core.internal.prod
 _is_cuda_python_build = driver._is_cuda_python()
+
+# Research-only host-overhead instrumentation. It is deliberately opt-in and
+# single-threaded: benchmark drivers enable it around one public call at a time.
+_preplan_profile_enabled = False
+_preplan_profile_events = []
+_preplan_profile_call = None
+
+
+def _set_preplan_profile_enabled(enabled):
+    global _preplan_profile_enabled, _preplan_profile_call
+    _preplan_profile_enabled = bool(enabled)
+    _preplan_profile_events.clear()
+    _preplan_profile_call = None
+
+
+def _consume_preplan_profile_events():
+    events = list(_preplan_profile_events)
+    _preplan_profile_events.clear()
+    return events
+
+
+def _preplan_profile_public_start(api):
+    global _preplan_profile_call
+    if _preplan_profile_enabled:
+        _preplan_profile_call = {
+            'api': api,
+            'entry_ns': _profile_perf(),
+            'first_event': len(_preplan_profile_events),
+        }
+
+
+def _preplan_profile_public_finish():
+    global _preplan_profile_call
+    if not _preplan_profile_enabled or _preplan_profile_call is None:
+        return
+    stop = _profile_perf()
+    call = _preplan_profile_call
+    for event in _preplan_profile_events[call['first_event']:]:
+        event['public_api'] = call['api']
+        event['public_entry_ns'] = call['entry_ns']
+        event['public_return_ns'] = stop
+    _preplan_profile_call = None
+
+
+def _append_preplan_profile_event(event):
+    if _preplan_profile_enabled:
+        _preplan_profile_events.append(event)
 
 if _is_cuda_python_build:
     from cupy.fft._fft_nvmath import _try_use_nvmath
@@ -98,6 +146,14 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
               out_size=None, out=None, plan=None):
     from cupy.cuda import cufft
 
+    profile = _preplan_profile_enabled
+    if profile:
+        profile_event = {
+            'plan_kind': 'Plan1d',
+            'stage_entry_ns': _profile_perf(),
+            'axis': int(axis),
+        }
+
     fft_type = _convert_fft_type(a.dtype, value_type)
 
     if axis % a.ndim != a.ndim - 1:
@@ -138,6 +194,8 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
         out_size = n
 
     batch = a.size // n
+    if profile:
+        profile_event['layout_ready_ns'] = _profile_perf()
 
     # plan search precedence:
     # 1. plan passed in as an argument
@@ -166,8 +224,13 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
             keys += (mgr.cb_load, mgr.cb_store,
                      0 if load_data is None else load_data.ptr,
                      0 if store_data is None else store_data.ptr)
+        if profile:
+            profile_event['key_ready_ns'] = _profile_perf()
         cache = get_plan_cache()
         cached_plan = cache.get(keys)
+        if profile:
+            profile_event['cache_lookup_end_ns'] = _profile_perf()
+            profile_event['cache_hit'] = cached_plan is not None
         if cached_plan is not None:
             plan = cached_plan
         elif mgr is None:
@@ -185,6 +248,10 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
                 plan = mgr.set_callbacks(fft_type)
                 plan = mgr.create_plan(plan, ('Plan1d', keys[:-5]))
             cache[keys] = plan
+        if profile:
+            profile_event['plan_ready_ns'] = _profile_perf()
+            profile_event['plan_constructor_stamps_ns'] = list(
+                getattr(plan, '_preplan_profile_stamps', ()))
     else:
         # check plan validity
         if not isinstance(plan, cufft.Plan1d):
@@ -198,6 +265,15 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
             raise ValueError('Batch size does not match the plan.')
         if config.use_multi_gpus != (plan.gpus is not None):
             raise ValueError('Unclear if multiple GPUs are to be used or not.')
+        if profile:
+            now = _profile_perf()
+            profile_event.update({
+                'key_ready_ns': now,
+                'cache_lookup_end_ns': now,
+                'cache_hit': None,
+                'plan_ready_ns': now,
+                'plan_constructor_stamps_ns': [],
+            })
 
     if overwrite_x and value_type == 'C2C':
         out = a
@@ -206,9 +282,13 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
         plan.check_output_array(a, out)
     else:
         out = plan.get_output_array(a)
+    if profile:
+        profile_event['output_ready_ns'] = _profile_perf()
 
     if batch != 0:
         plan.fft(a, out, direction)
+    if profile:
+        profile_event['execute_dispatched_ns'] = _profile_perf()
 
     sz = out.shape[-1]
     if fft_type == cufft.CUFFT_R2C or fft_type == cufft.CUFFT_D2Z:
@@ -222,6 +302,10 @@ def _exec_fft(a, direction, value_type, norm, axis, overwrite_x,
 
     if axis % a.ndim != a.ndim - 1:
         out = out.swapaxes(axis, -1)
+
+    if profile:
+        profile_event['stage_return_ns'] = _profile_perf()
+        _append_preplan_profile_event(profile_event)
 
     return out
 
@@ -469,12 +553,15 @@ def _get_cufft_plan_nd_args(
 
 
 def _get_cufft_plan_nd(
-        shape, fft_type, axes=None, order='C', out_size=None, to_cache=True):
+        shape, fft_type, axes=None, order='C', out_size=None, to_cache=True,
+        profile_event=None):
     """Generate a CUDA FFT plan for transforming up to three axes."""
     from cupy.cuda import cufft
 
     plan_args = _get_cufft_plan_nd_args(
         shape, fft_type, axes=axes, order=order, out_size=out_size)
+    if profile_event is not None:
+        profile_event['key_ready_ns'] = _profile_perf()
 
     # The cache identifies the backend plan plus any state bound to its handle.
     # Without callbacks, the backend constructor arguments are the full key.
@@ -491,6 +578,9 @@ def _get_cufft_plan_nd(
                       0 if store_data is None else store_data.ptr)
     cache = get_plan_cache()
     cached_plan = cache.get(cache_key)
+    if profile_event is not None:
+        profile_event['cache_lookup_end_ns'] = _profile_perf()
+        profile_event['cache_hit'] = cached_plan is not None
     if cached_plan is not None:
         plan = cached_plan
     elif mgr is None:
@@ -506,6 +596,11 @@ def _get_cufft_plan_nd(
             plan = mgr.create_plan(plan, ('PlanNd', plan_args))
         if to_cache:
             cache[cache_key] = plan
+
+    if profile_event is not None:
+        profile_event['plan_ready_ns'] = _profile_perf()
+        profile_event['plan_constructor_stamps_ns'] = list(
+            getattr(plan, '_preplan_profile_stamps', ()))
 
     return plan
 
@@ -555,6 +650,16 @@ def _exec_fftn(a, direction, value_type, norm, axes, overwrite_x,
                plan=None, out=None, out_size=None):
     from cupy.cuda import cufft
 
+    profile = _preplan_profile_enabled
+    if profile:
+        profile_event = {
+            'plan_kind': 'PlanNd',
+            'stage_entry_ns': _profile_perf(),
+            'axes': [int(axis) for axis in axes],
+        }
+    else:
+        profile_event = None
+
     fft_type = _convert_fft_type(a.dtype, value_type)
 
     if a.flags.c_contiguous:
@@ -572,6 +677,8 @@ def _exec_fftn(a, direction, value_type, norm, axes, overwrite_x,
         # hipFFT's R2C would overwrite input
         # hipFFT's C2R PlanNd is actually not in use so it's fine here
         a = a.copy()
+    if profile:
+        profile_event['layout_ready_ns'] = _profile_perf()
 
     # plan search precedence:
     # 1. plan passed in as an argument
@@ -585,7 +692,8 @@ def _exec_fftn(a, direction, value_type, norm, axes, overwrite_x,
     if plan is None:
         # search from cache, and generate a plan if not found
         plan = _get_cufft_plan_nd(a.shape, fft_type, axes=axes, order=order,
-                                  out_size=out_size)
+                                  out_size=out_size,
+                                  profile_event=profile_event)
     else:
         if not isinstance(plan, cufft.PlanNd):
             raise ValueError('expected plan to have type cufft.PlanNd')
@@ -595,6 +703,15 @@ def _exec_fftn(a, direction, value_type, norm, axes, overwrite_x,
             raise ValueError(
                 'The cuFFT plan and a.shape do not match the requested FFT '
                 'backend layout.')
+        if profile:
+            now = _profile_perf()
+            profile_event.update({
+                'key_ready_ns': now,
+                'cache_lookup_end_ns': now,
+                'cache_hit': None,
+                'plan_ready_ns': now,
+                'plan_constructor_stamps_ns': [],
+            })
 
     # TODO(leofang): support in-place transform for R2C/C2R
     if overwrite_x and value_type == 'C2C':
@@ -606,9 +723,13 @@ def _exec_fftn(a, direction, value_type, norm, axes, overwrite_x,
     else:
         _check_fftn_output_array(
             a, out, value_type, axes[-1], out_size)
+    if profile:
+        profile_event['output_ready_ns'] = _profile_perf()
 
     if out.size != 0:
         plan.fft(a, out, direction)
+    if profile:
+        profile_event['execute_dispatched_ns'] = _profile_perf()
 
     # normalize by the product of the shape along the transformed axes
     arr = a if fft_type in (cufft.CUFFT_R2C, cufft.CUFFT_D2Z) else out
@@ -619,6 +740,10 @@ def _exec_fftn(a, direction, value_type, norm, axes, overwrite_x,
         out /= math.sqrt(sz)
     elif norm == 'forward' and direction == cufft.CUFFT_FORWARD:
         out /= sz
+
+    if profile:
+        profile_event['stage_return_ns'] = _profile_perf()
+        _append_preplan_profile_event(profile_event)
 
     return out
 
@@ -740,13 +865,17 @@ def fft(a, n=None, axis=-1, norm=None):
 
     .. seealso:: :func:`numpy.fft.fft`
     """
-    if _is_cuda_python_build:
-        out = _try_use_nvmath(
-            a, n, axis, norm, fft_type='C2C', fft_direction='forward')
-        if out is not None:
-            return out
-    from cupy.cuda import cufft
-    return _fft(a, (n,), (axis,), norm, cufft.CUFFT_FORWARD)
+    _preplan_profile_public_start('cupy.fft.fft')
+    try:
+        if _is_cuda_python_build:
+            out = _try_use_nvmath(
+                a, n, axis, norm, fft_type='C2C', fft_direction='forward')
+            if out is not None:
+                return out
+        from cupy.cuda import cufft
+        return _fft(a, (n,), (axis,), norm, cufft.CUFFT_FORWARD)
+    finally:
+        _preplan_profile_public_finish()
 
 
 def ifft(a, n=None, axis=-1, norm=None):
@@ -860,15 +989,19 @@ def fftn(a, s=None, axes=None, norm=None):
 
     .. seealso:: :func:`numpy.fft.fftn`
     """
-    if _is_cuda_python_build:
-        out = _try_use_nvmath(
-            a, s, axes, norm, fft_type='C2C', fft_direction='forward')
-        if out is not None:
-            return out
-    from cupy.cuda import cufft
+    _preplan_profile_public_start('cupy.fft.fftn')
+    try:
+        if _is_cuda_python_build:
+            out = _try_use_nvmath(
+                a, s, axes, norm, fft_type='C2C', fft_direction='forward')
+            if out is not None:
+                return out
+        from cupy.cuda import cufft
 
-    func = _default_fft_func(a, s, axes)
-    return func(a, s, axes, norm, cufft.CUFFT_FORWARD)
+        func = _default_fft_func(a, s, axes)
+        return func(a, s, axes, norm, cufft.CUFFT_FORWARD)
+    finally:
+        _preplan_profile_public_finish()
 
 
 def ifftn(a, s=None, axes=None, norm=None):

@@ -53,6 +53,7 @@ cdef class Plan1d:
     cdef:
         readonly intptr_t handle
         readonly object work_area  # can be MemoryPointer or a list of it
+        readonly object _preplan_profile_stamps
         readonly int nx
         readonly int batch
         readonly Type fft_type
@@ -77,6 +78,7 @@ cdef class PlanNd:
     cdef:
         readonly intptr_t handle
         readonly object work_area  # memory.MemoryPointer
+        readonly object _preplan_profile_stamps
         readonly tuple shape
         readonly Type fft_type
         readonly tuple plan_key

@@ -6,6 +6,7 @@ from libcpp cimport vector
 from cupy_backends.cuda._softlink cimport SoftLink
 
 import threading
+from time import perf_counter_ns as _profile_perf
 
 import numpy
 
@@ -342,10 +343,12 @@ cdef class Plan1d:
         cdef bint use_multi_gpus = 0 if devices is None else 1
         cdef int result
 
+        profile_entry = _profile_perf()
         self.handle = <intptr_t>0
         self.xtArr = <intptr_t>0  # pointer to metadata for multi-GPU buffer
         self.xtArr_buffer = None  # actual multi-GPU intermediate buffer
 
+        profile_handle_start = _profile_perf()
         if prealloc_plan:
             plan = <Handle>prealloc_plan
         else:
@@ -354,6 +357,9 @@ cdef class Plan1d:
                 if result == 0:
                     result = cufftSetAutoAllocation(plan, 0)
             check_result(result)
+        profile_handle_end = _profile_perf()
+        self._preplan_profile_stamps = (
+            profile_entry, profile_handle_start, profile_handle_end)
 
         self.handle = <intptr_t>plan
         self.work_area = None
@@ -383,6 +389,10 @@ cdef class Plan1d:
                 else:
                     raise ValueError
 
+            profile_now = _profile_perf()
+            self._preplan_profile_stamps += (
+                profile_now, profile_now, profile_now)
+
         self.nx = nx
         self.fft_type = <Type>fft_type
         self.batch = batch
@@ -394,6 +404,7 @@ cdef class Plan1d:
         cdef size_t work_size
         cdef intptr_t ptr
 
+        profile_plan_start = _profile_perf()
         with nogil:
             result = cufftMakePlan1d(plan, nx, <Type>fft_type, batch,
                                      &work_size)
@@ -406,14 +417,18 @@ cdef class Plan1d:
                 result = cufftMakePlan1d(plan, nx, <Type>fft_type, batch,
                                          &work_size)
         check_result(result)
+        profile_plan_end = _profile_perf()
 
         work_area = memory.alloc(work_size)
         ptr = <intptr_t>(work_area.ptr)
         with nogil:
             result = cufftSetWorkArea(plan, <void*>(ptr))
         check_result(result)
+        profile_workspace_end = _profile_perf()
 
         self.work_area = work_area  # this is for cuFFT plan
+        self._preplan_profile_stamps += (
+            profile_plan_start, profile_plan_end, profile_workspace_end)
 
     cdef void _multi_gpu_get_plan(self, Handle plan, int nx, int fft_type,
                                   int batch, devices, out) except*:
@@ -820,6 +835,7 @@ cdef class PlanNd:
         cdef int* onembed_ptr
         cdef intptr_t ptr
 
+        profile_entry = _profile_perf()
         self.handle = <intptr_t>0
         ndim = len(shape)
 
@@ -835,6 +851,7 @@ cdef class PlanNd:
             onembed_arr = onembed
             onembed_ptr = onembed_arr.data()
 
+        profile_handle_start = _profile_perf()
         if prealloc_plan:
             plan = <Handle>prealloc_plan
         else:
@@ -843,10 +860,12 @@ cdef class PlanNd:
                 if result == 0:
                     result = cufftSetAutoAllocation(plan, 0)
             check_result(result)
+        profile_handle_end = _profile_perf()
 
         self.handle = <intptr_t>plan
         self.gpus = None  # TODO(leofang): support multi-GPU PlanNd
 
+        profile_plan_start = _profile_perf()
         if batch == 0:
             work_size = 0
         else:
@@ -867,6 +886,7 @@ cdef class PlanNd:
                                                <Type>fft_type, batch,
                                                &work_size)
             check_result(result)
+        profile_plan_end = _profile_perf()
 
         # TODO: for CUDA>=9.2 could also allow setting a work area policy
         # result = cufftXtSetWorkAreaPolicy(plan, policy, &work_size)
@@ -876,6 +896,7 @@ cdef class PlanNd:
         with nogil:
             result = cufftSetWorkArea(plan, <void*>(ptr))
         check_result(result)
+        profile_workspace_end = _profile_perf()
 
         self.shape = tuple(shape)
         self.fft_type = <Type>fft_type
@@ -891,6 +912,14 @@ cdef class PlanNd:
             batch,
         )
         self.work_area = work_area
+        self._preplan_profile_stamps = (
+            profile_entry,
+            profile_handle_start,
+            profile_handle_end,
+            profile_plan_start,
+            profile_plan_end,
+            profile_workspace_end,
+        )
 
     def __dealloc__(self):
         cdef Handle plan = <Handle>self.handle
