@@ -17,9 +17,10 @@ _prod = cupy._core.internal.prod
 _is_cuda_python_build = driver._is_cuda_python()
 
 # Research-only host-overhead instrumentation. It is deliberately opt-in and
-# single-threaded: benchmark drivers enable it around one public call at a time.
+# single-threaded: benchmark drivers enable it around one public call at a
+# time.
 _preplan_profile_enabled = False
-_preplan_profile_events = []
+_preplan_profile_events: list[dict[str, object]] = []
 _preplan_profile_call = None
 
 
@@ -62,6 +63,7 @@ def _preplan_profile_public_finish():
 def _append_preplan_profile_event(event):
     if _preplan_profile_enabled:
         _preplan_profile_events.append(event)
+
 
 if _is_cuda_python_build:
     from cupy.fft._fft_nvmath import _try_use_nvmath
