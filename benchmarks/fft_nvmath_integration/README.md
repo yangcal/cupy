@@ -51,6 +51,30 @@ Use an environment containing this CuPy worktree built with CUDA Python and a
 compatible nvmath-python build. Run from outside the CuPy source root so Python
 loads the built installation rather than an unbuilt source package.
 
+### ComputeLab convention
+
+Do not compile CuPy or keep virtual environments on NFS. Build the modified
+CuPy branch once in node-local storage and retain only its wheel:
+
+```bash
+bash benchmarks/fft_nvmath_integration/build_computelab_wheel.sh \
+  /home/scratch.ajdesai_ent/artifacts/cupy/fft-nvmath-integration-wheels
+```
+
+The script prints the final wheel path. Each benchmark allocation then creates
+a fresh node-local runtime environment, installs the persisted wheel and a
+pinned nvmath-python package, and writes only results to NFS:
+
+```bash
+bash benchmarks/fft_nvmath_integration/run_computelab.sh \
+  /home/scratch.ajdesai_ent/artifacts/cupy/fft-nvmath-integration-wheels/<key>/cupy-*.whl
+```
+
+The source checkout and all of its submodules must be prepared on the frontend
+before obtaining a compute allocation. Neither script performs Git network
+operations. The wheel is keyed by CuPy commit, Python version, CUDA major, and
+machine architecture, so later allocations reuse it without recompiling.
+
 Quick validation:
 
 ```bash
