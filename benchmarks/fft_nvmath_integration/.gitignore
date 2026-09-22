@@ -1,0 +1,4 @@
+*.json
+*.png
+*-report.txt
+__pycache__/
