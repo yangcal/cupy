@@ -5,6 +5,10 @@ import operator
 import warnings
 
 import nvmath.fft as nvmath_fft
+from nvmath.internal._strides_helpers import (
+    element_strides as _element_strides,
+)
+from nvmath.internal.tensor_ifc import _numpy_dtype_name
 
 import cupy
 from cupy.fft import config
@@ -27,6 +31,22 @@ _FFT_OPTIONS = {
     )
     for fft_type in ('C2C', 'R2C', 'C2R')
 }
+
+_CANONICAL_AXES = ((), (0,), (0, 1), (0, 1, 2))
+
+# Reuse normalized tuples for common full-axis spellings. Other axis objects
+# still use the general validation.
+_COMMON_AXIS_TUPLES = {
+    (1, (0,)): _CANONICAL_AXES[1],
+    (1, (-1,)): _CANONICAL_AXES[1],
+    (2, (0, 1)): _CANONICAL_AXES[2],
+    (2, (-2, -1)): _CANONICAL_AXES[2],
+    (3, (0, 1, 2)): _CANONICAL_AXES[3],
+    (3, (-3, -2, -1)): _CANONICAL_AXES[3],
+}
+# The benchmark sets this to False to match the retained-workspace lifecycle.
+# Normal CuPy behavior remains True outside that experiment.
+_RELEASE_WORKSPACE = True
 
 
 class CachedFFT(nvmath_fft.FFT):
@@ -71,6 +91,39 @@ def _normalize_axes(ndim, axes):
     return axes if len(set(axes)) == len(axes) else None
 
 
+def _normalize_axes_ajay(ndim, axes):
+    if axes is None:
+        return _CANONICAL_AXES[ndim] if 0 <= ndim <= 3 else None
+
+    if type(axes) is int:
+        return (axes % ndim,) if -ndim <= axes < ndim else None
+
+    if type(axes) is tuple:
+        if len(axes) > 3:
+            return None
+        if all(type(axis) is int for axis in axes):
+            common = _COMMON_AXIS_TUPLES.get((ndim, axes))
+            if common is not None:
+                return common
+    else:
+        try:
+            axis = operator.index(axes)
+        except TypeError:
+            axes = tuple(axes)
+        else:
+            axes = (axis,)
+
+    if not axes:
+        return axes
+    if len(axes) > 3:
+        return None
+    if any(axis >= ndim or axis < -ndim for axis in axes):
+        return None
+
+    axes = tuple(axis % ndim for axis in axes)
+    return axes if len(set(axes)) == len(axes) else None
+
+
 def _warn_fallback(exc):
     warnings.warn(
         f'nvmath-python rejected this FFT, so it will run on CuPy native '
@@ -82,6 +135,21 @@ def _warn_fallback(exc):
 
 
 def _scale_result(out, operand, axes, norm, fft_type, fft_direction):
+    shape = operand.shape if fft_type == 'R2C' else out.shape
+    size = math.prod(shape[axis] for axis in axes)
+    if norm == 'backward' and fft_direction == 'inverse':
+        out /= size
+    elif norm == 'ortho':
+        out /= math.sqrt(size)
+    elif norm == 'forward' and fft_direction == 'forward':
+        out /= size
+
+
+def _scale_result_ajay(out, operand, axes, norm, fft_type, fft_direction):
+    if (type(norm) is str and type(fft_direction) is str
+            and (norm == 'backward' and fft_direction != 'inverse'
+                 or norm == 'forward' and fft_direction != 'forward')):
+        return
     shape = operand.shape if fft_type == 'R2C' else out.shape
     size = math.prod(shape[axis] for axis in axes)
     if norm == 'backward' and fft_direction == 'inverse':
@@ -109,16 +177,15 @@ def _create_key_from_operand(operand, axes, options, permutation=None):
     """
     if permutation is None:
         shape = tuple(operand.shape)
-        element_strides = tuple(
-            stride // operand.itemsize for stride in operand.strides)
+        strides = _element_strides(operand.strides, operand.itemsize)
     else:
         shape = tuple(operand.shape[axis] for axis in permutation)
-        element_strides = _c_contiguous_element_strides(shape)
+        strides = _c_contiguous_element_strides(shape)
     return nvmath_fft.FFT.create_key_from_metadata(
         shape,
-        operand.dtype.name,
+        _numpy_dtype_name(operand.dtype),
         'cuda',
-        strides=element_strides,
+        strides=strides,
         axes=axes,
         options=options,
         execution='cuda',
@@ -239,10 +306,147 @@ def _try_use_nvmath(
             out = plan.execute(
                 direction=direction,
                 stream=stream,
-                release_workspace=True,
+                release_workspace=_RELEASE_WORKSPACE,
             )
             _scale_result(
                 out, operand, axes, norm, fft_type, fft_direction)
+        finally:
+            plan.release_operand()
+    except Exception:
+        if cache_miss:
+            plan.free()
+        raise
+
+    if cache_miss:
+        if cache.is_enabled:
+            try:
+                cache[key] = plan
+            except Exception:
+                plan.free()
+                raise
+        else:
+            # A disabled cache drops the insertion silently, so the plan has
+            # no owner and has to be released here.
+            plan.free()
+
+    if result_permutation is not None:
+        out = out.transpose(result_permutation)
+    return out
+
+
+def _try_use_nvmath_ajay(
+        operand, requested_shape, axes, norm, *, fft_type, fft_direction):
+    """Execute with nvmath, or return None to use CuPy's native path.
+
+    Shape changes, multi-GPU execution, callbacks and explicit plans fall back
+    silently. Anything nvmath rejects while building or planning also falls
+    back, but warns, since which operands, dtypes and layouts nvmath accepts is
+    nvmath's to decide and changes between versions. Failures once the plan is
+    live propagate instead: see the comments on those blocks.
+    """
+    if not config.use_nvmath:
+        return None
+    if not isinstance(operand, cupy.ndarray):
+        return None
+    if requested_shape is not None:
+        # Keep CuPy's existing padding and truncation behavior for now.
+        return None
+    if config.devices is not None:
+        # CuPy's configured multi-GPU execution remains on the native path.
+        return None
+    if config.get_current_callback_manager() is not None:
+        # cuFFT callbacks are supported only by CuPy's native plans.
+        return None
+
+    from cupy.cuda import cufft
+    if cufft.get_current_plan() is not None:
+        return None
+
+    axes = _normalize_axes_ajay(operand.ndim, axes)
+    if axes is None:
+        return None
+    if not axes:
+        return operand if fft_type == 'C2C' else None
+    if operand.size == 0:
+        return None
+
+    if norm is None:
+        norm = 'backward'
+    elif norm not in _VALID_NORMS:
+        raise ValueError(
+            f'Invalid norm value {norm}, should be "backward", "ortho", '
+            'or "forward".')
+
+    try:
+        direction = _DIRECTIONS[fft_direction]
+    except KeyError:
+        raise ValueError(
+            f'Unsupported FFT direction: {fft_direction!r}') from None
+
+    options = _FFT_OPTIONS[fft_type]
+    permutation = None
+    result_permutation = None
+
+    try:
+        nvmath_key = _create_key_from_operand(operand, axes, options)
+    except nvmath_fft.UnsupportedLayoutError as e:
+        permutation = tuple(e.permutation)
+        axes = tuple(e.axes)
+        result_permutation = _invert_permutation(permutation)
+        # The copy below could be transformed in place, but nvmath's key does
+        # not encode `inplace`: for a dense C2C layout the in-place and
+        # out-of-place keys are identical, so an in-place plan would share a
+        # cache entry with the out-of-place plan for the same layout and could
+        # later be handed a caller's array to overwrite. Stay out-of-place.
+        nvmath_key = _create_key_from_operand(
+            operand, axes, options, permutation)
+    except Exception as e:
+        _warn_fallback(e)
+        return None
+
+    stream = cupy.cuda.get_current_stream()
+    # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
+    # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
+    key = ('nvmath', stream.ptr, nvmath_key)
+    cache = get_plan_cache()
+    plan = cache.get(key)
+    cache_miss = plan is None
+
+    if permutation is not None:
+        # Materialize the layout nvmath recommended, matching the C-contiguous
+        # metadata the key was built from. This has to happen before the
+        # operand is bound to a plan on either the hit or the miss path.
+        operand = operand.transpose(permutation).copy()
+
+    if cache_miss:
+        try:
+            plan = CachedFFT(
+                operand,
+                axes=axes,
+                options=options,
+                execution='cuda',
+                stream=stream,
+            )
+            plan.plan(stream=stream)
+        except Exception as e:
+            if plan is not None:
+                plan.free()
+            _warn_fallback(e)
+            return None
+    else:
+        plan.reset_operand_unchecked(operand, stream=stream)
+
+    try:
+        try:
+            out = plan.execute(
+                direction=direction,
+                stream=stream,
+                release_workspace=_RELEASE_WORKSPACE,
+            )
+            if (type(norm) is not str or norm != 'backward'
+                    or fft_direction != 'forward'):
+                _scale_result_ajay(
+                    out, operand, axes, norm, fft_type, fft_direction)
         finally:
             plan.release_operand()
     except Exception:

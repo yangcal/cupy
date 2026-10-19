@@ -1,0 +1,769 @@
+"""Measure warm original/ajay CuPy FFT paths across curated operands.
+
+The sweep measures CPU host latency, with the exact minimal cached lifecycle
+included only for comparable C2C default-forward cases. GPU event intervals
+include host submission gaps. This is coverage, not a workload frequency model.
+Install this checkout with nvmath candidate 84d59bc before running.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import hashlib
+import importlib
+import importlib.machinery
+import importlib.util
+import inspect
+import itertools
+import json
+import logging
+import math
+import os
+import platform
+import random
+import re
+import sys
+import warnings
+from pathlib import Path
+from statistics import median
+
+EXECUTE_SHA = (
+    "6c69df10b7762d6e04ad70b24c12857dcd7cbd360fe2ae2f8805a0eae6630779"
+)
+MINIMAL_SHA = (
+    "f436d4536041b066494a2d8ba487ef192514d9159d1d2023c3331245cc7a4cf1"
+)
+PAIRS = {
+    "original_minus_minimal": ("original", "minimal"),
+    "ajay_minus_minimal": ("ajay", "minimal"),
+    "original_minus_ajay": ("original", "ajay"),
+}
+
+
+def check(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def identity(path):
+    path = Path(path).resolve()
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+
+
+def load(filename):
+    path = Path(__file__).resolve().with_name(filename)
+    spec = importlib.util.spec_from_file_location(
+        "_fft_benchmark_" + path.stem, path
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def counts(cache):
+    match = re.search(r"hits / misses: (\d+) / (\d+)", repr(cache))
+    check(match is not None, "Cannot read actual PlanCache counters")
+    return tuple(map(int, match.groups()))
+
+
+def save(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(path)
+
+
+def row_orders(labels, blocks):
+    rng, orders = random.Random(0), []
+    permutations = list(itertools.permutations(labels))
+    for _ in range(blocks // len(permutations)):
+        cycle = permutations.copy()
+        rng.shuffle(cycle)
+        orders.extend(cycle)
+    return orders
+
+
+def host_input(np, spec, kwargs, seed):
+    dtype, shape = np.dtype(spec["dtype"]), spec["shape"]
+    if spec["arange"]:
+        host = np.arange(math.prod(shape), dtype=np.float32).reshape(shape)
+        host = host.astype(dtype)
+        return host + np.complex64(1 - 0.5j) if seed == 101 else host
+    double = dtype.name in ("float64", "complex128")
+    real_dtype = np.float64 if double else np.float32
+    rng = np.random.default_rng(seed)
+    real = rng.uniform(-0.5, 0.5, shape).astype(real_dtype)
+    if spec["public"].startswith("irfft"):
+        if spec["public"] == "irfft":
+            axes = (kwargs.get("axis", -1),)
+        elif spec["public"] == "irfft2":
+            axes = kwargs.get("axes", (-2, -1))
+        else:
+            axes = kwargs.get("axes")
+        host = np.fft.rfftn(real, axes=axes, norm="backward").astype(dtype)
+    elif dtype.kind == "c":
+        imag = rng.uniform(-0.5, 0.5, shape).astype(real_dtype)
+        host = (real + 1j * imag).astype(dtype)
+    else:
+        host = real.astype(dtype)
+    return np.asfortranarray(host) if spec["layout"] == "F" else host
+
+
+def device_input(cp, host, layout):
+    if layout != "strided":
+        return cp.array(host, order=layout, copy=True)
+    backing = cp.empty(
+        (*host.shape[:-1], 2 * host.shape[-1]), dtype=host.dtype
+    )
+    operand = backing[..., ::2]
+    operand[...] = cp.asarray(host)
+    return operand
+
+
+def transform_axes(spec, kwargs, ndim):
+    if spec["public"] in ("fft", "ifft", "rfft", "irfft"):
+        axes = (kwargs.get("axis", -1),)
+    elif spec["public"].endswith("2"):
+        axes = kwargs.get("axes", (-2, -1))
+    else:
+        axes = kwargs.get("axes", tuple(range(ndim)))
+    if axes is None:
+        axes = tuple(range(ndim))
+    return tuple(int(axis) % ndim for axis in axes)
+
+
+def reference_error(np, actual, wanted, axes, input_dtype):
+    """Apply nvmath's 100-epsilon L2 criterion per transformed batch.
+
+    The reference uses double precision, but the tolerance follows the
+    actual operand's precision. Zero references use an absolute L2 bound.
+    See tests/nvmath_tests/fft/test_fft_with_hypothesis.py::verify_result
+    and utils/check_helpers.py::assert_norm_close in the nvmath candidate.
+    """
+    real_dtype = np.empty((), dtype=input_dtype).real.dtype
+    output_dtype = (
+        np.result_type(real_dtype, np.complex64)
+        if np.iscomplexobj(wanted) else real_dtype
+    )
+    check(wanted.dtype.name in ("float64", "complex128"),
+          "Reference must use double precision")
+    check(actual.shape == wanted.shape, "Incorrect output shape")
+    check(actual.dtype == output_dtype, "Incorrect output dtype")
+    check(np.isfinite(actual).all() and np.isfinite(wanted).all(),
+          "Nonfinite FFT output or reference")
+    difference = np.abs(actual - wanted)
+    error = np.sqrt(np.sum(difference ** 2, axis=axes, dtype=np.float64))
+    magnitude = np.sqrt(np.sum(np.abs(wanted) ** 2, axis=axes,
+                               dtype=np.float64))
+    relative = np.divide(error, magnitude, out=np.zeros_like(error),
+                         where=magnitude != 0)
+    zero_error = np.where(magnitude == 0, error, 0)
+    bound = float(100 * np.finfo(real_dtype).eps)
+    worst_relative = float(np.max(relative))
+    worst_zero = float(np.max(zero_error))
+    check(worst_relative <= bound and worst_zero <= bound,
+          f"FFT norm error: relative L2={worst_relative}, "
+          f"zero-reference absolute L2={worst_zero}, limit={bound}")
+    return {"max_batch_relative_l2": worst_relative,
+            "max_zero_reference_l2": worst_zero,
+            "max_absolute_error": float(np.max(difference)),
+            "l2_limit": bound}
+
+
+def summarize(blocks, labels):
+    rows = {
+        label: median(b["rows"][label]["cpu_median_us"] for b in blocks)
+        for label in labels
+    }
+    pairs = {
+        name: (a, b)
+        for name, (a, b) in PAIRS.items()
+        if a in labels and b in labels
+    }
+    values = {
+        name: [b["paired_cpu_us"][name] for b in blocks] for name in pairs
+    }
+    result = {
+        "rows_cpu_us": rows,
+        **{name: median(v) for name, v in values.items()},
+    }
+    result["sign_counts"] = {
+        name: {
+            "positive": sum(x > 0 for x in v),
+            "negative": sum(x < 0 for x in v),
+            "zero": sum(x == 0 for x in v),
+        }
+        for name, v in values.items()
+    }
+    delta = result["original_minus_ajay"]
+    percent = 100 * delta / rows["original"]
+    result["original_minus_ajay_percent"] = percent
+    result["negative_median"] = delta < 0
+    slower = result["sign_counts"]["original_minus_ajay"]["negative"]
+    result["material_regression_candidate"] = (
+        delta <= -0.2
+        and percent <= -2
+        and slower >= math.ceil(len(blocks) * 10 / 12)
+    )
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", choices=("basic", "sweep"), default="sweep")
+    parser.add_argument("--list-cases", action="store_true")
+    parser.add_argument(
+        "--case", dest="case_filter", help="Case-name substring"
+    )
+    parser.add_argument(
+        "--json", type=Path, default=Path("adapter-overhead.json")
+    )
+    parser.add_argument(
+        "--cpu", type=int, help="Allowed CPU; lowest by default"
+    )
+    parser.add_argument("--device", type=int, default=0)
+    parser.add_argument(
+        "--blocks", type=int, default=12, help="Positive multiple of six"
+    )
+    parser.add_argument("--repeats", type=int, default=500)
+    parser.add_argument("--warmups", type=int, default=20)
+    parser.add_argument("--release-workspace", action="store_true")
+    args = parser.parse_args()
+    catalog = load("cases.py")
+    cases = getattr(catalog, args.suite)()
+    if args.case_filter:
+        cases = [s for s in cases if args.case_filter in s["name"]]
+    if not cases:
+        parser.error("No cases match --case")
+    if args.list_cases:
+        for spec in cases:
+            rows = (
+                "original/ajay/minimal" if spec["minimal"] else "original/ajay"
+            )
+            print(
+                f"{spec['name']}: {spec['public']} {spec['shape']} "
+                f"{spec['dtype']} {spec['layout']} {spec['kwargs']} "
+                f"numpy_axes={spec['numpy_axes']}; {rows}"
+            )
+        print(f"{len(cases)} cases")
+        return
+    if (
+        args.blocks < 6
+        or args.blocks % 6
+        or args.repeats < 1
+        or args.warmups < 0
+        or args.device < 0
+    ):
+        parser.error(
+            "Require blocks >=6 divisible by6, repeats >=1, "
+            "warmups >=0, device >=0"
+        )
+    affinity = os.sched_getaffinity(0)
+    cpu = min(affinity) if args.cpu is None else args.cpu
+    if cpu not in affinity:
+        parser.error(f"CPU {cpu} is outside {sorted(affinity)}")
+
+    # Help and case listing never import NumPy, CuPy, or nvmath.
+    import numpy as np
+    import nvmath.fft as nf
+    from nvmath.internal._strides_helpers import element_strides
+    from nvmath.internal.tensor_ifc import _numpy_dtype_name
+
+    import cupy as cp
+    from cupy.cuda import cufft, driver
+    from cupyx.profiler import benchmark
+
+    adapter = importlib.import_module("cupy.fft._fft_nvmath")
+    expected_adapter = (
+        Path(__file__).resolve().parents[2] / "cupy" / "fft" / "_fft_nvmath.py"
+    )
+    check(
+        Path(adapter.__file__).resolve() == expected_adapter.resolve(),
+        "CuPy was imported from another checkout. Install this checkout "
+        "with its editable build, and run this source tree's benchmark. "
+        f"Imported: {adapter.__file__}; expected: {expected_adapter}",
+    )
+    minimal = load("minimal_lifecycle.py")
+    execute = hashlib.sha256(
+        inspect.getsource(nf.FFT.execute).encode()
+    ).hexdigest()
+    check(
+        execute == EXECUTE_SHA, "Requires the exact nvmath candidate execute"
+    )
+    minimal_sha = hashlib.sha256(
+        inspect.getsource(minimal.execute_cached).encode()
+    ).hexdigest()
+    check(
+        minimal_sha == MINIMAL_SHA, "Minimal lifecycle differs from reference"
+    )
+    for module in (adapter, minimal):
+        namespace = module.__dict__
+        check(
+            namespace.get("cp", namespace.get("cupy")) is cp
+            and namespace.get("nf", namespace.get("nvmath_fft")) is nf
+            and namespace.get("_numpy_dtype_name") is _numpy_dtype_name
+            and namespace.get(
+                "element_strides", namespace.get("_element_strides")
+            )
+            is element_strides,
+            "Rows must use identical backend and metadata providers",
+        )
+    check(
+        _numpy_dtype_name.cache_parameters()
+        == {"maxsize": 256, "typed": False},
+        "Requires cached dtype names",
+    )
+    stride_module = importlib.import_module(element_strides.__module__)
+    check(
+        any(
+            stride_module.__file__.endswith(s)
+            for s in importlib.machinery.EXTENSION_SUFFIXES
+        ),
+        "Requires compiled element_strides without substitution",
+    )
+    check(adapter.CachedFFT.execute is nf.FFT.execute, "Different FFT execute")
+    fft_module = importlib.import_module("cupy.fft._fft")
+    old_hook = fft_module._try_use_nvmath
+    check(
+        old_hook is adapter._try_use_nvmath, "Public FFT must start original"
+    )
+    check(driver._is_cuda_python(), "Requires the CuPy CUDA-Python build")
+    check(type(adapter._RELEASE_WORKSPACE) is bool, "Workspace policy missing")
+    settings = (
+        cp.fft.config.use_nvmath,
+        cp.fft.config.use_multi_gpus,
+        adapter._RELEASE_WORKSPACE,
+    )
+    gc_enabled, cache, cache_owned = gc.isenabled(), None, False
+    files = {
+        "benchmark": __file__,
+        "cases": catalog.__file__,
+        "adapter": adapter.__file__,
+        "minimal_lifecycle": minimal.__file__,
+        "nvmath_fft": inspect.getfile(nf.FFT),
+        "public_fft": inspect.getfile(cp.fft.fft),
+        "profiler": inspect.getfile(benchmark),
+        "plan_cache": importlib.import_module("cupy.fft._cache").__file__,
+        "dtype_provider": importlib.import_module(
+            _numpy_dtype_name.__module__
+        ).__file__,
+    }
+    for name in (
+        "nvmath.internal.tensor_ifc_cupy",
+        "nvmath.internal._strides_helpers",
+        "nvmath.fft._fft_impl",
+        "nvmath._internal.cuda_scopes",
+        "nvmath.internal._layout._layout",
+        "nvmath._internal.stream._resolver",
+    ):
+        files[name] = importlib.import_module(name).__file__
+    block_path = args.json.with_name(args.json.stem + "-blocks.jsonl")
+    payload = {
+        "status": "running",
+        "execute_sha256": execute,
+        "cases": [],
+        "configuration": {
+            **vars(args),
+            "json": str(args.json),
+            "cpu": cpu,
+            "order_seed": 0,
+            "selected_cases": len(cases),
+            "block_checkpoint": str(block_path),
+        },
+        "sources": {name: identity(path) for name, path in files.items()},
+        "measurement": "cupyx.profiler.benchmark CPU host latency; "
+        "output disposal timed; GPU intervals include host gaps",
+        "limitations": "Curated cases have no production frequency weights. "
+        "Only marked C2C default-forward cases use minimal.",
+        "candidate_threshold": {
+            "slower_us": 0.2,
+            "slower_percent": 2,
+            "negative_block_fraction": 10 / 12,
+        },
+        "validation": {
+            "row_agreement": "bitwise, before reference validation",
+            "reference": "NumPy FFT of the same input promoted to double",
+            "accuracy": "per-batch relative L2 <= 100 * input dtype epsilon; "
+                        "absolute L2 for zero references",
+        },
+    }
+    try:
+        os.sched_setaffinity(0, {cpu})
+        cp.fft.config.use_nvmath, cp.fft.config.use_multi_gpus = True, False
+        adapter._RELEASE_WORKSPACE = args.release_workspace
+        with cp.cuda.Device(args.device), warnings.catch_warnings():
+            warnings.filterwarnings(
+                "error",
+                category=RuntimeWarning,
+                message=r"nvmath-python rejected this FFT.*",
+            )
+            cache = cp.fft.config.get_plan_cache()
+            check(
+                cache.is_enabled and cache.get_curr_size() == 0,
+                "Requires a fresh process with an empty enabled PlanCache",
+            )
+            cache_owned = True
+            check(
+                cp.fft.config.devices is None
+                and cp.fft.config.get_current_callback_manager() is None
+                and cufft.get_current_plan() is None,
+                "Remove multi-GPU, callback and explicit-plan contexts",
+            )
+            stream = cp.cuda.get_current_stream()
+            name = cp.cuda.runtime.getDeviceProperties(args.device)["name"]
+            payload["environment"] = {
+                "gpu": name.decode() if isinstance(name, bytes) else str(name),
+                "host": platform.uname()._asdict(),
+                "python": sys.version,
+                "python_executable": sys.executable,
+                "numpy": np.__version__,
+                "cupy": cp.__version__,
+                "nvmath": importlib.import_module("nvmath").__version__,
+                "cuda_runtime": cp.cuda.runtime.runtimeGetVersion(),
+                "cuda_driver": cp.cuda.runtime.driverGetVersion(),
+                "stream_ptr": stream.ptr,
+            }
+            block_path.parent.mkdir(parents=True, exist_ok=True)
+            block_path.write_text("")
+            save(args.json, payload)
+            for case_index, spec in enumerate(cases, 1):
+                payload["current_case"] = spec["name"]
+                print(
+                    f"[case] {case_index}/{len(cases)} {spec['name']}",
+                    flush=True,
+                )
+                kwargs = dict(spec["kwargs"])
+                if spec["numpy_axes"]:
+                    kwargs["axes"] = tuple(np.int64(x) for x in kwargs["axes"])
+                host = host_input(np, spec, kwargs, 202)
+                warm_host = host_input(np, spec, kwargs, 101)
+                operand = device_input(cp, host, spec["layout"])
+                warm_operand = device_input(cp, warm_host, spec["layout"])
+                public = getattr(cp.fft, spec["public"])
+                check(
+                    public.__globals__ is fft_module.__dict__,
+                    "Public API does not read the selected hook",
+                )
+                hooks = {
+                    "original": adapter._try_use_nvmath,
+                    "ajay": adapter._try_use_nvmath_ajay,
+                }
+                labels = (
+                    ("original", "ajay", "minimal")
+                    if spec["minimal"]
+                    else ("original", "ajay")
+                )
+                axes = tuple(range(operand.ndim))
+                options = adapter._FFT_OPTIONS["C2C"]
+                outputs, minimal_cache = [], {}
+                reference_axes = transform_axes(spec, kwargs, operand.ndim)
+                reference_dtype = (
+                    np.complex128 if np.iscomplexobj(host) else np.float64
+                )
+                try:
+                    fft_module._try_use_nvmath = hooks["ajay"]
+                    warm = public(warm_operand, **kwargs)
+                    reference = getattr(np.fft, spec["public"])
+                    warm_expected = reference(
+                        warm_host.astype(reference_dtype), **kwargs)
+                    expected = reference(
+                        host.astype(reference_dtype), **kwargs)
+                    outputs.append((warm, warm_expected))
+                    entries = list(cache)
+                    check(len(entries) == 1, "Expected one warm nvmath plan")
+                    cache_key, node = entries[0]
+                    check(
+                        isinstance(cache_key, tuple)
+                        and len(cache_key) == 3
+                        and cache_key[:2] == ("nvmath", stream.ptr),
+                        "Warm request did not route to nvmath",
+                    )
+                    plan = node.plan
+                    check(
+                        isinstance(plan, adapter.CachedFFT)
+                        and not plan.inplace,
+                        "Wrong cached FFT plan",
+                    )
+                    check(
+                        not plan.logger.isEnabledFor(logging.INFO),
+                        "Disable nvmath INFO/DEBUG logging",
+                    )
+                    if spec["minimal"]:
+                        key = adapter._create_key_from_operand(
+                            operand, axes, options
+                        )
+                        check(
+                            key == cache_key[2], "Minimal metadata key differs"
+                        )
+                        minimal_cache[(stream.ptr, key)] = plan
+
+                    def verify():
+                        entries = list(cache)
+                        check(
+                            len(entries) == 1
+                            and entries[0][0] == cache_key
+                            and entries[0][1].plan is plan,
+                            "CuPy cache identity changed",
+                        )
+                        if spec["minimal"]:
+                            check(
+                                len(minimal_cache) == 1
+                                and minimal_cache[(stream.ptr, key)] is plan,
+                                "Minimal dictionary changed",
+                            )
+                        check(
+                            plan._operand_released
+                            and plan.operand.tensor is None,
+                            "Cached plan retained its operand",
+                        )
+                        check(
+                            plan.workspace.size == 0
+                            or (plan.workspace.ptr is None)
+                            == args.release_workspace,
+                            "Wrong workspace policy",
+                        )
+
+                    comparisons = []
+                    for input_index, (fresh, values, wanted) in enumerate((
+                        (operand, host, expected),
+                        (warm_operand, warm_host, warm_expected),
+                    )):
+                        previous = None
+                        for label in labels:
+                            fft_module._try_use_nvmath = hooks.get(
+                                label, hooks["ajay"]
+                            )
+                            before = counts(cache)
+                            if label == "minimal":
+                                out = minimal.execute_cached(
+                                    fresh,
+                                    axes,
+                                    options,
+                                    minimal_cache,
+                                    release_workspace=args.release_workspace,
+                                )
+                            else:
+                                out = public(fresh, **kwargs)
+                            outputs.append((out, wanted))
+                            actual = out.get()
+                            if previous is not None:
+                                check(actual.dtype == previous.dtype
+                                      and actual.shape == previous.shape
+                                      and actual.tobytes()
+                                      == previous.tobytes(),
+                                      f"FFT rows differ bitwise for {label}")
+                            previous = actual
+                            comparisons.append(
+                                (input_index, label, actual, wanted))
+                            np.testing.assert_array_equal(fresh.get(), values)
+                            check(
+                                counts(cache)
+                                == (
+                                    before[0] + int(label != "minimal"),
+                                    before[1],
+                                ),
+                                "Wrong preflight cache path",
+                            )
+                            verify()
+                    # Establish row agreement for both operands before the
+                    # independent backend-versus-reference accuracy check.
+                    accuracy = [
+                        {"input": input_index, "row": label,
+                         **reference_error(np, actual, wanted,
+                                           reference_axes, host.dtype)}
+                        for input_index, label, actual, wanted in comparisons
+                    ]
+                    accuracy.append({
+                        "input": "planning-warmup", "row": "ajay",
+                        **reference_error(np, warm.get(), warm_expected,
+                                          reference_axes, host.dtype),
+                    })
+                    comparisons.clear()
+                    del actual, previous
+                    pointers = []
+                    for out, wanted in outputs:
+                        check(
+                            out.shape == warm.shape
+                            and out.dtype == warm.dtype
+                            and out.strides == warm.strides,
+                            "Different output metadata",
+                        )
+                        pointers.append(out.data.ptr)
+                    check(
+                        len(set(pointers)) == len(pointers)
+                        and not {
+                            operand.data.ptr,
+                            warm_operand.data.ptr,
+                        }.intersection(pointers),
+                        "Outputs alias",
+                    )
+                    outputs.clear()
+                    del out, warm, fresh
+                    calls = {
+                        label: (public, (operand,), kwargs)
+                        for label in ("original", "ajay")
+                    }
+                    if spec["minimal"]:
+                        calls["minimal"] = (
+                            minimal.execute_cached,
+                            (operand, axes, options, minimal_cache),
+                            {"release_workspace": args.release_workspace},
+                        )
+                    case = {
+                        "case": spec,
+                        "rows": labels,
+                        "operand_shape": operand.shape,
+                        "operand_strides": operand.strides,
+                        "canonical_key_repr": repr(cache_key[2]),
+                        "runtime_axes": repr(
+                            kwargs.get("axes", kwargs.get("axis"))
+                        ),
+                        "correctness": True,
+                        "reference_error": accuracy,
+                        "route": "nvmath",
+                        "blocks": [],
+                    }
+                    payload["cases"].append(case)
+                    references = sys.getrefcount(operand)
+                    gc.disable()
+                    for index, order in enumerate(
+                        row_orders(labels, args.blocks)
+                    ):
+                        print(
+                            f"[progress] {spec['name']} "
+                            f"block {index + 1}/{args.blocks}: "
+                            + ", ".join(order),
+                            flush=True,
+                        )
+                        block = {"index": index, "order": order, "rows": {}}
+                        for label in order:
+                            fft_module._try_use_nvmath = hooks.get(
+                                label, hooks["ajay"]
+                            )
+                            function, positional, keywords = calls[label]
+                            before = counts(cache)
+                            result = benchmark(
+                                function,
+                                args=positional,
+                                kwargs=keywords,
+                                name=label,
+                                n_repeat=args.repeats,
+                                n_warmup=args.warmups,
+                                devices=(args.device,),
+                            )
+                            cpu_times = result.cpu_times.tolist()
+                            hits = (
+                                args.warmups + len(cpu_times)
+                                if label in hooks
+                                else 0
+                            )
+                            check(
+                                len(cpu_times) == args.repeats
+                                and counts(cache)
+                                == (before[0] + hits, before[1]),
+                                "Timed cache path changed",
+                            )
+                            verify()
+                            block["rows"][label] = {
+                                "cpu_seconds": cpu_times,
+                                "gpu_seconds": result.gpu_times.tolist(),
+                                "cpu_median_us": median(cpu_times) * 1e6,
+                            }
+                        check(
+                            sys.getrefcount(operand) == references,
+                            "Timed call retained an input reference",
+                        )
+                        block["paired_cpu_us"] = {
+                            name: block["rows"][a]["cpu_median_us"]
+                            - block["rows"][b]["cpu_median_us"]
+                            for name, (a, b) in PAIRS.items()
+                            if a in labels and b in labels
+                        }
+                        block["workspace"] = {
+                            "required_bytes": plan.workspace.size,
+                            "allocated_bytes": plan.workspace.allocated_size,
+                            "retained": plan.workspace.ptr is not None,
+                        }
+                        case["blocks"].append(block)
+                        # Incremental raw checkpoint avoids rewriting all prior
+                        # cases' samples after every block on NFS.
+                        with block_path.open("a") as log:
+                            log.write(
+                                json.dumps(
+                                    {"case": spec["name"], "block": block}
+                                )
+                                + "\n"
+                            )
+                    case["summary"] = summarize(case["blocks"], labels)
+                    np.testing.assert_array_equal(operand.get(), host)
+                    summary = case["summary"]
+                    tag = (
+                        "REGRESSION"
+                        if summary["negative_median"]
+                        else "saving"
+                    )
+                    if summary["material_regression_candidate"]:
+                        tag += " candidate"
+                    slower = summary["sign_counts"]["original_minus_ajay"][
+                        "negative"
+                    ]
+                    print(
+                        f"{spec['name']}: {tag} "
+                        f"{summary['original_minus_ajay']:+.3f} us "
+                        f"({summary['original_minus_ajay_percent']:+.2f}%); "
+                        f"ajay slower in {slower}/{args.blocks} blocks",
+                        flush=True,
+                    )
+                    if spec["minimal"]:
+                        print(
+                            "  original-minus-minimal "
+                            f"{summary['original_minus_minimal']:.3f} us; "
+                            "ajay-minus-minimal "
+                            f"{summary['ajay_minus_minimal']:.3f} us",
+                            flush=True,
+                        )
+                finally:
+                    fft_module._try_use_nvmath = old_hook
+                    stream.synchronize()
+                    cache.clear()
+                    minimal_cache.clear()
+                    outputs.clear()
+                    if gc_enabled:
+                        gc.enable()
+                save(args.json, payload)
+            payload["negative_cases"] = [
+                c["case"]["name"]
+                for c in payload["cases"]
+                if c["summary"]["negative_median"]
+            ]
+            print(
+                "Negative paired medians: "
+                + (", ".join(payload["negative_cases"]) or "none"),
+                flush=True,
+            )
+            payload["status"] = "complete"
+    except BaseException as exc:
+        payload["status"], payload["error"] = "failed", repr(exc)
+        raise
+    finally:
+        fft_module._try_use_nvmath = old_hook
+        if cache_owned:
+            cache.clear()
+        (
+            cp.fft.config.use_nvmath,
+            cp.fft.config.use_multi_gpus,
+            adapter._RELEASE_WORKSPACE,
+        ) = settings
+        os.sched_setaffinity(0, affinity)
+        if gc_enabled:
+            gc.enable()
+        save(args.json, payload)
+
+
+if __name__ == "__main__":
+    main()
