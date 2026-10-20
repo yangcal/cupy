@@ -1,4 +1,4 @@
-"""Measure warm original/ajay CuPy FFT paths across curated operands.
+"""Measure warm original/ajay/native CuPy FFT paths and bound nvmath execution across curated operands.
 
 The sweep measures CPU host latency, with the exact minimal cached lifecycle
 included only for comparable C2C default-forward cases. GPU event intervals
@@ -38,6 +38,12 @@ PAIRS = {
     "original_minus_minimal": ("original", "minimal"),
     "ajay_minus_minimal": ("ajay", "minimal"),
     "original_minus_ajay": ("original", "ajay"),
+    "original_minus_native": ("original", "native"),
+    "ajay_minus_native": ("ajay", "native"),
+    "minimal_minus_native": ("minimal", "native"),
+    "minimal_minus_stateful": ("minimal", "stateful"),
+    "ajay_minus_stateful": ("ajay", "stateful"),
+    "native_minus_stateful": ("native", "stateful"),
 }
 
 
@@ -80,7 +86,18 @@ def save(path, payload):
 
 def row_orders(labels, blocks):
     rng, orders = random.Random(0), []
-    permutations = list(itertools.permutations(labels))
+    if len(labels) == 5:
+        # Williams design: each row occupies each position twice, and every
+        # ordered adjacent pair occurs twice over ten blocks.
+        base = (0, 1, 4, 2, 3)
+        permutations = [
+            tuple(labels[(x + offset) % 5] for x in order)
+            for offset in range(5) for order in (base, base[::-1])
+        ]
+    else:
+        permutations = list(itertools.permutations(labels))
+    check(blocks >= len(permutations) and blocks % len(permutations) == 0,
+          f"Require blocks to be a positive multiple of {len(permutations)}")
     for _ in range(blocks // len(permutations)):
         cycle = permutations.copy()
         rng.shuffle(cycle)
@@ -228,7 +245,8 @@ def main():
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
-        "--blocks", type=int, default=12, help="Positive multiple of six"
+        "--blocks", type=int, default=30,
+        help="Multiple of 30; multiple of 6 if no minimal cases are selected",
     )
     parser.add_argument("--repeats", type=int, default=500)
     parser.add_argument("--warmups", type=int, default=20)
@@ -243,7 +261,8 @@ def main():
     if args.list_cases:
         for spec in cases:
             rows = (
-                "original/ajay/minimal" if spec["minimal"] else "original/ajay"
+                "original/ajay/minimal/native/stateful"
+                if spec["minimal"] else "original/ajay/native"
             )
             print(
                 f"{spec['name']}: {spec['public']} {spec['shape']} "
@@ -252,15 +271,17 @@ def main():
             )
         print(f"{len(cases)} cases")
         return
+    permutation_count = 30 if any(s["minimal"] for s in cases) else 6
     if (
-        args.blocks < 6
-        or args.blocks % 6
+        args.blocks < permutation_count
+        or args.blocks % permutation_count
         or args.repeats < 1
         or args.warmups < 0
         or args.device < 0
     ):
         parser.error(
-            "Require blocks >=6 divisible by6, repeats >=1, "
+            f"Require blocks >= {permutation_count} and divisible by it, "
+            "repeats >=1, "
             "warmups >=0, device >=0"
         )
     affinity = os.sched_getaffinity(0)
@@ -311,7 +332,7 @@ def main():
                 "element_strides", namespace.get("_element_strides")
             )
             is element_strides,
-            "Rows must use identical backend and metadata providers",
+            "Nvmath rows must use identical backend and metadata providers",
         )
     check(
         _numpy_dtype_name.cache_parameters()
@@ -349,6 +370,7 @@ def main():
         "public_fft": inspect.getfile(cp.fft.fft),
         "profiler": inspect.getfile(benchmark),
         "plan_cache": importlib.import_module("cupy.fft._cache").__file__,
+        "native_cufft": cufft.__file__,
         "dtype_provider": importlib.import_module(
             _numpy_dtype_name.__module__
         ).__file__,
@@ -373,20 +395,27 @@ def main():
             "cpu": cpu,
             "order_seed": 0,
             "selected_cases": len(cases),
+            "native_enable_nd_planning": cp.fft.config.enable_nd_planning,
+            "native_workspace_policy": "retained with cached native plans",
             "block_checkpoint": str(block_path),
         },
         "sources": {name: identity(path) for name, path in files.items()},
         "measurement": "cupyx.profiler.benchmark CPU host latency; "
         "output disposal timed; GPU intervals include host gaps",
         "limitations": "Curated cases have no production frequency weights. "
-        "Only marked C2C default-forward cases use minimal.",
+        "Only marked C2C default-forward cases use minimal and stateful. Native contrasts "
+        "include backend plan, copy, scaling and output-layout differences; "
+        "release_workspace applies only to the nvmath rows.",
         "candidate_threshold": {
             "slower_us": 0.2,
             "slower_percent": 2,
             "negative_block_fraction": 10 / 12,
         },
         "validation": {
-            "row_agreement": "bitwise, before reference validation",
+            "row_agreement": (
+                "nvmath rows bitwise before reference validation; "
+                "native checked independently against reference"
+            ),
             "reference": "NumPy FFT of the same input promoted to double",
             "accuracy": "per-batch relative L2 <= 100 * input dtype epsilon; "
                         "absolute L2 for zero references",
@@ -454,19 +483,30 @@ def main():
                     "ajay": adapter._try_use_nvmath_ajay,
                 }
                 labels = (
-                    ("original", "ajay", "minimal")
+                    ("original", "ajay", "minimal", "native", "stateful")
                     if spec["minimal"]
-                    else ("original", "ajay")
+                    else ("original", "ajay", "native")
                 )
                 axes = tuple(range(operand.ndim))
                 options = adapter._FFT_OPTIONS["C2C"]
                 outputs, minimal_cache = [], {}
+                stateful = None
+                native_outputs, native_plans, native_plan_info = [], {}, []
+                hits_per_call = {"original": 1, "ajay": 1, "minimal": 0,
+                                 "stateful": 0}
+
+                def select(label):
+                    cp.fft.config.use_nvmath = label != "native"
+                    fft_module._try_use_nvmath = hooks.get(
+                        label, hooks["original"]
+                    )
+
                 reference_axes = transform_axes(spec, kwargs, operand.ndim)
                 reference_dtype = (
                     np.complex128 if np.iscomplexobj(host) else np.float64
                 )
                 try:
-                    fft_module._try_use_nvmath = hooks["ajay"]
+                    select("ajay")
                     warm = public(warm_operand, **kwargs)
                     reference = getattr(np.fft, spec["public"])
                     warm_expected = reference(
@@ -501,14 +541,45 @@ def main():
                             key == cache_key[2], "Minimal metadata key differs"
                         )
                         minimal_cache[(stream.ptr, key)] = plan
+                        stateful = nf.FFT(
+                            operand, axes=axes, options=options,
+                            execution="cuda", stream=stream,
+                        )
+                        stateful.plan(stream=stream)
+
+                    # Native owns its own Plan1d/PlanNd entries. Its public
+                    # call may use several FFT passes and cache lookups.
+                    select("native")
+                    native_warm = public(warm_operand, **kwargs)
+                    native_outputs.append((native_warm, warm_expected))
+                    for native_key, native_node in cache:
+                        if native_key == cache_key:
+                            continue
+                        native_plan = native_node.plan
+                        check(
+                            isinstance(native_plan,
+                                       (cufft.Plan1d, cufft.PlanNd))
+                            and native_plan.gpus is None,
+                            "Native warmup created an unexpected plan",
+                        )
+                        native_plans[native_key] = native_plan
+                        native_plan_info.append({
+                            "key": repr(native_key),
+                            "type": type(native_plan).__name__,
+                            "workspace_bytes": native_node.memsize,
+                        })
+                    check(native_plans, "Native warmup did not cache a plan")
+                    del native_plan, native_node, native_key
 
                     def verify():
-                        entries = list(cache)
+                        entries = {key: node.plan for key, node in cache}
                         check(
-                            len(entries) == 1
-                            and entries[0][0] == cache_key
-                            and entries[0][1].plan is plan,
-                            "CuPy cache identity changed",
+                            len(entries) == 1 + len(native_plans)
+                            and entries.get(cache_key) is plan
+                            and all(entries.get(key) is value
+                                    for key, value in native_plans.items()),
+                            "CuPy cache identities changed; both backend "
+                            "families must fit without eviction",
                         )
                         if spec["minimal"]:
                             check(
@@ -528,6 +599,7 @@ def main():
                             "Wrong workspace policy",
                         )
 
+                    verify()
                     comparisons = []
                     for input_index, (fresh, values, wanted) in enumerate((
                         (operand, host, expected),
@@ -535,11 +607,18 @@ def main():
                     )):
                         previous = None
                         for label in labels:
-                            fft_module._try_use_nvmath = hooks.get(
-                                label, hooks["ajay"]
-                            )
+                            select(label)
                             before = counts(cache)
-                            if label == "minimal":
+                            if label == "stateful":
+                                # Rebinding only for untimed two-input validation.
+                                stateful.reset_operand_unchecked(
+                                    fresh, stream=stream)
+                                out = stateful.execute(
+                                    direction=nf.FFTDirection.FORWARD,
+                                    stream=stream,
+                                    release_workspace=args.release_workspace,
+                                )
+                            elif label == "minimal":
                                 out = minimal.execute_cached(
                                     fresh,
                                     axes,
@@ -549,22 +628,35 @@ def main():
                                 )
                             else:
                                 out = public(fresh, **kwargs)
-                            outputs.append((out, wanted))
+                            if label == "native":
+                                native_outputs.append((out, wanted))
+                            else:
+                                outputs.append((out, wanted))
                             actual = out.get()
-                            if previous is not None:
-                                check(actual.dtype == previous.dtype
-                                      and actual.shape == previous.shape
-                                      and actual.tobytes()
-                                      == previous.tobytes(),
-                                      f"FFT rows differ bitwise for {label}")
-                            previous = actual
+                            if label != "native":
+                                if previous is not None:
+                                    check(
+                                        actual.dtype == previous.dtype
+                                        and actual.shape == previous.shape
+                                        and actual.tobytes()
+                                        == previous.tobytes(),
+                                        f"FFT rows differ bitwise for {label}",
+                                    )
+                                previous = actual
                             comparisons.append(
                                 (input_index, label, actual, wanted))
                             np.testing.assert_array_equal(fresh.get(), values)
+                            after = counts(cache)
+                            if (label == "native"
+                                    and label not in hits_per_call):
+                                check(after[1] == before[1]
+                                      and after[0] > before[0],
+                                      "Native preflight was not a warm hit")
+                                hits_per_call[label] = after[0] - before[0]
                             check(
-                                counts(cache)
+                                after
                                 == (
-                                    before[0] + int(label != "minimal"),
+                                    before[0] + hits_per_call[label],
                                     before[1],
                                 ),
                                 "Wrong preflight cache path",
@@ -583,6 +675,11 @@ def main():
                         **reference_error(np, warm.get(), warm_expected,
                                           reference_axes, host.dtype),
                     })
+                    accuracy.append({
+                        "input": "planning-warmup", "row": "native",
+                        **reference_error(np, native_warm.get(), warm_expected,
+                                          reference_axes, host.dtype),
+                    })
                     comparisons.clear()
                     del actual, previous
                     pointers = []
@@ -594,6 +691,9 @@ def main():
                             "Different output metadata",
                         )
                         pointers.append(out.data.ptr)
+                    # Native may use another legal output layout and need not
+                    # agree bitwise with nvmath. Its reference check is above.
+                    pointers.extend(out.data.ptr for out, _ in native_outputs)
                     check(
                         len(set(pointers)) == len(pointers)
                         and not {
@@ -602,17 +702,38 @@ def main():
                         }.intersection(pointers),
                         "Outputs alias",
                     )
+                    output_metadata = {
+                        backend: {
+                            "shape": value.shape,
+                            "dtype": str(value.dtype),
+                            "strides": value.strides,
+                            "c_contiguous": bool(value.flags.c_contiguous),
+                            "f_contiguous": bool(value.flags.f_contiguous),
+                        }
+                        for backend, value in (
+                            ("nvmath", warm), ("native", native_warm)
+                        )
+                    }
                     outputs.clear()
-                    del out, warm, fresh
+                    native_outputs.clear()
+                    del out, warm, native_warm, fresh
                     calls = {
                         label: (public, (operand,), kwargs)
-                        for label in ("original", "ajay")
+                        for label in ("original", "ajay", "native")
                     }
                     if spec["minimal"]:
                         calls["minimal"] = (
                             minimal.execute_cached,
                             (operand, axes, options, minimal_cache),
                             {"release_workspace": args.release_workspace},
+                        )
+                        # The timed object remains bound to this operand.
+                        stateful.reset_operand_unchecked(operand, stream=stream)
+                        calls["stateful"] = (
+                            stateful.execute, (),
+                            {"direction": nf.FFTDirection.FORWARD,
+                             "stream": stream,
+                             "release_workspace": args.release_workspace},
                         )
                     case = {
                         "case": spec,
@@ -625,7 +746,15 @@ def main():
                         ),
                         "correctness": True,
                         "reference_error": accuracy,
-                        "route": "nvmath",
+                        "route": {
+                            label: "native_cupy" if label == "native"
+                            else "nvmath" for label in labels
+                        },
+                        "cache_hits_per_call": {
+                            label: hits_per_call[label] for label in labels
+                        },
+                        "native_plans": native_plan_info,
+                        "output_metadata": output_metadata,
                         "blocks": [],
                     }
                     payload["cases"].append(case)
@@ -642,9 +771,7 @@ def main():
                         )
                         block = {"index": index, "order": order, "rows": {}}
                         for label in order:
-                            fft_module._try_use_nvmath = hooks.get(
-                                label, hooks["ajay"]
-                            )
+                            select(label)
                             function, positional, keywords = calls[label]
                             before = counts(cache)
                             result = benchmark(
@@ -657,10 +784,8 @@ def main():
                                 devices=(args.device,),
                             )
                             cpu_times = result.cpu_times.tolist()
-                            hits = (
+                            hits = hits_per_call[label] * (
                                 args.warmups + len(cpu_times)
-                                if label in hooks
-                                else 0
                             )
                             check(
                                 len(cpu_times) == args.repeats
@@ -669,6 +794,12 @@ def main():
                                 "Timed cache path changed",
                             )
                             verify()
+                            if stateful is not None:
+                                check(
+                                    not stateful._operand_released
+                                    and stateful.operand.tensor is operand,
+                                    "Stateful row lost its continuously bound operand",
+                                )
                             block["rows"][label] = {
                                 "cpu_seconds": cpu_times,
                                 "gpu_seconds": result.gpu_times.tolist(),
@@ -727,12 +858,27 @@ def main():
                             f"{summary['ajay_minus_minimal']:.3f} us",
                             flush=True,
                         )
+                    print(
+                        "  CPU us: "
+                        + ", ".join(
+                            f"{label}={summary['rows_cpu_us'][label]:.3f}"
+                            for label in labels
+                        )
+                        + "; ajay-minus-native "
+                        f"{summary['ajay_minus_native']:+.3f} us",
+                        flush=True,
+                    )
                 finally:
                     fft_module._try_use_nvmath = old_hook
+                    cp.fft.config.use_nvmath = True
                     stream.synchronize()
+                    if stateful is not None:
+                        stateful.free()
                     cache.clear()
                     minimal_cache.clear()
+                    native_plans.clear()
                     outputs.clear()
+                    native_outputs.clear()
                     if gc_enabled:
                         gc.enable()
                 save(args.json, payload)
