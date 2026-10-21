@@ -1,5 +1,8 @@
 # Warm FFT comparison
 
+tldr:
+Fusing normalization into the FFT store removes substantial repeated adapter work and delivers consistent warm-call improvements across the tested transform families. Compilation latency, caching policy and generated-code efficiency remain implementation questions before production adoption.
+
 Compare the public CuPy FFT paths with a minimal cached nvmath lifecycle.
 
 | Row | What it measures | Definition |
