@@ -144,21 +144,41 @@ def _scale_result(out, operand, axes, norm, fft_type, fft_direction):
     elif norm == 'forward' and fft_direction == 'forward':
         out /= size
 
+def _compile_normalization_epilog(plan, operand, axes, norm, fft_direction):
+    """Translate CuPy normalization into a plan's constant-divisor epilog."""
+    if norm == 'ortho':
+        shape = (plan.get_output_layout()[0]
+                 if plan.fft_abstract_type == 'C2R' else operand.shape)
+        divisor = math.sqrt(math.prod(shape[axis] for axis in axes))
+    elif (norm == 'backward' and fft_direction == 'inverse'
+          or norm == 'forward' and fft_direction == 'forward'):
+        shape = (plan.get_output_layout()[0]
+                 if plan.fft_abstract_type == 'C2R' else operand.shape)
+        divisor = math.prod(shape[axis] for axis in axes)
+    else:
+        divisor = 1
 
-def _scale_result_ajay(out, operand, axes, norm, fft_type, fft_direction):
-    if (type(norm) is str and type(fft_direction) is str
-            and (norm == 'backward' and fft_direction != 'inverse'
-                 or norm == 'forward' and fft_direction != 'forward')):
-        return
-    shape = operand.shape if fft_type == 'R2C' else out.shape
-    size = math.prod(shape[axis] for axis in axes)
-    if norm == 'backward' and fft_direction == 'inverse':
-        out /= size
-    elif norm == 'ortho':
-        out /= math.sqrt(size)
-    elif norm == 'forward' and fft_direction == 'forward':
-        out /= size
+    plan._cupy_fft_epilog_divisor = divisor
+    plan._cupy_fft_epilog_ltoir = None
+    if divisor == 1:
+        return None
 
+    import numpy
+
+    # Capture the output's real component precision: a Python float would
+    # promote single-precision arithmetic in the compiled callback.
+    divisor = numpy.finfo(plan.result_data_type).dtype.type(divisor)
+
+    def rescale(data_out, offset, data, user_info, unused):
+        data_out[offset] = data / divisor
+
+    # Follow nvmath's documented callback flow in the plan's device context.
+    # No caller-info buffer is needed for this constant-divisor epilog.
+    with cupy.cuda.Device(plan.device_id):
+        ltoir = nvmath_fft.compile_epilog(
+            rescale, plan.result_data_type, plan.result_data_type)
+    plan._cupy_fft_epilog_ltoir = ltoir
+    return {'ltoir': ltoir}
 
 def _c_contiguous_element_strides(shape):
     strides = [1] * len(shape)
@@ -336,13 +356,16 @@ def _try_use_nvmath(
 
 def _try_use_nvmath_ajay(
         operand, requested_shape, axes, norm, *, fft_type, fft_direction):
-    """Execute with nvmath, or return None to use CuPy's native path.
+    """Execute with cached normalization epilogs, or use CuPy's native path.
 
     Shape changes, multi-GPU execution, callbacks and explicit plans fall back
     silently. Anything nvmath rejects while building or planning also falls
     back, but warns, since which operands, dtypes and layouts nvmath accepts is
     nvmath's to decide and changes between versions. Failures once the plan is
     live propagate instead: see the comments on those blocks.
+
+    Compile scaling only when constructing a plan. Warm execution applies it
+    while cuFFT stores its output, avoiding a separate CuPy division.
     """
     if not config.use_nvmath:
         return None
@@ -355,7 +378,7 @@ def _try_use_nvmath_ajay(
         # CuPy's configured multi-GPU execution remains on the native path.
         return None
     if config.get_current_callback_manager() is not None:
-        # cuFFT callbacks are supported only by CuPy's native plans.
+        # CuPy user callback contexts remain on native plans.
         return None
 
     from cupy.cuda import cufft
@@ -376,6 +399,10 @@ def _try_use_nvmath_ajay(
         raise ValueError(
             f'Invalid norm value {norm}, should be "backward", "ortho", '
             'or "forward".')
+    elif type(norm) is not str:
+        # Accepted string-like objects need not be hashable. Cache the
+        # validated meaning, using the same equality rules as validation.
+        norm = _VALID_NORMS[_VALID_NORMS.index(norm)]
 
     try:
         direction = _DIRECTIONS[fft_direction]
@@ -407,7 +434,16 @@ def _try_use_nvmath_ajay(
     stream = cupy.cuda.get_current_stream()
     # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
     # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
+    # A store callback bakes the normalization into the plan. Keep those
+    # plans separate from Original and from other norms/directions; requests
+    # without scaling still share the original cache entry.
+    needs_scaling = (
+        norm == 'ortho'
+        or norm == 'backward' and fft_direction == 'inverse'
+        or norm == 'forward' and fft_direction == 'forward')
     key = ('nvmath', stream.ptr, nvmath_key)
+    if needs_scaling:
+        key += (norm, fft_direction)
     cache = get_plan_cache()
     plan = cache.get(key)
     cache_miss = plan is None
@@ -427,7 +463,9 @@ def _try_use_nvmath_ajay(
                 execution='cuda',
                 stream=stream,
             )
-            plan.plan(stream=stream)
+            epilog = _compile_normalization_epilog(
+                plan, operand, axes, norm, fft_direction)
+            plan.plan(stream=stream, epilog=epilog)
         except Exception as e:
             if plan is not None:
                 plan.free()
@@ -443,10 +481,6 @@ def _try_use_nvmath_ajay(
                 stream=stream,
                 release_workspace=_RELEASE_WORKSPACE,
             )
-            if (type(norm) is not str or norm != 'backward'
-                    or fft_direction != 'forward'):
-                _scale_result_ajay(
-                    out, operand, axes, norm, fft_type, fft_direction)
         finally:
             plan.release_operand()
     except Exception:

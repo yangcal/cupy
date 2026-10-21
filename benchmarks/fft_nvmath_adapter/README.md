@@ -4,16 +4,24 @@ Compare the public CuPy FFT paths with a minimal cached nvmath lifecycle.
 
 | Row | What it measures | Definition |
 | --- | --- | --- |
-| Original | CuPy's nvmath adapter, including compiled stride conversion and cached dtype names. | [`_try_use_nvmath`](../../cupy/fft/_fft_nvmath.py#L202) |
-| Ajay | Original plus common-axis shortcuts and skipping no-op scaling setup. | [`_try_use_nvmath_ajay`](../../cupy/fft/_fft_nvmath.py#L337), with adjacent `_normalize_axes_ajay` and `_scale_result_ajay` helpers |
+| Original | CuPy's nvmath adapter, including compiled stride conversion and cached dtype names. | [`_try_use_nvmath`](../../cupy/fft/_fft_nvmath.py#L222) |
+| Ajay | Original plus common-axis shortcuts and normalization fused into the FFT output store. | [`_try_use_nvmath_ajay`](../../cupy/fft/_fft_nvmath.py#L357), [`_compile_normalization_epilog`](../../cupy/fft/_fft_nvmath.py#L147) |
 | Native | Public `cupy.fft` with nvmath disabled, using CuPy's cached cuFFT plans. | [`cupy/fft/_fft.py`](../../cupy/fft/_fft.py); selected in [`main.py`](main.py) |
 | Stateful | Repeated direct `FFT.execute()` on a separately planned, continuously bound operand; no key, cache lookup or rebinding. Forward C2C only. | `stateful.execute` in [`main.py`](main.py) |
 | Minimal | Fresh metadata key, dictionary lookup, operand binding, forward execution and operand release. Forward C2C only. | [`execute_cached`](minimal_lifecycle.py#L18) |
 
-Original, Ajay and Minimal use the same execute candidate and share one
-cached plan. Stateful uses that candidate on its own bound object. Native
-uses its own plans. Operands and requests are in
-[`cases.py`](cases.py).
+Original, Ajay and Minimal use the same execute candidate. Unscaled
+requests share a cached plan; scaled Ajay requests use separate plans with
+normalization compiled into the store callback on a cache miss. Stateful
+uses that candidate on its own bound object. Native uses its own plans.
+Operands and requests are in [`cases.py`](cases.py).
+
+The adapter computes the normalization divisor, defines a small Python
+scaling function and compiles it with nvmath's documented `compile_epilog`
+API on a plan miss. The returned code is passed to `plan(epilog=...)`.
+Warm plan hits reuse that plan without compiling or separately scaling
+the output. This follows nvmath's existing normalization example and
+requires its optional Numba dependencies; no nvmath source changes are needed.
 
 ## Replicate
 
@@ -28,15 +36,16 @@ git clone --branch ajay/fft-cache-lifecycle \
 git -C nvmath-fft-request checkout --detach \
   84d59bc0fa8128142669ec9586537f5bba169254
 
-python -m pip install 'setuptools>=77.0.3' wheel 'Cython==3.2.9' 'numpy==2.5.4'
-python -m pip install --no-build-isolation -e './nvmath-fft-request[sysctk13]'
+python -m pip install 'setuptools>=77.0.3' wheel 'Cython==3.2.9' 'numpy<2.5'
+python -m pip install --no-build-isolation -e './nvmath-fft-request[sysctk13,numba]'
 CUPY_USE_CUDA_PYTHON=1 PYTHONPATH="$PWD/nvmath-fft-request" \
   python -m pip install --no-build-isolation -e ./cupy-fft-request
 cd cupy-fft-request
 ```
 
-The nvmath clone requires internal repository access. For general source-build
-setup, see [CuPy installation](../../docs/source/install.rst).
+The nvmath checkout contains the execute/workspace candidate and requires
+internal repository access. For general source-build setup, see
+[CuPy installation](../../docs/source/install.rst).
 
 Run a short three-operand check, then the full 87-case sweep:
 
@@ -53,123 +62,214 @@ Raw samples, environment and source hashes are saved in JSON. The five-row
 cases use a balanced ten-order design repeated three times; other cases use
 all six permutations five times.
 
+Both CPU call times and CUDA-event elapsed times are printed and summarized
+in JSON as `rows_cpu_us` and `rows_gpu_us`, with paired differences for each.
+CUDA events bracket the complete public call and include host submission
+gaps; they do not isolate FFT kernel time.
+
+JSON also records the first plan's construction, `compile_epilog` and
+planning host times during setup, separately from the warm samples.
+These are individual observations affected by compiler first use and
+driver caches. Execution is excluded from those preparation intervals;
+the collection wrappers are removed before warm timing.
+
 ## Results
 
-NVIDIA B200 warm CPU call times in microseconds, measured with
-`cupyx.profiler.benchmark` on 2026-10-20. Values are medians of block
-medians from 30 balanced blocks, with 500 samples per row per block.
-Planning and validation are outside timing. These are host call times,
-not isolated GPU kernel times.
+This run validates the documented `compile_epilog` implementation. Ajay
+retains the earlier common-axis shortcuts. The earlier scaling shortcut
+only skipped setup when no scaling was needed; scaled requests still
+launched a separate CuPy division. Ajay now performs that division in the
+FFT output store, removing the separate scaling launch and output pass.
 
-All columns come from the same run. Operand descriptions give input
-shape, dtype and layout; `strided` means a positive stride-two view.
-Minimal and Stateful are included only for the matched forward C2C cases.
+NVIDIA B200 warm CPU call times in microseconds, measured with  
+`cupyx.profiler.benchmark` on 2026-10-21. Values are medians of block  
+medians from 30 balanced blocks, with 500 samples per row per block.  
+Planning and validation are outside timing. These are host call times,  
+not isolated GPU kernel times.  
+Savings use paired block differences and need not equal subtraction of  
+the independently aggregated table entries.
 
-Ajay was faster in 83 cases. Four batched `ifft2` cases were slightly
-slower (0.12–0.16 µs). All 87 cases passed numerical and
-backend-routing checks. These are curated cases, without production
-workload weighting.
+Historical context, CPU time in µs: the earlier Ajay column is the
+2026-10-20 axes/no-op-scaling implementation. Current Ajay and Native are
+from this run. These are separate B200 allocations with NumPy 2.5.4 and
+2.4.6 respectively, rather than an isolated measurement of fusion alone.
+
+| Request | Earlier Ajay | Current Ajay | Current Native |
+| --- | ---: | ---: | ---: |
+| `fft`, `(1024,)`, `ortho` | 25.89 | 13.50 | 13.43 |
+| `fftn`, `(32,32)`, `forward` | 30.83 | 17.49 | 25.94 |
+| `ifftn`, `(16,16,16)`, `ortho` | 33.57 | 19.55 | 29.07 |
+| `irfftn`, input `(4,8,9)`, default norm | 61.32 | 45.58 | 43.99 |
 
 Tiny forward C2C transforms (complex64, C-contiguous), CPU time in µs:
 
 | Operand | Stateful | Minimal | Original | Ajay | Native |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `(2,)` | 7.44 | 11.02 | 16.33 | 13.36 | 7.78 |
-| `(2,2)` | 9.23 | 13.42 | 20.05 | 17.31 | 15.48 |
-| `(2,2,2)` | 11.03 | 15.18 | 22.05 | 19.05 | 17.74 |
+| `(2,)` | 7.34 | 10.97 | 15.99 | 13.12 | 7.64 |
+| `(2,2)` | 9.11 | 13.26 | 19.59 | 17.11 | 15.15 |
+| `(2,2,2)` | 10.90 | 15.09 | 21.70 | 18.90 | 17.53 |
+
+The paired Ajay overhead above Minimal is 2.14 / 3.90 / 3.80 µs for these
+1D / 2D / 3D requests.
+
+### CUDA-event validation
+
+Representative CUDA-event times in µs, from the same samples as the CPU
+results. Events include host submission gaps, copies and scaling; these
+are complete stream intervals, not isolated FFT kernel timings.
+
+| Request | Original | Ajay | Native |
+| --- | ---: | ---: | ---: |
+| `fft`, `(1024,)`, `ortho` | 29.22 | 17.22 | 16.96 |
+| `fftn`, `(32,32)`, `forward` | 34.45 | 21.22 | 28.38 |
+| `ifftn`, `(16,16,16)`, `ortho` | 37.13 | 22.02 | 31.52 |
+| `ifft`, `(1048576,)`, default norm | 37.78 | 31.52 | 29.41 |
+| `rfft`, `(1048575,)`, `ortho` | 67.10 | 62.96 | 58.31 |
+| `ifft2`, `(4,256,512)`, default norm | 35.68 | 26.02 | 32.32 |
+| `ifft2`, `(4,256,512)`, `ortho` | 35.90 | 29.81 | 32.32 |
+| `irfft`, input `(524289,)`, default norm | 64.81 | 55.52 | 43.71 |
+| `irfftn`, input `(64,64,33)`, `ortho` | 66.24 | 51.64 | 46.98 |
+
+Callback compilation took 1.18 s on first use in the sweep. The remaining
+34 scaled plan misses took 8.22–42.12 ms to compile, with a 12.01 ms median.
+Scaled Ajay planning intervals ranged from 25.47 to 592.20 ms. These are
+individual setup observations outside the warm samples, not a repeated
+cold-path benchmark.
 
 ### Full results
 
+Scaling-heavy operand families appear first, followed by C2R's remaining
+input-preservation work and unscaled requests. Related requests for the same
+operand stay together, including their unscaled controls. IDs remain the
+original case IDs used in the graph below.
+
+#### C2C normalization — contiguous operands
+
 | ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
 | ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| 1 | `fft(a, axis=-1)` | `(2,)` complex64 C | 7.780 | 16.328 | 13.360 | 11.017 | 7.444 |
-| 2 | `fft(a, axis=-1)` | `(8,)` complex64 C | 7.770 | 16.382 | 13.150 | 10.980 | 7.442 |
-| 3 | `fft(a, axis=-1)` | `(64,)` complex64 C | 7.798 | 16.491 | 13.319 | 11.035 | 7.531 |
-| 4 | `fft(a, axis=-1)` | `(1024,)` complex64 C | 7.894 | 16.641 | 13.440 | 11.085 | 7.507 |
-| 5 | `fft(a, axis=-1)` | `(65536,)` complex64 C | 9.612 | 18.362 | 15.356 | 12.864 | 9.194 |
-| 6 | `fft(a, axis=-1)` | `(1048576,)` complex64 C | 9.660 | 18.499 | 15.393 | 12.928 | 9.228 |
-| 7 | `fftn(a, axes=(0, 1))` | `(2, 2)` complex64 C | 15.476 | 20.049 | 17.306 | 13.424 | 9.235 |
-| 8 | `fftn(a, axes=(0, 1))` | `(8, 8)` complex64 C | 15.485 | 19.998 | 17.213 | 13.444 | 9.295 |
-| 9 | `fftn(a, axes=(0, 1))` | `(32, 32)` complex64 C | 15.573 | 20.056 | 17.142 | 13.402 | 9.312 |
-| 10 | `fftn(a, axes=(0, 1))` | `(128, 128)` complex64 C | 15.595 | 20.165 | 17.324 | 13.611 | 9.360 |
-| 11 | `fftn(a, axes=(0, 1))` | `(1024, 1024)` complex64 C | 15.621 | 20.317 | 17.518 | 13.582 | 9.211 |
-| 12 | `fftn(a, axes=(0, 1, 2))` | `(2, 2, 2)` complex64 C | 17.737 | 22.051 | 19.047 | 15.179 | 11.032 |
-| 13 | `fftn(a, axes=(0, 1, 2))` | `(4, 4, 4)` complex64 C | 17.881 | 22.116 | 19.140 | 15.288 | 11.034 |
-| 14 | `fftn(a, axes=(0, 1, 2))` | `(16, 16, 16)` complex64 C | 18.035 | 22.468 | 19.511 | 15.545 | 11.128 |
-| 15 | `fftn(a, axes=(0, 1, 2))` | `(64, 64, 64)` complex64 C | 18.054 | 22.519 | 19.534 | 15.546 | 11.150 |
-| 16 | `fftn(a, axes=(0, 1, 2))` | `(128, 64, 128)` complex64 C | 18.119 | 22.498 | 19.490 | 15.525 | 11.063 |
-| 17 | `fft(a, axis=-1, norm='backward')` | `(1024,)` complex64 C | 7.908 | 16.982 | 13.694 | — | — |
-| 18 | `fft(a, axis=-1, norm='forward')` | `(1024,)` complex64 C | 13.676 | 27.201 | 25.773 | — | — |
-| 19 | `fft(a, axis=-1, norm='ortho')` | `(1024,)` complex64 C | 13.637 | 27.317 | 25.886 | — | — |
-| 20 | `ifft(a, axis=-1, norm=None)` | `(1024,)` complex64 C | 13.536 | 27.036 | 25.693 | — | — |
-| 21 | `ifft(a, axis=-1, norm='forward')` | `(1024,)` complex64 C | 7.948 | 16.971 | 14.298 | — | — |
-| 22 | `ifft(a, axis=-1, norm='ortho')` | `(1024,)` complex64 C | 13.647 | 27.389 | 26.006 | — | — |
-| 23 | `ifft(a, axis=-1)` | `(1048576,)` complex64 C | 15.265 | 28.866 | 27.539 | — | — |
-| 24 | `fftn(a, axes=(0, 1), norm='backward')` | `(32, 32)` complex64 C | 15.549 | 20.258 | 17.354 | — | — |
-| 25 | `fftn(a, axes=(0, 1), norm='forward')` | `(32, 32)` complex64 C | 25.962 | 32.625 | 30.831 | — | — |
-| 26 | `fftn(a, axes=(0, 1), norm='ortho')` | `(32, 32)` complex64 C | 26.431 | 32.863 | 30.947 | — | — |
-| 27 | `ifftn(a, axes=(0, 1), norm=None)` | `(32, 32)` complex64 C | 26.505 | 32.855 | 31.025 | — | — |
-| 28 | `ifftn(a, axes=(0, 1), norm='forward')` | `(32, 32)` complex64 C | 15.446 | 20.069 | 17.468 | — | — |
-| 29 | `ifftn(a, axes=(0, 1), norm='ortho')` | `(32, 32)` complex64 C | 26.139 | 32.857 | 30.946 | — | — |
-| 30 | `ifftn(a, axes=(0, 1))` | `(1024, 1024)` complex64 C | 26.934 | 33.549 | 31.688 | — | — |
-| 31 | `fftn(a, axes=(0, 1, 2), norm='backward')` | `(16, 16, 16)` complex64 C | 17.877 | 22.361 | 19.328 | — | — |
-| 32 | `fftn(a, axes=(0, 1, 2), norm='forward')` | `(16, 16, 16)` complex64 C | 29.363 | 35.337 | 33.372 | — | — |
-| 33 | `fftn(a, axes=(0, 1, 2), norm='ortho')` | `(16, 16, 16)` complex64 C | 29.223 | 35.232 | 33.239 | — | — |
-| 34 | `ifftn(a, axes=(0, 1, 2), norm=None)` | `(16, 16, 16)` complex64 C | 29.740 | 35.429 | 33.501 | — | — |
-| 35 | `ifftn(a, axes=(0, 1, 2), norm='forward')` | `(16, 16, 16)` complex64 C | 18.296 | 22.615 | 20.104 | — | — |
-| 36 | `ifftn(a, axes=(0, 1, 2), norm='ortho')` | `(16, 16, 16)` complex64 C | 29.559 | 35.623 | 33.572 | — | — |
-| 37 | `ifftn(a, axes=(0, 1, 2))` | `(128, 64, 128)` complex64 C | 29.012 | 35.067 | 33.083 | — | — |
-| 38 | `fftn(a, axes=(1,))` | `(3, 16)` complex64 C | 9.076 | 17.155 | 16.368 | — | — |
-| 39 | `fftn(a, axes=(1,))` | `(16, 65536)` complex64 C | 10.855 | 19.271 | 18.540 | — | — |
-| 40 | `fft2(a)` | `(2, 8, 16)` complex64 C | 16.274 | 20.223 | 19.473 | — | — |
-| 41 | `fft2(a)` | `(4, 256, 512)` complex64 C | 16.330 | 20.621 | 19.843 | — | — |
-| 42 | `fftn(a, axes=(1, 0))` | `(8, 16)` complex64 C | 15.479 | 20.133 | 19.409 | — | — |
-| 43 | `fftn(a, axes=(1, 0))` | `(1024, 1024)` complex64 C | 15.548 | 20.534 | 19.611 | — | — |
-| 44 | `fftn(a, axes=(0, 2))` | `(4, 3, 8)` complex64 C | 34.611 | 20.711 | 19.810 | — | — |
-| 45 | `fftn(a, axes=(0, 2))` | `(128, 4, 1024)` complex64 C | 36.168 | 21.214 | 20.362 | — | — |
-| 46 | `fftn(a, axes=[0, 2])` | `(4, 3, 8)` complex64 C | 35.291 | 20.751 | 19.934 | — | — |
-| 47 | `fftn(a, axes=[0, 2])` | `(128, 4, 1024)` complex64 C | 36.374 | 21.265 | 20.454 | — | — |
-| 48 | `fftn(a, axes=(np.int64(0), np.int64(2)))` | `(4, 3, 8)` complex64 C | 36.629 | 21.418 | 20.185 | — | — |
-| 49 | `fftn(a, axes=(np.int64(0), np.int64(2)))` | `(128, 4, 1024)` complex64 C | 38.018 | 22.127 | 20.733 | — | — |
-| 50 | `fftn(a, axes=(0, -1))` | `(8, 16)` complex64 C | 15.630 | 20.248 | 19.449 | — | — |
-| 51 | `fftn(a, axes=(0, -1))` | `(1024, 1024)` complex64 C | 15.742 | 20.437 | 19.595 | — | — |
-| 52 | `fftn(a, axes=(2, 3))` | `(2, 3, 8, 16)` complex64 C | 16.237 | 20.623 | 19.908 | — | — |
-| 53 | `fftn(a, axes=(2, 3))` | `(2, 4, 256, 512)` complex64 C | 16.220 | 20.849 | 19.987 | — | — |
-| 54 | `ifft2(a, norm=None)` | `(2, 8, 16)` complex64 C | 27.922 | 33.046 | 33.234 | — | — |
-| 55 | `ifft2(a, norm='forward')` | `(2, 8, 16)` complex64 C | 16.144 | 20.555 | 20.047 | — | — |
-| 56 | `ifft2(a, norm='ortho')` | `(2, 8, 16)` complex64 C | 27.624 | 33.268 | 33.400 | — | — |
-| 57 | `ifft2(a, norm=None)` | `(4, 256, 512)` complex64 C | 27.945 | 33.351 | 33.477 | — | — |
-| 58 | `ifft2(a, norm='forward')` | `(4, 256, 512)` complex64 C | 16.412 | 20.796 | 20.318 | — | — |
-| 59 | `ifft2(a, norm='ortho')` | `(4, 256, 512)` complex64 C | 27.821 | 33.669 | 33.806 | — | — |
-| 60 | `rfft(a)` | `(32,)` float32 C | 7.791 | 16.520 | 13.334 | — | — |
-| 61 | `rfft(a)` | `(1048576,)` float32 C | 11.588 | 20.862 | 17.912 | — | — |
-| 62 | `irfft(a)` | `(17,)` complex64 C | 26.869 | 53.300 | 52.174 | — | — |
-| 63 | `irfft(a)` | `(524289,)` complex64 C | 31.228 | 59.335 | 58.259 | — | — |
-| 64 | `rfft2(a)` | `(8, 16)` float32 C | 15.951 | 20.055 | 17.262 | — | — |
-| 65 | `rfft2(a)` | `(1024, 1024)` float32 C | 16.223 | 20.549 | 17.754 | — | — |
-| 66 | `irfft2(a)` | `(8, 9)` complex64 C | 42.711 | 60.802 | 58.813 | — | — |
-| 67 | `irfft2(a)` | `(1024, 513)` complex64 C | 43.203 | 61.806 | 59.589 | — | — |
-| 68 | `rfftn(a)` | `(4, 8, 16)` float32 C | 17.160 | 22.000 | 18.302 | — | — |
-| 69 | `rfftn(a)` | `(128, 64, 128)` float32 C | 17.340 | 22.218 | 18.721 | — | — |
-| 70 | `irfftn(a)` | `(4, 8, 9)` complex64 C | 44.462 | 63.548 | 61.324 | — | — |
-| 71 | `irfftn(a)` | `(128, 64, 65)` complex64 C | 44.569 | 63.917 | 61.732 | — | — |
-| 72 | `rfft(a, norm='forward')` | `(33,)` float32 C | 13.503 | 26.988 | 25.481 | — | — |
-| 73 | `rfft(a, norm='ortho')` | `(1048575,)` float32 C | 23.866 | 38.064 | 36.517 | — | — |
-| 74 | `irfft2(a, norm='forward')` | `(8, 9)` complex64 C | 32.792 | 46.338 | 43.600 | — | — |
-| 75 | `irfft2(a, norm='ortho')` | `(512, 513)` complex64 C | 43.474 | 61.983 | 60.012 | — | — |
-| 76 | `fft(a, norm=None)` | `(1048576,)` complex128 C | 9.692 | 18.533 | 15.444 | — | — |
-| 77 | `ifft(a, norm=None)` | `(65536,)` complex128 C | 15.413 | 29.057 | 27.533 | — | — |
-| 78 | `rfftn(a, norm='forward')` | `(64, 64, 64)` float64 C | 29.555 | 34.680 | 32.470 | — | — |
-| 79 | `irfftn(a, norm='ortho')` | `(64, 64, 33)` complex128 C | 45.110 | 64.223 | 62.048 | — | — |
-| 80 | `fft(a)` | `(8, 16)` complex64 F | 14.729 | 16.531 | 13.630 | — | — |
-| 81 | `fft(a)` | `(16, 65536)` complex64 F | 16.504 | 18.540 | 15.438 | — | — |
-| 82 | `fft(a)` | `(64,)` complex64 strided | 13.944 | 16.419 | 13.485 | — | — |
-| 83 | `fft(a)` | `(1048576,)` complex64 strided | 15.777 | 18.475 | 15.433 | — | — |
-| 84 | `ifft(a)` | `(8, 16)` complex64 F | 23.119 | 29.005 | 27.617 | — | — |
-| 85 | `ifft(a)` | `(16, 65536)` complex64 F | 24.526 | 31.030 | 29.722 | — | — |
-| 86 | `ifft(a)` | `(64,)` complex64 strided | 19.669 | 26.711 | 25.271 | — | — |
-| 87 | `ifft(a)` | `(1048576,)` complex64 strided | 21.816 | 29.118 | 27.694 | — | — |
+| 18 | `fft(a, axis=-1, norm='forward')` | `(1024,)` complex64 C | 13.453 | 26.802 | 13.637 | — | — |
+| 19 | `fft(a, axis=-1, norm='ortho')` | `(1024,)` complex64 C | 13.427 | 26.788 | 13.497 | — | — |
+| 20 | `ifft(a, axis=-1, norm=None)` | `(1024,)` complex64 C | 13.415 | 26.686 | 13.447 | — | — |
+| 22 | `ifft(a, axis=-1, norm='ortho')` | `(1024,)` complex64 C | 13.459 | 26.914 | 13.459 | — | — |
+| 4 | `fft(a, axis=-1)` | `(1024,)` complex64 C | 7.818 | 16.284 | 13.436 | 11.011 | 7.323 |
+| 17 | `fft(a, axis=-1, norm='backward')` | `(1024,)` complex64 C | 7.793 | 16.377 | 13.488 | — | — |
+| 21 | `ifft(a, axis=-1, norm='forward')` | `(1024,)` complex64 C | 7.782 | 16.376 | 13.513 | — | — |
+| 23 | `ifft(a, axis=-1)` | `(1048576,)` complex64 C | 15.158 | 28.427 | 15.357 | — | — |
+| 6 | `fft(a, axis=-1)` | `(1048576,)` complex64 C | 9.578 | 18.519 | 15.699 | 13.001 | 9.132 |
+| 25 | `fftn(a, axes=(0, 1), norm='forward')` | `(32, 32)` complex64 C | 25.943 | 31.966 | 17.495 | — | — |
+| 26 | `fftn(a, axes=(0, 1), norm='ortho')` | `(32, 32)` complex64 C | 25.923 | 32.156 | 17.342 | — | — |
+| 27 | `ifftn(a, axes=(0, 1), norm=None)` | `(32, 32)` complex64 C | 25.835 | 31.969 | 17.278 | — | — |
+| 29 | `ifftn(a, axes=(0, 1), norm='ortho')` | `(32, 32)` complex64 C | 26.102 | 32.369 | 17.132 | — | — |
+| 9 | `fftn(a, axes=(0, 1))` | `(32, 32)` complex64 C | 15.080 | 19.486 | 17.070 | 13.301 | 9.143 |
+| 24 | `fftn(a, axes=(0, 1), norm='backward')` | `(32, 32)` complex64 C | 15.121 | 19.841 | 17.309 | — | — |
+| 28 | `ifftn(a, axes=(0, 1), norm='forward')` | `(32, 32)` complex64 C | 15.123 | 19.793 | 17.336 | — | — |
+| 30 | `ifftn(a, axes=(0, 1))` | `(1024, 1024)` complex64 C | 25.984 | 32.535 | 17.661 | — | — |
+| 11 | `fftn(a, axes=(0, 1))` | `(1024, 1024)` complex64 C | 15.252 | 19.915 | 17.464 | 13.426 | 9.035 |
+| 43 | `fftn(a, axes=(1, 0))` | `(1024, 1024)` complex64 C | 15.379 | 20.056 | 19.447 | — | — |
+| 51 | `fftn(a, axes=(0, -1))` | `(1024, 1024)` complex64 C | 15.246 | 20.024 | 19.500 | — | — |
+| 32 | `fftn(a, axes=(0, 1, 2), norm='forward')` | `(16, 16, 16)` complex64 C | 29.299 | 34.839 | 19.681 | — | — |
+| 33 | `fftn(a, axes=(0, 1, 2), norm='ortho')` | `(16, 16, 16)` complex64 C | 28.868 | 34.620 | 19.270 | — | — |
+| 34 | `ifftn(a, axes=(0, 1, 2), norm=None)` | `(16, 16, 16)` complex64 C | 28.888 | 34.309 | 19.226 | — | — |
+| 36 | `ifftn(a, axes=(0, 1, 2), norm='ortho')` | `(16, 16, 16)` complex64 C | 29.069 | 34.676 | 19.548 | — | — |
+| 14 | `fftn(a, axes=(0, 1, 2))` | `(16, 16, 16)` complex64 C | 17.700 | 22.031 | 19.258 | 15.240 | 11.070 |
+| 31 | `fftn(a, axes=(0, 1, 2), norm='backward')` | `(16, 16, 16)` complex64 C | 17.708 | 21.929 | 19.280 | — | — |
+| 35 | `ifftn(a, axes=(0, 1, 2), norm='forward')` | `(16, 16, 16)` complex64 C | 17.765 | 22.161 | 19.513 | — | — |
+| 37 | `ifftn(a, axes=(0, 1, 2))` | `(128, 64, 128)` complex64 C | 28.503 | 34.488 | 19.419 | — | — |
+| 16 | `fftn(a, axes=(0, 1, 2))` | `(128, 64, 128)` complex64 C | 17.613 | 21.956 | 19.209 | 15.253 | 10.899 |
+| 77 | `ifft(a, norm=None)` | `(65536,)` complex128 C | 15.280 | 28.579 | 15.543 | — | — |
 
-<img width="3600" height="1300" alt="image" src="https://github.com/user-attachments/assets/d7d71d43-6a13-436c-82cf-13ba02a4b468" />
+#### Batched C2C normalization
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 54 | `ifft2(a, norm=None)` | `(2, 8, 16)` complex64 C | 26.952 | 32.249 | 19.508 | — | — |
+| 56 | `ifft2(a, norm='ortho')` | `(2, 8, 16)` complex64 C | 27.709 | 32.963 | 19.688 | — | — |
+| 40 | `fft2(a)` | `(2, 8, 16)` complex64 C | 15.817 | 19.952 | 19.406 | — | — |
+| 55 | `ifft2(a, norm='forward')` | `(2, 8, 16)` complex64 C | 15.988 | 20.116 | 19.591 | — | — |
+| 57 | `ifft2(a, norm=None)` | `(4, 256, 512)` complex64 C | 28.058 | 33.140 | 19.868 | — | — |
+| 59 | `ifft2(a, norm='ortho')` | `(4, 256, 512)` complex64 C | 28.049 | 33.375 | 19.909 | — | — |
+| 41 | `fft2(a)` | `(4, 256, 512)` complex64 C | 16.042 | 20.328 | 19.722 | — | — |
+| 58 | `ifft2(a, norm='forward')` | `(4, 256, 512)` complex64 C | 16.051 | 20.396 | 19.885 | — | — |
+
+#### C2C normalization — Fortran and strided operands
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 84 | `ifft(a)` | `(8, 16)` complex64 F | 22.516 | 28.611 | 13.608 | — | — |
+| 80 | `fft(a)` | `(8, 16)` complex64 F | 14.626 | 16.378 | 13.585 | — | — |
+| 85 | `ifft(a)` | `(16, 65536)` complex64 F | 23.888 | 30.657 | 15.777 | — | — |
+| 81 | `fft(a)` | `(16, 65536)` complex64 F | 16.289 | 18.451 | 15.639 | — | — |
+| 86 | `ifft(a)` | `(64,)` complex64 strided | 19.345 | 26.466 | 13.220 | — | — |
+| 82 | `fft(a)` | `(64,)` complex64 strided | 13.673 | 16.092 | 12.984 | — | — |
+| 87 | `ifft(a)` | `(1048576,)` complex64 strided | 21.212 | 28.547 | 15.313 | — | — |
+| 83 | `fft(a)` | `(1048576,)` complex64 strided | 15.562 | 18.193 | 15.405 | — | — |
+
+#### R2C normalization
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 72 | `rfft(a, norm='forward')` | `(33,)` float32 C | 13.357 | 26.766 | 13.650 | — | — |
+| 73 | `rfft(a, norm='ortho')` | `(1048575,)` float32 C | 23.862 | 37.679 | 24.402 | — | — |
+| 78 | `rfftn(a, norm='forward')` | `(64, 64, 64)` float64 C | 29.436 | 34.214 | 18.777 | — | — |
+
+#### C2R transforms — input preservation and normalization
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 62 | `irfft(a)` | `(17,)` complex64 C | 29.184 | 58.520 | 39.484 | — | — |
+| 63 | `irfft(a)` | `(524289,)` complex64 C | 31.015 | 58.776 | 44.358 | — | — |
+| 66 | `irfft2(a)` | `(8, 9)` complex64 C | 42.005 | 59.651 | 42.623 | — | — |
+| 74 | `irfft2(a, norm='forward')` | `(8, 9)` complex64 C | 32.117 | 45.791 | 42.878 | — | — |
+| 75 | `irfft2(a, norm='ortho')` | `(512, 513)` complex64 C | 43.039 | 60.935 | 43.453 | — | — |
+| 67 | `irfft2(a)` | `(1024, 513)` complex64 C | 43.020 | 60.813 | 43.859 | — | — |
+| 70 | `irfftn(a)` | `(4, 8, 9)` complex64 C | 43.985 | 63.035 | 45.583 | — | — |
+| 71 | `irfftn(a)` | `(128, 64, 65)` complex64 C | 44.247 | 63.357 | 45.982 | — | — |
+| 79 | `irfftn(a, norm='ortho')` | `(64, 64, 33)` complex128 C | 44.277 | 63.520 | 46.162 | — | — |
+
+#### Unscaled C2C — full transforms
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | `fft(a, axis=-1)` | `(2,)` complex64 C | 7.642 | 15.987 | 13.121 | 10.965 | 7.338 |
+| 2 | `fft(a, axis=-1)` | `(8,)` complex64 C | 7.670 | 16.048 | 12.945 | 10.940 | 7.327 |
+| 3 | `fft(a, axis=-1)` | `(64,)` complex64 C | 7.699 | 16.311 | 13.228 | 11.043 | 7.312 |
+| 5 | `fft(a, axis=-1)` | `(65536,)` complex64 C | 9.500 | 18.322 | 15.590 | 12.928 | 9.122 |
+| 7 | `fftn(a, axes=(0, 1))` | `(2, 2)` complex64 C | 15.146 | 19.589 | 17.106 | 13.255 | 9.105 |
+| 8 | `fftn(a, axes=(0, 1))` | `(8, 8)` complex64 C | 15.282 | 19.719 | 17.104 | 13.291 | 9.132 |
+| 42 | `fftn(a, axes=(1, 0))` | `(8, 16)` complex64 C | 15.344 | 19.757 | 19.197 | — | — |
+| 50 | `fftn(a, axes=(0, -1))` | `(8, 16)` complex64 C | 15.136 | 19.714 | 19.138 | — | — |
+| 10 | `fftn(a, axes=(0, 1))` | `(128, 128)` complex64 C | 15.130 | 19.761 | 17.260 | 13.430 | 9.224 |
+| 12 | `fftn(a, axes=(0, 1, 2))` | `(2, 2, 2)` complex64 C | 17.532 | 21.700 | 18.896 | 15.093 | 10.902 |
+| 13 | `fftn(a, axes=(0, 1, 2))` | `(4, 4, 4)` complex64 C | 17.507 | 21.850 | 19.144 | 15.123 | 10.914 |
+| 15 | `fftn(a, axes=(0, 1, 2))` | `(64, 64, 64)` complex64 C | 17.756 | 22.299 | 19.493 | 15.458 | 10.972 |
+| 76 | `fft(a, norm=None)` | `(1048576,)` complex128 C | 9.630 | 18.214 | 15.443 | — | — |
+
+#### Unscaled C2C — batched and nonadjacent axes
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 38 | `fftn(a, axes=(1,))` | `(3, 16)` complex64 C | 8.892 | 16.793 | 16.212 | — | — |
+| 39 | `fftn(a, axes=(1,))` | `(16, 65536)` complex64 C | 10.756 | 19.140 | 18.451 | — | — |
+| 52 | `fftn(a, axes=(2, 3))` | `(2, 3, 8, 16)` complex64 C | 15.914 | 20.276 | 19.748 | — | — |
+| 53 | `fftn(a, axes=(2, 3))` | `(2, 4, 256, 512)` complex64 C | 15.964 | 20.557 | 19.988 | — | — |
+| 44 | `fftn(a, axes=(0, 2))` | `(4, 3, 8)` complex64 C | 33.912 | 20.259 | 19.662 | — | — |
+| 46 | `fftn(a, axes=[0, 2])` | `(4, 3, 8)` complex64 C | 35.063 | 20.285 | 19.768 | — | — |
+| 48 | `fftn(a, axes=(np.int64(0), np.int64(2)))` | `(4, 3, 8)` complex64 C | 36.718 | 21.064 | 19.979 | — | — |
+| 45 | `fftn(a, axes=(0, 2))` | `(128, 4, 1024)` complex64 C | 35.293 | 20.752 | 20.059 | — | — |
+| 47 | `fftn(a, axes=[0, 2])` | `(128, 4, 1024)` complex64 C | 37.031 | 20.773 | 20.053 | — | — |
+| 49 | `fftn(a, axes=(np.int64(0), np.int64(2)))` | `(128, 4, 1024)` complex64 C | 37.371 | 21.631 | 20.387 | — | — |
+
+#### Unscaled R2C transforms
+
+| ID | Request | Operand | Native | Original | Ajay | Minimal | Stateful |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 60 | `rfft(a)` | `(32,)` float32 C | 7.634 | 16.306 | 13.431 | — | — |
+| 61 | `rfft(a)` | `(1048576,)` float32 C | 11.504 | 20.507 | 17.826 | — | — |
+| 64 | `rfft2(a)` | `(8, 16)` float32 C | 15.670 | 19.758 | 17.136 | — | — |
+| 65 | `rfft2(a)` | `(1024, 1024)` float32 C | 15.994 | 20.183 | 17.650 | — | — |
+| 68 | `rfftn(a)` | `(4, 8, 16)` float32 C | 17.037 | 21.587 | 18.172 | — | — |
+| 69 | `rfftn(a)` | `(128, 64, 128)` float32 C | 16.947 | 21.737 | 18.297 | — | — |
+
+![Warm CPU times and paired Ajay-minus-Native gaps, in table order](warm-cpu-comparison.png)
 
 

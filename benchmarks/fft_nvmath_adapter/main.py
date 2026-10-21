@@ -1,6 +1,6 @@
 """Measure warm original/ajay/native CuPy FFT paths and bound nvmath execution across curated operands.
 
-The sweep measures CPU host latency, with the exact minimal cached lifecycle
+The sweep measures CPU host latency and GPU event intervals, with the exact minimal cached lifecycle
 included only for comparable C2C default-forward cases. GPU event intervals
 include host submission gaps. This is coverage, not a workload frequency model.
 Install this checkout with nvmath candidate 84d59bc before running.
@@ -13,6 +13,7 @@ import gc
 import hashlib
 import importlib
 import importlib.machinery
+import importlib.metadata
 import importlib.util
 import inspect
 import itertools
@@ -24,6 +25,7 @@ import platform
 import random
 import re
 import sys
+import time
 import warnings
 from pathlib import Path
 from statistics import median
@@ -58,6 +60,48 @@ def identity(path):
         "path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
     }
+
+
+def installed_version(package):
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def prepare_call(function, operand, kwargs, adapter, nf):
+    """Record first-miss host preparation; remove all wrappers before timing."""
+    elapsed = {name: 0 for name in ("construct", "compile_epilog", "plan")}
+    missing, previous = object(), []
+
+    def measured(name, target):
+        def call(*args, **keywords):
+            start = time.perf_counter_ns()
+            try:
+                return target(*args, **keywords)
+            finally:
+                elapsed[name] += time.perf_counter_ns() - start
+        return call
+
+    try:
+        for owner, attribute, phase in (
+            (adapter.CachedFFT, "__init__", "construct"),
+            (nf, "compile_epilog", "compile_epilog"),
+            (adapter.CachedFFT, "plan", "plan"),
+        ):
+            previous.append(
+                (owner, attribute, vars(owner).get(attribute, missing)))
+            setattr(owner, attribute,
+                    measured(phase, getattr(owner, attribute)))
+        output = function(operand, **kwargs)
+    finally:
+        for owner, attribute, original in reversed(previous):
+            if original is missing:
+                delattr(owner, attribute)
+            else:
+                setattr(owner, attribute, original)
+    return output, {name + "_cpu_us": value / 1000
+                    for name, value in elapsed.items()}
 
 
 def load(filename):
@@ -207,6 +251,14 @@ def summarize(blocks, labels):
     }
     result = {
         "rows_cpu_us": rows,
+        "rows_gpu_us": {
+            label: median(b["rows"][label]["gpu_median_us"] for b in blocks)
+            for label in labels
+        },
+        "paired_gpu_us": {
+            name: median(b["paired_gpu_us"][name] for b in blocks)
+            for name in pairs
+        },
         **{name: median(v) for name, v in values.items()},
     }
     result["sign_counts"] = {
@@ -300,6 +352,10 @@ def main():
     from cupyx.profiler import benchmark
 
     adapter = importlib.import_module("cupy.fft._fft_nvmath")
+    check(
+        hasattr(nf, "compile_epilog"),
+        "Requires nvmath's documented compile_epilog API",
+    )
     expected_adapter = (
         Path(__file__).resolve().parents[2] / "cupy" / "fft" / "_fft_nvmath.py"
     )
@@ -365,6 +421,7 @@ def main():
         "benchmark": __file__,
         "cases": catalog.__file__,
         "adapter": adapter.__file__,
+        "normalization": inspect.getfile(inspect.unwrap(nf.compile_epilog)),
         "minimal_lifecycle": minimal.__file__,
         "nvmath_fft": inspect.getfile(nf.FFT),
         "public_fft": inspect.getfile(cp.fft.fft),
@@ -400,8 +457,14 @@ def main():
             "block_checkpoint": str(block_path),
         },
         "sources": {name: identity(path) for name, path in files.items()},
-        "measurement": "cupyx.profiler.benchmark CPU host latency; "
-        "output disposal timed; GPU intervals include host gaps",
+        "measurement": "cupyx.profiler.benchmark CPU host latency and "
+        "CUDA-event stream elapsed time; output disposal timed. "
+        "GPU intervals include host submission gaps, not isolated kernel time.",
+        "preparation_measurement": (
+            "Single first-miss host intervals for construction, compile_epilog "
+            "and plan; execution excluded. Wrappers removed before warm timing. "
+            "Compiler first use and driver caches affect these observations."
+        ),
         "limitations": "Curated cases have no production frequency weights. "
         "Only marked C2C default-forward cases use minimal and stateful. Native contrasts "
         "include backend plan, copy, scaling and output-layout differences; "
@@ -413,8 +476,8 @@ def main():
         },
         "validation": {
             "row_agreement": (
-                "nvmath rows bitwise before reference validation; "
-                "native checked independently against reference"
+                "Shared unscaled nvmath rows agree bitwise; "
+                "fused Ajay and native checked independently against reference"
             ),
             "reference": "NumPy FFT of the same input promoted to double",
             "accuracy": "per-batch relative L2 <= 100 * input dtype epsilon; "
@@ -456,6 +519,10 @@ def main():
                 "cuda_runtime": cp.cuda.runtime.runtimeGetVersion(),
                 "cuda_driver": cp.cuda.runtime.driverGetVersion(),
                 "stream_ptr": stream.ptr,
+                "callback_compiler": {
+                    package: installed_version(package)
+                    for package in ("numba", "numba-cuda", "llvmlite")
+                },
             }
             block_path.parent.mkdir(parents=True, exist_ok=True)
             block_path.write_text("")
@@ -492,6 +559,7 @@ def main():
                 outputs, minimal_cache = [], {}
                 stateful = None
                 native_outputs, native_plans, native_plan_info = [], {}, []
+                nvmath_plans = {}
                 hits_per_call = {"original": 1, "ajay": 1, "minimal": 0,
                                  "stateful": 0}
 
@@ -507,7 +575,9 @@ def main():
                 )
                 try:
                     select("ajay")
-                    warm = public(warm_operand, **kwargs)
+                    warm, ajay_preparation = prepare_call(
+                        public, warm_operand, kwargs, adapter, nf)
+                    preparation = {"ajay": ajay_preparation}
                     reference = getattr(np.fft, spec["public"])
                     warm_expected = reference(
                         warm_host.astype(reference_dtype), **kwargs)
@@ -519,7 +589,7 @@ def main():
                     cache_key, node = entries[0]
                     check(
                         isinstance(cache_key, tuple)
-                        and len(cache_key) == 3
+                        and len(cache_key) in (3, 5)
                         and cache_key[:2] == ("nvmath", stream.ptr),
                         "Warm request did not route to nvmath",
                     )
@@ -533,7 +603,30 @@ def main():
                         not plan.logger.isEnabledFor(logging.INFO),
                         "Disable nvmath INFO/DEBUG logging",
                     )
+                    # Scaling is baked into Ajay's callback plan. Original
+                    # keeps a separate ordinary plan for those requests;
+                    # unscaled rows still share the same cached object.
+                    original_warm = None
+                    if len(cache_key) == 5:
+                        select("original")
+                        original_warm, original_preparation = prepare_call(
+                            public, warm_operand, kwargs, adapter, nf)
+                        preparation["original"] = original_preparation
+                        outputs.append((original_warm, warm_expected))
+                    nvmath_plans = {key: node.plan for key, node in cache}
+                    original_key = ("nvmath", stream.ptr, cache_key[2])
+                    original_plan = nvmath_plans.get(original_key)
+                    check(
+                        all(isinstance(value, adapter.CachedFFT)
+                            and not value.inplace
+                            for value in nvmath_plans.values())
+                        and original_plan is not None
+                        and nvmath_plans.get(cache_key) is plan,
+                        "Original and Ajay warmups must use nvmath",
+                    )
                     if spec["minimal"]:
+                        check(original_plan is plan and len(cache_key) == 3,
+                              "Unscaled rows must share one cached plan")
                         key = adapter._create_key_from_operand(
                             operand, axes, options
                         )
@@ -553,7 +646,7 @@ def main():
                     native_warm = public(warm_operand, **kwargs)
                     native_outputs.append((native_warm, warm_expected))
                     for native_key, native_node in cache:
-                        if native_key == cache_key:
+                        if native_key in nvmath_plans:
                             continue
                         native_plan = native_node.plan
                         check(
@@ -574,8 +667,10 @@ def main():
                     def verify():
                         entries = {key: node.plan for key, node in cache}
                         check(
-                            len(entries) == 1 + len(native_plans)
-                            and entries.get(cache_key) is plan
+                            len(entries)
+                            == len(nvmath_plans) + len(native_plans)
+                            and all(entries.get(key) is value
+                                    for key, value in nvmath_plans.items())
                             and all(entries.get(key) is value
                                     for key, value in native_plans.items()),
                             "CuPy cache identities changed; both backend "
@@ -587,17 +682,18 @@ def main():
                                 and minimal_cache[(stream.ptr, key)] is plan,
                                 "Minimal dictionary changed",
                             )
-                        check(
-                            plan._operand_released
-                            and plan.operand.tensor is None,
-                            "Cached plan retained its operand",
-                        )
-                        check(
-                            plan.workspace.size == 0
-                            or (plan.workspace.ptr is None)
-                            == args.release_workspace,
-                            "Wrong workspace policy",
-                        )
+                        for cached in nvmath_plans.values():
+                            check(
+                                cached._operand_released
+                                and cached.operand.tensor is None,
+                                "Cached plan retained its operand",
+                            )
+                            check(
+                                cached.workspace.size == 0
+                                or (cached.workspace.ptr is None)
+                                == args.release_workspace,
+                                "Wrong workspace policy",
+                            )
 
                     verify()
                     comparisons = []
@@ -634,7 +730,8 @@ def main():
                                 outputs.append((out, wanted))
                             actual = out.get()
                             if label != "native":
-                                if previous is not None:
+                                if (previous is not None
+                                        and original_plan is plan):
                                     check(
                                         actual.dtype == previous.dtype
                                         and actual.shape == previous.shape
@@ -662,8 +759,9 @@ def main():
                                 "Wrong preflight cache path",
                             )
                             verify()
-                    # Establish row agreement for both operands before the
-                    # independent backend-versus-reference accuracy check.
+                    # Shared unscaled rows must agree bitwise. A fused
+                    # scaling plan may round differently; validate every row
+                    # independently against the same numerical reference.
                     accuracy = [
                         {"input": input_index, "row": label,
                          **reference_error(np, actual, wanted,
@@ -716,7 +814,7 @@ def main():
                     }
                     outputs.clear()
                     native_outputs.clear()
-                    del out, warm, native_warm, fresh
+                    del out, warm, original_warm, native_warm, fresh
                     calls = {
                         label: (public, (operand,), kwargs)
                         for label in ("original", "ajay", "native")
@@ -739,6 +837,7 @@ def main():
                         "case": spec,
                         "rows": labels,
                         "operand_shape": operand.shape,
+                        "preparation": preparation,
                         "operand_strides": operand.strides,
                         "canonical_key_repr": repr(cache_key[2]),
                         "runtime_axes": repr(
@@ -752,6 +851,21 @@ def main():
                         },
                         "cache_hits_per_call": {
                             label: hits_per_call[label] for label in labels
+                        },
+                        "nvmath_plans": {
+                            label: {
+                                "key": repr(plan_key),
+                                "fused_scaling": getattr(
+                                    cached, "_cupy_fft_epilog_ltoir", None
+                                ) is not None,
+                                "divisor": getattr(
+                                    cached, "_cupy_fft_epilog_divisor", None
+                                ),
+                            }
+                            for label, plan_key, cached in (
+                                ("original", original_key, original_plan),
+                                ("ajay", cache_key, plan),
+                            )
                         },
                         "native_plans": native_plan_info,
                         "output_metadata": output_metadata,
@@ -804,6 +918,8 @@ def main():
                                 "cpu_seconds": cpu_times,
                                 "gpu_seconds": result.gpu_times.tolist(),
                                 "cpu_median_us": median(cpu_times) * 1e6,
+                                "gpu_median_us": median(
+                                    result.gpu_times[0].tolist()) * 1e6,
                             }
                         check(
                             sys.getrefcount(operand) == references,
@@ -812,6 +928,12 @@ def main():
                         block["paired_cpu_us"] = {
                             name: block["rows"][a]["cpu_median_us"]
                             - block["rows"][b]["cpu_median_us"]
+                            for name, (a, b) in PAIRS.items()
+                            if a in labels and b in labels
+                        }
+                        block["paired_gpu_us"] = {
+                            name: block["rows"][a]["gpu_median_us"]
+                            - block["rows"][b]["gpu_median_us"]
                             for name, (a, b) in PAIRS.items()
                             if a in labels and b in labels
                         }
@@ -868,6 +990,16 @@ def main():
                         f"{summary['ajay_minus_native']:+.3f} us",
                         flush=True,
                     )
+                    print(
+                        "  GPU event us (includes host gaps): "
+                        + ", ".join(
+                            f"{label}={summary['rows_gpu_us'][label]:.3f}"
+                            for label in labels
+                        )
+                        + "; ajay-minus-native "
+                        f"{summary['paired_gpu_us']['ajay_minus_native']:+.3f} us",
+                        flush=True,
+                    )
                 finally:
                     fft_module._try_use_nvmath = old_hook
                     cp.fft.config.use_nvmath = True
@@ -877,6 +1009,7 @@ def main():
                     cache.clear()
                     minimal_cache.clear()
                     native_plans.clear()
+                    nvmath_plans.clear()
                     outputs.clear()
                     native_outputs.clear()
                     if gc_enabled:
