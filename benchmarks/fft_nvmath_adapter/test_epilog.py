@@ -1,4 +1,4 @@
-"""CPU-only checks of Ajay's normalization epilog and cache lifecycle.
+"""CPU-only checks of Ajay's epilog, reset selection and cache lifecycle.
 
 The real functions are extracted from the adapter so these checks do not import
 CuPy or initialize CUDA. Numerical correctness is checked by the GPU benchmark.
@@ -97,6 +97,7 @@ class TestEpilog(unittest.TestCase):
         class Plan:
             def __init__(self, operand, *, axes, options, execution, stream):
                 self.freed = self.released = self.resets = 0
+                self.prepared_resets = 0
                 self.device_id = 0
                 self.fft_abstract_type = options
                 shape = list(operand.shape)
@@ -123,6 +124,11 @@ class TestEpilog(unittest.TestCase):
             def reset_operand_unchecked(self, operand, **kwargs):
                 self.resets += 1
 
+            def _reset_operand_unchecked_prepared(self, operand, *, stream):
+                self.prepared_resets += 1
+                self.prepared_operand = operand
+                self.prepared_stream = stream
+
             def release_operand(self):
                 self.released += 1
 
@@ -148,9 +154,15 @@ class TestEpilog(unittest.TestCase):
         tree = ast.parse(ADAPTER.read_text())
         selected = ast.Module(body=[
             node for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS
+            if (isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS
+                or isinstance(node, ast.ClassDef)
+                and node.name == '_PreparedC2RCachedFFT'
+                or isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name)
+                        and target.id == '_C2R_FFT'
+                        for target in node.targets))
         ], type_ignores=[])
-        self.assertEqual(len(selected.body), len(FUNCTIONS))
+        self.assertEqual(len(selected.body), len(FUNCTIONS) + 2)
         exec(compile(selected, str(ADAPTER), 'exec'), self.ns)
 
     def invoke(self, *, norm='backward', direction='inverse', kind='C2C',
@@ -297,6 +309,85 @@ class TestEpilog(unittest.TestCase):
         self.invoke(kind='C2R', operand=Array((8, 9)), axes=(0, 1))
         self.assertEqual(self.plans[0]._cupy_fft_epilog_divisor, 128)
         self.assertEqual(self.compilations, [(128, 'float32', 0)])
+
+    def test_c2r_subclass_keeps_execute_and_selects_prepared_reset(self):
+        candidate = self.ns['_PreparedC2RCachedFFT']
+        self.assertIs(candidate.execute, self.ns['CachedFFT'].execute)
+        first, second = Array((17,)), Array((17,))
+        self.invoke(kind='C2R', operand=first)
+        plan = self.plans[0]
+        self.assertIs(type(plan), candidate)
+        self.assertIs(next(iter(self.cache))[-1], candidate)
+        self.invoke(kind='C2R', operand=second)
+        self.assertEqual(plan.resets, 0)
+        self.assertEqual(plan.prepared_resets, 1)
+        self.assertIs(plan.prepared_operand, second)
+        self.assertIs(plan.prepared_stream, self.stream)
+        self.assertEqual(plan.released, 2)
+        self.assertEqual(len(self.compilations), 1)
+
+    def test_c2r_plans_do_not_reuse_original_even_without_scaling(self):
+        operand = Array((17,))
+        original = self.ns['CachedFFT'](
+            operand, axes=(0,), options='C2R', execution='cuda',
+            stream=self.stream)
+        original_key = ('nvmath', 7, ((17,), (0,), 'C2R'))
+        self.cache[original_key] = original
+        for norm, key_length in (
+                ('forward', 4), ('backward', 6), ('ortho', 6)):
+            with self.subTest(norm=norm):
+                output = self.invoke(kind='C2R', operand=operand, norm=norm)
+                key, plan = next((key, plan)
+                                for key, plan in self.cache.items()
+                                if plan.output is output)
+                self.assertEqual(key[:3], original_key)
+                self.assertEqual(len(key), key_length)
+                self.assertIs(key[-1], self.ns['_PreparedC2RCachedFFT'])
+                self.assertIsNot(plan, original)
+        self.assertEqual(original.resets, 0)
+        self.assertEqual(original.prepared_resets, 0)
+        self.assertIs(self.cache[original_key], original)
+        self.assertEqual(len(self.cache), 4)
+
+    def test_c2r_fused_control_and_prepared_use_separate_plans(self):
+        operand = Array((17,))
+        control = self.ns['CachedFFT']
+        candidate = self.ns['_PreparedC2RCachedFFT']
+        for norm in ('forward', 'backward'):
+            with self.subTest(norm=norm):
+                self.ns['_C2R_FFT'] = control
+                control_out = self.invoke(
+                    kind='C2R', operand=operand, norm=norm)
+                control_plan = self.plans[-1]
+                self.ns['_C2R_FFT'] = candidate
+                candidate_out = self.invoke(
+                    kind='C2R', operand=operand, norm=norm)
+                candidate_plan = self.plans[-1]
+                self.assertIsNot(control_out, candidate_out)
+                self.assertIs(type(control_plan), control)
+                self.assertIs(type(candidate_plan), candidate)
+                self.ns['_C2R_FFT'] = control
+                self.assertIs(self.invoke(
+                    kind='C2R', operand=operand, norm=norm), control_out)
+                self.ns['_C2R_FFT'] = candidate
+                self.assertIs(self.invoke(
+                    kind='C2R', operand=operand, norm=norm), candidate_out)
+                self.assertEqual(control_plan.resets, 1)
+                self.assertEqual(control_plan.prepared_resets, 0)
+                self.assertEqual(candidate_plan.resets, 0)
+                self.assertEqual(candidate_plan.prepared_resets, 1)
+        self.assertEqual(len(self.cache), 4)
+        self.assertEqual(len(self.compilations), 2)
+
+    def test_other_fft_families_keep_the_base_class_and_key(self):
+        for kind in ('C2C', 'R2C'):
+            with self.subTest(kind=kind):
+                self.invoke(kind=kind, direction='forward')
+                plan = self.plans[-1]
+                self.assertIs(type(plan), self.ns['CachedFFT'])
+                self.assertIn(
+                    ('nvmath', 7, ((1024,), (0,), kind)), self.cache)
+                self.assertEqual(plan.prepared_resets, 0)
 
     def test_r2c_divisor_uses_real_input(self):
         self.invoke(kind='R2C', direction='forward', norm='forward',

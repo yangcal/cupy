@@ -69,6 +69,18 @@ class CachedFFT(nvmath_fft.FFT):
         return None
 
 
+class _PreparedC2RCachedFFT(CachedFFT):
+    """Use nvmath's experimental prepared copy when rebinding a C2R input."""
+
+    def reset_operand_unchecked(self, operand, *, stream=None):
+        return self._reset_operand_unchecked_prepared(operand, stream=stream)
+
+
+# The benchmark can select CachedFFT for the fused-scaling control. Keep this
+# choice local to Ajay's C2R plans; nvmath's FFT class is never patched.
+_C2R_FFT = _PreparedC2RCachedFFT
+
+
 def _normalize_axes(ndim, axes):
     if axes is None:
         axes = tuple(range(ndim))
@@ -435,8 +447,8 @@ def _try_use_nvmath_ajay(
     # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
     # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
     # A store callback bakes the normalization into the plan. Keep those
-    # plans separate from Original and from other norms/directions; requests
-    # without scaling still share the original cache entry.
+    # plans separate from Original and from other norms/directions. Unscaled
+    # C2C/R2C requests still share the original cache entry.
     needs_scaling = (
         norm == 'ortho'
         or norm == 'backward' and fft_direction == 'inverse'
@@ -444,6 +456,10 @@ def _try_use_nvmath_ajay(
     key = ('nvmath', stream.ptr, nvmath_key)
     if needs_scaling:
         key += (norm, fft_direction)
+    if fft_type == 'C2R':
+        # The reset implementation is part of this experiment's plan identity.
+        # Neither Original nor the fused-scaling control may reuse it.
+        key += (_C2R_FFT,)
     cache = get_plan_cache()
     plan = cache.get(key)
     cache_miss = plan is None
@@ -456,7 +472,8 @@ def _try_use_nvmath_ajay(
 
     if cache_miss:
         try:
-            plan = CachedFFT(
+            plan_class = _C2R_FFT if fft_type == 'C2R' else CachedFFT
+            plan = plan_class(
                 operand,
                 axes=axes,
                 options=options,

@@ -1,9 +1,13 @@
-"""Measure warm original/ajay/native CuPy FFT paths and bound nvmath execution across curated operands.
+"""Measure warm CuPy FFT paths and bound nvmath execution across operands.
 
-The sweep measures CPU host latency and GPU event intervals, with the exact minimal cached lifecycle
+The sweep measures CPU host latency and GPU event intervals, with the exact
+minimal cached lifecycle
 included only for comparable C2C default-forward cases. GPU event intervals
 include host submission gaps. This is coverage, not a workload frequency model.
-Install this checkout with nvmath candidate 84d59bc before running.
+Use --case irfft --compare-c2r-reset --blocks 24 to isolate prepared C2R
+reset against the same fused adapter using the original operand reset.
+Install this checkout with the nvmath prepared-C2R-reset candidate;
+its execute implementation remains pinned to candidate 84d59bc.
 """
 
 from __future__ import annotations
@@ -42,6 +46,8 @@ PAIRS = {
     "original_minus_ajay": ("original", "ajay"),
     "original_minus_native": ("original", "native"),
     "ajay_minus_native": ("ajay", "native"),
+    "fused_minus_ajay": ("fused", "ajay"),
+    "fused_minus_native": ("fused", "native"),
     "minimal_minus_native": ("minimal", "native"),
     "minimal_minus_stateful": ("minimal", "stateful"),
     "ajay_minus_stateful": ("ajay", "stateful"),
@@ -70,7 +76,7 @@ def installed_version(package):
 
 
 def prepare_call(function, operand, kwargs, adapter, nf):
-    """Record first-miss host preparation; remove all wrappers before timing."""
+    """Record miss preparation; remove all wrappers before warm timing."""
     elapsed = {name: 0 for name in ("construct", "compile_epilog", "plan")}
     missing, previous = object(), []
 
@@ -279,6 +285,16 @@ def summarize(blocks, labels):
         and percent <= -2
         and slower >= math.ceil(len(blocks) * 10 / 12)
     )
+    if "fused" in labels:
+        delta = result["fused_minus_ajay"]
+        percent = 100 * delta / rows["fused"]
+        result["fused_minus_ajay_percent"] = percent
+        result["fused_negative_median"] = delta < 0
+        result["fused_material_regression_candidate"] = (
+            delta <= -0.2 and percent <= -2
+            and result["sign_counts"]["fused_minus_ajay"]["negative"]
+            >= math.ceil(len(blocks) * 10 / 12)
+        )
     return result
 
 
@@ -303,6 +319,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=500)
     parser.add_argument("--warmups", type=int, default=20)
     parser.add_argument("--release-workspace", action="store_true")
+    parser.add_argument(
+        "--compare-c2r-reset", action="store_true",
+        help="C2R cases only: compare the fused adapter with original versus "
+             "prepared operand reset; requires blocks divisible by 24",
+    )
     args = parser.parse_args()
     catalog = load("cases.py")
     cases = getattr(catalog, args.suite)()
@@ -310,12 +331,18 @@ def main():
         cases = [s for s in cases if args.case_filter in s["name"]]
     if not cases:
         parser.error("No cases match --case")
+    if args.compare_c2r_reset and not all(
+        spec["public"].startswith("irfft") for spec in cases
+    ):
+        parser.error("--compare-c2r-reset requires only C2R cases; "
+                     "use --case irfft")
     if args.list_cases:
         for spec in cases:
             rows = (
+                "original/fused/ajay/native" if args.compare_c2r_reset else (
                 "original/ajay/minimal/native/stateful"
                 if spec["minimal"] else "original/ajay/native"
-            )
+            ))
             print(
                 f"{spec['name']}: {spec['public']} {spec['shape']} "
                 f"{spec['dtype']} {spec['layout']} {spec['kwargs']} "
@@ -323,7 +350,10 @@ def main():
             )
         print(f"{len(cases)} cases")
         return
-    permutation_count = 30 if any(s["minimal"] for s in cases) else 6
+    permutation_count = (
+        24 if args.compare_c2r_reset
+        else 30 if any(s["minimal"] for s in cases) else 6
+    )
     if (
         args.blocks < permutation_count
         or args.blocks % permutation_count
@@ -404,6 +434,10 @@ def main():
         "Requires compiled element_strides without substitution",
     )
     check(adapter.CachedFFT.execute is nf.FFT.execute, "Different FFT execute")
+    check(hasattr(nf.FFT, "_reset_operand_unchecked_prepared"),
+          "Requires the nvmath prepared C2R reset candidate")
+    c2r_fft = adapter._C2R_FFT
+    check(c2r_fft.execute is nf.FFT.execute, "Different C2R FFT execute")
     fft_module = importlib.import_module("cupy.fft._fft")
     old_hook = fft_module._try_use_nvmath
     check(
@@ -415,6 +449,7 @@ def main():
         cp.fft.config.use_nvmath,
         cp.fft.config.use_multi_gpus,
         adapter._RELEASE_WORKSPACE,
+        adapter._C2R_FFT,
     )
     gc_enabled, cache, cache_owned = gc.isenabled(), None, False
     files = {
@@ -459,14 +494,17 @@ def main():
         "sources": {name: identity(path) for name, path in files.items()},
         "measurement": "cupyx.profiler.benchmark CPU host latency and "
         "CUDA-event stream elapsed time; output disposal timed. "
-        "GPU intervals include host submission gaps, not isolated kernel time.",
+        "GPU intervals include host submission gaps, "
+        "not isolated kernel time.",
         "preparation_measurement": (
-            "Single first-miss host intervals for construction, compile_epilog "
-            "and plan; execution excluded. Wrappers removed before warm timing. "
+            "Single first-miss host intervals for construction, "
+            "compile_epilog and plan; execution excluded. "
+            "Wrappers removed before warm timing. "
             "Compiler first use and driver caches affect these observations."
         ),
         "limitations": "Curated cases have no production frequency weights. "
-        "Only marked C2C default-forward cases use minimal and stateful. Native contrasts "
+        "Only marked C2C default-forward cases use minimal and stateful. "
+        "Native contrasts "
         "include backend plan, copy, scaling and output-layout differences; "
         "release_workspace applies only to the nvmath rows.",
         "candidate_threshold": {
@@ -547,23 +585,31 @@ def main():
                 )
                 hooks = {
                     "original": adapter._try_use_nvmath,
+                    "fused": adapter._try_use_nvmath_ajay,
                     "ajay": adapter._try_use_nvmath_ajay,
                 }
                 labels = (
+                    ("original", "fused", "ajay", "native")
+                    if args.compare_c2r_reset else (
                     ("original", "ajay", "minimal", "native", "stateful")
                     if spec["minimal"]
                     else ("original", "ajay", "native")
-                )
+                ))
                 axes = tuple(range(operand.ndim))
                 options = adapter._FFT_OPTIONS["C2C"]
                 outputs, minimal_cache = [], {}
                 stateful = None
                 native_outputs, native_plans, native_plan_info = [], {}, []
                 nvmath_plans = {}
-                hits_per_call = {"original": 1, "ajay": 1, "minimal": 0,
-                                 "stateful": 0}
+                hits_per_call = {
+                    "original": 1, "fused": 1, "ajay": 1,
+                    "minimal": 0, "stateful": 0}
 
                 def select(label):
+                    # Select reset before each benchmark call;
+                    # the timed public FFT call keeps its usual signature.
+                    adapter._C2R_FFT = (
+                        adapter.CachedFFT if label == "fused" else c2r_fft)
                     cp.fft.config.use_nvmath = label != "native"
                     fft_module._try_use_nvmath = hooks.get(
                         label, hooks["original"]
@@ -589,7 +635,7 @@ def main():
                     cache_key, node = entries[0]
                     check(
                         isinstance(cache_key, tuple)
-                        and len(cache_key) in (3, 5)
+                        and len(cache_key) in (3, 4, 5, 6)
                         and cache_key[:2] == ("nvmath", stream.ptr),
                         "Warm request did not route to nvmath",
                     )
@@ -603,18 +649,38 @@ def main():
                         not plan.logger.isEnabledFor(logging.INFO),
                         "Disable nvmath INFO/DEBUG logging",
                     )
-                    # Scaling is baked into Ajay's callback plan. Original
-                    # keeps a separate ordinary plan for those requests;
-                    # unscaled rows still share the same cached object.
+                    # Baked scaling and the C2R reset class distinguish Ajay
+                    # plans from Original; other unscaled rows share one plan.
                     original_warm = None
-                    if len(cache_key) == 5:
+                    original_key = ("nvmath", stream.ptr, cache_key[2])
+                    if cache_key != original_key:
                         select("original")
                         original_warm, original_preparation = prepare_call(
                             public, warm_operand, kwargs, adapter, nf)
                         preparation["original"] = original_preparation
                         outputs.append((original_warm, warm_expected))
+                    fused_warm, fused_plan, fused_key = None, None, None
+                    if args.compare_c2r_reset:
+                        before_fused = {key for key, _ in cache}
+                        select("fused")
+                        fused_warm, fused_preparation = prepare_call(
+                            public, warm_operand, kwargs, adapter, nf)
+                        preparation["fused"] = fused_preparation
+                        outputs.append((fused_warm, warm_expected))
+                        fused_entries = [
+                            (key, node.plan) for key, node in cache
+                            if key not in before_fused]
+                        check(len(fused_entries) == 1,
+                              "Expected one separate fused reference plan")
+                        fused_key, fused_plan = fused_entries[0]
+                        check(type(fused_plan) is adapter.CachedFFT
+                              and type(plan) is c2r_fft
+                              and fused_key[:-1] == cache_key[:-1]
+                              and fused_key[-1] is adapter.CachedFFT
+                              and cache_key[-1] is c2r_fft,
+                              "Fused and prepared rows must differ "
+                              "only in reset class")
                     nvmath_plans = {key: node.plan for key, node in cache}
-                    original_key = ("nvmath", stream.ptr, cache_key[2])
                     original_plan = nvmath_plans.get(original_key)
                     check(
                         all(isinstance(value, adapter.CachedFFT)
@@ -695,6 +761,16 @@ def main():
                                 "Wrong workspace policy",
                             )
 
+                    def verify_c2r_reset(label):
+                        if (label != "ajay"
+                                or not spec["public"].startswith("irfft")):
+                            return
+                        info = getattr(plan, "_c2r_reset_prepared_info", None)
+                        check(type(plan) is c2r_fft and info is not None
+                              and info["eligible"]
+                              and plan._c2r_reset_prepared_last_used,
+                              f"Prepared C2R reset was not used: {info!r}")
+
                     verify()
                     comparisons = []
                     for input_index, (fresh, values, wanted) in enumerate((
@@ -706,7 +782,7 @@ def main():
                             select(label)
                             before = counts(cache)
                             if label == "stateful":
-                                # Rebinding only for untimed two-input validation.
+                                # Rebind for untimed two-input validation.
                                 stateful.reset_operand_unchecked(
                                     fresh, stream=stream)
                                 out = stateful.execute(
@@ -724,6 +800,7 @@ def main():
                                 )
                             else:
                                 out = public(fresh, **kwargs)
+                            verify_c2r_reset(label)
                             if label == "native":
                                 native_outputs.append((out, wanted))
                             else:
@@ -731,7 +808,9 @@ def main():
                             actual = out.get()
                             if label != "native":
                                 if (previous is not None
-                                        and original_plan is plan):
+                                        and (original_plan is plan
+                                             or args.compare_c2r_reset
+                                             and label == "ajay")):
                                     check(
                                         actual.dtype == previous.dtype
                                         and actual.shape == previous.shape
@@ -814,10 +893,12 @@ def main():
                     }
                     outputs.clear()
                     native_outputs.clear()
-                    del out, warm, original_warm, native_warm, fresh
+                    del (out, warm, original_warm, fused_warm,
+                         native_warm, fresh)
                     calls = {
                         label: (public, (operand,), kwargs)
-                        for label in ("original", "ajay", "native")
+                        for label in ("original", "fused", "ajay", "native")
+                        if label in labels
                     }
                     if spec["minimal"]:
                         calls["minimal"] = (
@@ -826,13 +907,18 @@ def main():
                             {"release_workspace": args.release_workspace},
                         )
                         # The timed object remains bound to this operand.
-                        stateful.reset_operand_unchecked(operand, stream=stream)
+                        stateful.reset_operand_unchecked(
+                            operand, stream=stream)
                         calls["stateful"] = (
                             stateful.execute, (),
                             {"direction": nf.FFTDirection.FORWARD,
                              "stream": stream,
                              "release_workspace": args.release_workspace},
                         )
+                    plan_rows = [("original", original_key, original_plan),
+                                 ("ajay", cache_key, plan)]
+                    if args.compare_c2r_reset:
+                        plan_rows.insert(1, ("fused", fused_key, fused_plan))
                     case = {
                         "case": spec,
                         "rows": labels,
@@ -861,11 +947,23 @@ def main():
                                 "divisor": getattr(
                                     cached, "_cupy_fft_epilog_divisor", None
                                 ),
+                                "reset_method": (
+                                    cached.reset_operand_unchecked
+                                    .__func__.__qualname__),
+                                "c2r_preparation": {
+                                    "selected": (
+                                        cached.fft_abstract_type == "C2R"
+                                        and type(cached) is c2r_fft),
+                                    "info": getattr(
+                                        cached, "_c2r_reset_prepared_info",
+                                        None),
+                                    "last_used": getattr(
+                                        cached,
+                                        "_c2r_reset_prepared_last_used",
+                                        False),
+                                },
                             }
-                            for label, plan_key, cached in (
-                                ("original", original_key, original_plan),
-                                ("ajay", cache_key, plan),
-                            )
+                            for label, plan_key, cached in plan_rows
                         },
                         "native_plans": native_plan_info,
                         "output_metadata": output_metadata,
@@ -908,11 +1006,13 @@ def main():
                                 "Timed cache path changed",
                             )
                             verify()
+                            verify_c2r_reset(label)
                             if stateful is not None:
                                 check(
                                     not stateful._operand_released
                                     and stateful.operand.tensor is operand,
-                                    "Stateful row lost its continuously bound operand",
+                                    "Stateful row lost its continuously "
+                                    "bound operand",
                                 )
                             block["rows"][label] = {
                                 "cpu_seconds": cpu_times,
@@ -955,20 +1055,31 @@ def main():
                     case["summary"] = summarize(case["blocks"], labels)
                     np.testing.assert_array_equal(operand.get(), host)
                     summary = case["summary"]
+                    reference_pair = (
+                        "fused_minus_ajay" if args.compare_c2r_reset
+                        else "original_minus_ajay")
+                    negative_key = (
+                        "fused_negative_median" if args.compare_c2r_reset
+                        else "negative_median")
+                    material_key = (
+                        "fused_material_regression_candidate"
+                        if args.compare_c2r_reset
+                        else "material_regression_candidate")
+                    percent_key = reference_pair + "_percent"
                     tag = (
                         "REGRESSION"
-                        if summary["negative_median"]
+                        if summary[negative_key]
                         else "saving"
                     )
-                    if summary["material_regression_candidate"]:
+                    if summary[material_key]:
                         tag += " candidate"
-                    slower = summary["sign_counts"]["original_minus_ajay"][
+                    slower = summary["sign_counts"][reference_pair][
                         "negative"
                     ]
                     print(
                         f"{spec['name']}: {tag} "
-                        f"{summary['original_minus_ajay']:+.3f} us "
-                        f"({summary['original_minus_ajay_percent']:+.2f}%); "
+                        f"{reference_pair} {summary[reference_pair]:+.3f} us "
+                        f"({summary[percent_key]:+.2f}%); "
                         f"ajay slower in {slower}/{args.blocks} blocks",
                         flush=True,
                     )
@@ -997,11 +1108,13 @@ def main():
                             for label in labels
                         )
                         + "; ajay-minus-native "
-                        f"{summary['paired_gpu_us']['ajay_minus_native']:+.3f} us",
+                        f"{summary['paired_gpu_us']['ajay_minus_native']:+.3f}"
+                        " us",
                         flush=True,
                     )
                 finally:
                     fft_module._try_use_nvmath = old_hook
+                    adapter._C2R_FFT = c2r_fft
                     cp.fft.config.use_nvmath = True
                     stream.synchronize()
                     if stateful is not None:
@@ -1018,7 +1131,9 @@ def main():
             payload["negative_cases"] = [
                 c["case"]["name"]
                 for c in payload["cases"]
-                if c["summary"]["negative_median"]
+                if c["summary"][
+                    "fused_negative_median" if args.compare_c2r_reset
+                    else "negative_median"]
             ]
             print(
                 "Negative paired medians: "
@@ -1037,6 +1152,7 @@ def main():
             cp.fft.config.use_nvmath,
             cp.fft.config.use_multi_gpus,
             adapter._RELEASE_WORKSPACE,
+            adapter._C2R_FFT,
         ) = settings
         os.sched_setaffinity(0, affinity)
         if gc_enabled:
