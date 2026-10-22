@@ -6,7 +6,7 @@ included only for comparable C2C default-forward cases. GPU event intervals
 include host submission gaps. This is coverage, not a workload frequency model.
 Use --case irfft --compare-c2r-reset --blocks 24 to isolate prepared C2R
 reset against the same fused adapter using the original operand reset.
-Install this checkout with the nvmath prepared-C2R-reset candidate;
+Install this checkout with prepared copying in nvmath reset_operand_unchecked;
 its execute implementation remains pinned to candidate 84d59bc.
 """
 
@@ -39,6 +39,9 @@ EXECUTE_SHA = (
 )
 MINIMAL_SHA = (
     "f436d4536041b066494a2d8ba487ef192514d9159d1d2023c3331245cc7a4cf1"
+)
+REFERENCE_RESET_SHA = (
+    "546f6caa821abf6a0a14a3bbb2e795e0421335a9c7aad5d0cf03fda543f99a19"
 )
 PAIRS = {
     "original_minus_minimal": ("original", "minimal"),
@@ -119,6 +122,16 @@ def load(filename):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def select_reset(fft_class, method, plans=()):
+    """Select a row's reset outside timing, without changing nvmath's class."""
+    fft_class.reset_operand_unchecked = method
+    for plan in plans:
+        if getattr(plan, "fft_abstract_type", None) == "C2R":
+            # Shared plans can retain a recipe from the preceding Ajay row.
+            # This diagnostic describes the next row's reset, not that recipe.
+            plan._c2r_reset_prepared_last_used = False
 
 
 def counts(cache):
@@ -434,10 +447,20 @@ def main():
         "Requires compiled element_strides without substitution",
     )
     check(adapter.CachedFFT.execute is nf.FFT.execute, "Different FFT execute")
-    check(hasattr(nf.FFT, "_reset_operand_unchecked_prepared"),
-          "Requires the nvmath prepared C2R reset candidate")
-    c2r_fft = adapter._C2R_FFT
-    check(c2r_fft.execute is nf.FFT.execute, "Different C2R FFT execute")
+    check(hasattr(nf.FFT, "_try_reset_c2r_operand"),
+          "Requires prepared C2R copying in nvmath reset_operand_unchecked")
+    reset_reference = load("reference_reset.py")
+    reference_sha = hashlib.sha256(
+        inspect.getsource(reset_reference.reset_operand_unchecked).encode()
+    ).hexdigest()
+    check(reference_sha == REFERENCE_RESET_SHA,
+          "Reference reset differs from the retained nvmath implementation")
+    nvmath_reset = nf.FFT.reset_operand_unchecked
+    check(adapter.CachedFFT.reset_operand_unchecked is nvmath_reset,
+          "Ajay must use nvmath's existing reset API directly")
+    missing = object()
+    previous_reset = vars(adapter.CachedFFT).get(
+        "reset_operand_unchecked", missing)
     fft_module = importlib.import_module("cupy.fft._fft")
     old_hook = fft_module._try_use_nvmath
     check(
@@ -449,7 +472,6 @@ def main():
         cp.fft.config.use_nvmath,
         cp.fft.config.use_multi_gpus,
         adapter._RELEASE_WORKSPACE,
-        adapter._C2R_FFT,
     )
     gc_enabled, cache, cache_owned = gc.isenabled(), None, False
     files = {
@@ -458,6 +480,7 @@ def main():
         "adapter": adapter.__file__,
         "normalization": inspect.getfile(inspect.unwrap(nf.compile_epilog)),
         "minimal_lifecycle": minimal.__file__,
+        "reference_reset": reset_reference.__file__,
         "nvmath_fft": inspect.getfile(nf.FFT),
         "public_fft": inspect.getfile(cp.fft.fft),
         "profiler": inspect.getfile(benchmark),
@@ -480,6 +503,10 @@ def main():
     payload = {
         "status": "running",
         "execute_sha256": execute,
+        "reference_reset": {
+            "nvmath_revision": "eafc59f5f7f335957c34f8aa5a1a0d449694efd0",
+            "method_sha256": reference_sha,
+        },
         "cases": [],
         "configuration": {
             **vars(args),
@@ -601,15 +628,20 @@ def main():
                 stateful = None
                 native_outputs, native_plans, native_plan_info = [], {}, []
                 nvmath_plans = {}
+                reset_observations = {}
                 hits_per_call = {
                     "original": 1, "fused": 1, "ajay": 1,
                     "minimal": 0, "stateful": 0}
 
                 def select(label):
-                    # Select reset before each benchmark call;
-                    # the timed public FFT call keeps its usual signature.
-                    adapter._C2R_FFT = (
-                        adapter.CachedFFT if label == "fused" else c2r_fft)
+                    # All rows use ordinary CachedFFT instances. Changing
+                    # only this subclass's method keeps control selection
+                    # outside the timed public call and leaves nf.FFT intact.
+                    method = (reset_reference.reset_operand_unchecked
+                              if label in ("original", "fused")
+                              else nvmath_reset)
+                    select_reset(adapter.CachedFFT, method,
+                                 (node.plan for _, node in cache))
                     cp.fft.config.use_nvmath = label != "native"
                     fft_module._try_use_nvmath = hooks.get(
                         label, hooks["original"]
@@ -635,7 +667,7 @@ def main():
                     cache_key, node = entries[0]
                     check(
                         isinstance(cache_key, tuple)
-                        and len(cache_key) in (3, 4, 5, 6)
+                        and len(cache_key) in (3, 5)
                         and cache_key[:2] == ("nvmath", stream.ptr),
                         "Warm request did not route to nvmath",
                     )
@@ -649,8 +681,8 @@ def main():
                         not plan.logger.isEnabledFor(logging.INFO),
                         "Disable nvmath INFO/DEBUG logging",
                     )
-                    # Baked scaling and the C2R reset class distinguish Ajay
-                    # plans from Original; other unscaled rows share one plan.
+                    # Baked scaling distinguishes Ajay plans from Original;
+                    # reset selection never changes the production cache key.
                     original_warm = None
                     original_key = ("nvmath", stream.ptr, cache_key[2])
                     if cache_key != original_key:
@@ -659,27 +691,22 @@ def main():
                             public, warm_operand, kwargs, adapter, nf)
                         preparation["original"] = original_preparation
                         outputs.append((original_warm, warm_expected))
+                    else:
+                        preparation["original"] = {"shared_plan_with": "ajay"}
                     fused_warm, fused_plan, fused_key = None, None, None
                     if args.compare_c2r_reset:
-                        before_fused = {key for key, _ in cache}
+                        before_fused = {key: node.plan for key, node in cache}
                         select("fused")
                         fused_warm, fused_preparation = prepare_call(
                             public, warm_operand, kwargs, adapter, nf)
-                        preparation["fused"] = fused_preparation
+                        preparation["fused"] = {
+                            **fused_preparation, "shared_plan_with": "ajay"}
                         outputs.append((fused_warm, warm_expected))
-                        fused_entries = [
-                            (key, node.plan) for key, node in cache
-                            if key not in before_fused]
-                        check(len(fused_entries) == 1,
-                              "Expected one separate fused reference plan")
-                        fused_key, fused_plan = fused_entries[0]
-                        check(type(fused_plan) is adapter.CachedFFT
-                              and type(plan) is c2r_fft
-                              and fused_key[:-1] == cache_key[:-1]
-                              and fused_key[-1] is adapter.CachedFFT
-                              and cache_key[-1] is c2r_fft,
-                              "Fused and prepared rows must differ "
-                              "only in reset class")
+                        after_fused = {key: node.plan for key, node in cache}
+                        check(after_fused == before_fused
+                              and after_fused.get(cache_key) is plan,
+                              "Fused and Ajay must share one cached plan")
+                        fused_key, fused_plan = cache_key, plan
                     nvmath_plans = {key: node.plan for key, node in cache}
                     original_plan = nvmath_plans.get(original_key)
                     check(
@@ -762,14 +789,42 @@ def main():
                             )
 
                     def verify_c2r_reset(label):
-                        if (label != "ajay"
-                                or not spec["public"].startswith("irfft")):
+                        if label not in ("original", "fused", "ajay"):
                             return
-                        info = getattr(plan, "_c2r_reset_prepared_info", None)
-                        check(type(plan) is c2r_fft and info is not None
-                              and info["eligible"]
-                              and plan._c2r_reset_prepared_last_used,
-                              f"Prepared C2R reset was not used: {info!r}")
+                        cached = (original_plan if label == "original"
+                                  else fused_plan if label == "fused"
+                                  else plan)
+                        method = cached.reset_operand_unchecked.__func__
+                        prepared = (cached.fft_abstract_type == "C2R"
+                                    and method is nvmath_reset)
+                        info = getattr(
+                            cached, "_c2r_reset_prepared_info", None)
+                        last_used = getattr(
+                            cached, "_c2r_reset_prepared_last_used", False)
+                        check(type(cached) is adapter.CachedFFT,
+                              "Unexpected nvmath cached plan class")
+                        if label in ("original", "fused"):
+                            check(method is (
+                                      reset_reference.reset_operand_unchecked)
+                                  and not last_used,
+                                  "Reference control used prepared C2R reset")
+                        else:
+                            check(method is nvmath_reset,
+                                  "Ajay must use nvmath's existing reset API")
+                        if prepared:
+                            check(info is not None and info["eligible"]
+                                  and last_used,
+                                  "Prepared C2R reset was not used: "
+                                  f"{info!r}")
+                        reset_observations[label] = {
+                            "reset_method": method.__qualname__,
+                            "c2r_preparation": {
+                                "selected": prepared,
+                                "info": (dict(info)
+                                         if prepared and info else None),
+                                "last_used": last_used,
+                            },
+                        }
 
                     verify()
                     comparisons = []
@@ -947,21 +1002,7 @@ def main():
                                 "divisor": getattr(
                                     cached, "_cupy_fft_epilog_divisor", None
                                 ),
-                                "reset_method": (
-                                    cached.reset_operand_unchecked
-                                    .__func__.__qualname__),
-                                "c2r_preparation": {
-                                    "selected": (
-                                        cached.fft_abstract_type == "C2R"
-                                        and type(cached) is c2r_fft),
-                                    "info": getattr(
-                                        cached, "_c2r_reset_prepared_info",
-                                        None),
-                                    "last_used": getattr(
-                                        cached,
-                                        "_c2r_reset_prepared_last_used",
-                                        False),
-                                },
+                                **reset_observations[label],
                             }
                             for label, plan_key, cached in plan_rows
                         },
@@ -1114,7 +1155,6 @@ def main():
                     )
                 finally:
                     fft_module._try_use_nvmath = old_hook
-                    adapter._C2R_FFT = c2r_fft
                     cp.fft.config.use_nvmath = True
                     stream.synchronize()
                     if stateful is not None:
@@ -1146,13 +1186,17 @@ def main():
         raise
     finally:
         fft_module._try_use_nvmath = old_hook
+        if previous_reset is missing:
+            if "reset_operand_unchecked" in vars(adapter.CachedFFT):
+                del adapter.CachedFFT.reset_operand_unchecked
+        else:
+            adapter.CachedFFT.reset_operand_unchecked = previous_reset
         if cache_owned:
             cache.clear()
         (
             cp.fft.config.use_nvmath,
             cp.fft.config.use_multi_gpus,
             adapter._RELEASE_WORKSPACE,
-            adapter._C2R_FFT,
         ) = settings
         os.sched_setaffinity(0, affinity)
         if gc_enabled:

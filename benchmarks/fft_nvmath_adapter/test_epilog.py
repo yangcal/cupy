@@ -19,7 +19,8 @@ import numpy
 
 
 ADAPTER = Path(__file__).resolve().parents[2] / 'cupy/fft/_fft_nvmath.py'
-FUNCTIONS = {'_compile_normalization_epilog', '_try_use_nvmath_ajay'}
+FUNCTIONS = {'_compile_normalization_epilog', '_try_use_nvmath',
+             '_try_use_nvmath_ajay'}
 
 
 class Array:
@@ -111,7 +112,7 @@ class TestEpilog(unittest.TestCase):
             def get_output_layout(self):
                 return self.output.shape, ()
 
-            def plan(self, *, stream, epilog):
+            def plan(self, *, stream, epilog=None):
                 self.epilog = epilog
                 if owner.fail_plan:
                     raise RuntimeError('planning failed')
@@ -121,13 +122,13 @@ class TestEpilog(unittest.TestCase):
                     raise RuntimeError('execution failed')
                 return self.output
 
-            def reset_operand_unchecked(self, operand, **kwargs):
-                self.resets += 1
-
-            def _reset_operand_unchecked_prepared(self, operand, *, stream):
-                self.prepared_resets += 1
-                self.prepared_operand = operand
-                self.prepared_stream = stream
+            def reset_operand_unchecked(self, operand, *, stream):
+                if self.fft_abstract_type == 'C2R':
+                    self.prepared_resets += 1
+                    self.prepared_operand = operand
+                    self.prepared_stream = stream
+                else:
+                    self.resets += 1
 
             def release_operand(self):
                 self.released += 1
@@ -146,7 +147,9 @@ class TestEpilog(unittest.TestCase):
             '_DIRECTIONS': {'forward': -1, 'inverse': 1},
             '_VALID_NORMS': ('backward', 'forward', 'ortho'),
             '_RELEASE_WORKSPACE': False,
+            '_normalize_axes': lambda ndim, axes: axes,
             '_normalize_axes_ajay': lambda ndim, axes: axes,
+            '_scale_result': lambda *args: None,
             '_create_key_from_operand': lambda operand, axes, options: (
                 operand.shape, axes, options),
             '_warn_fallback': self.fallbacks.append,
@@ -154,15 +157,9 @@ class TestEpilog(unittest.TestCase):
         tree = ast.parse(ADAPTER.read_text())
         selected = ast.Module(body=[
             node for node in tree.body
-            if (isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS
-                or isinstance(node, ast.ClassDef)
-                and node.name == '_PreparedC2RCachedFFT'
-                or isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name)
-                        and target.id == '_C2R_FFT'
-                        for target in node.targets))
+            if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS
         ], type_ignores=[])
-        self.assertEqual(len(selected.body), len(FUNCTIONS) + 2)
+        self.assertEqual(len(selected.body), len(FUNCTIONS))
         exec(compile(selected, str(ADAPTER), 'exec'), self.ns)
 
     def invoke(self, *, norm='backward', direction='inverse', kind='C2C',
@@ -310,74 +307,60 @@ class TestEpilog(unittest.TestCase):
         self.assertEqual(self.plans[0]._cupy_fft_epilog_divisor, 128)
         self.assertEqual(self.compilations, [(128, 'float32', 0)])
 
-    def test_c2r_subclass_keeps_execute_and_selects_prepared_reset(self):
-        candidate = self.ns['_PreparedC2RCachedFFT']
-        self.assertIs(candidate.execute, self.ns['CachedFFT'].execute)
+    def test_c2r_uses_normal_reset_api_and_epilog_key(self):
+        candidate = self.ns['CachedFFT']
         first, second = Array((17,)), Array((17,))
         self.invoke(kind='C2R', operand=first)
         plan = self.plans[0]
         self.assertIs(type(plan), candidate)
-        self.assertIs(next(iter(self.cache))[-1], candidate)
+        self.assertEqual(list(self.cache), [
+            ('nvmath', 7, ((17,), (0,), 'C2R'), 'backward', 'inverse')])
         self.invoke(kind='C2R', operand=second)
-        self.assertEqual(plan.resets, 0)
         self.assertEqual(plan.prepared_resets, 1)
         self.assertIs(plan.prepared_operand, second)
         self.assertIs(plan.prepared_stream, self.stream)
         self.assertEqual(plan.released, 2)
         self.assertEqual(len(self.compilations), 1)
 
-    def test_c2r_plans_do_not_reuse_original_even_without_scaling(self):
+    def test_unscaled_c2r_original_and_ajay_share_plan_and_normal_reset(self):
         operand = Array((17,))
-        original = self.ns['CachedFFT'](
-            operand, axes=(0,), options='C2R', execution='cuda',
-            stream=self.stream)
-        original_key = ('nvmath', 7, ((17,), (0,), 'C2R'))
-        self.cache[original_key] = original
-        for norm, key_length in (
-                ('forward', 4), ('backward', 6), ('ortho', 6)):
-            with self.subTest(norm=norm):
-                output = self.invoke(kind='C2R', operand=operand, norm=norm)
-                key, plan = next((key, plan)
-                                for key, plan in self.cache.items()
-                                if plan.output is output)
-                self.assertEqual(key[:3], original_key)
-                self.assertEqual(len(key), key_length)
-                self.assertIs(key[-1], self.ns['_PreparedC2RCachedFFT'])
-                self.assertIsNot(plan, original)
-        self.assertEqual(original.resets, 0)
-        self.assertEqual(original.prepared_resets, 0)
-        self.assertIs(self.cache[original_key], original)
-        self.assertEqual(len(self.cache), 4)
+        original_output = self.ns['_try_use_nvmath'](
+            operand, None, (0,), 'forward',
+            fft_type='C2R', fft_direction='inverse')
+        plan = self.plans[0]
+        self.assertIs(type(plan), self.ns['CachedFFT'])
+        self.assertIs(self.invoke(kind='C2R', operand=operand, norm='forward'),
+                      original_output)
+        self.assertEqual(list(self.cache), [
+            ('nvmath', 7, ((17,), (0,), 'C2R'))])
+        self.assertEqual(len(self.plans), 1)
+        self.assertEqual(plan.prepared_resets, 1)
+        self.assertEqual(plan.released, 2)
+        self.assertEqual(self.compilations, [])
 
-    def test_c2r_fused_control_and_prepared_use_separate_plans(self):
+    def test_scaled_c2r_epilog_keeps_original_plan_separate(self):
         operand = Array((17,))
-        control = self.ns['CachedFFT']
-        candidate = self.ns['_PreparedC2RCachedFFT']
-        for norm in ('forward', 'backward'):
-            with self.subTest(norm=norm):
-                self.ns['_C2R_FFT'] = control
-                control_out = self.invoke(
-                    kind='C2R', operand=operand, norm=norm)
-                control_plan = self.plans[-1]
-                self.ns['_C2R_FFT'] = candidate
-                candidate_out = self.invoke(
-                    kind='C2R', operand=operand, norm=norm)
-                candidate_plan = self.plans[-1]
-                self.assertIsNot(control_out, candidate_out)
-                self.assertIs(type(control_plan), control)
-                self.assertIs(type(candidate_plan), candidate)
-                self.ns['_C2R_FFT'] = control
-                self.assertIs(self.invoke(
-                    kind='C2R', operand=operand, norm=norm), control_out)
-                self.ns['_C2R_FFT'] = candidate
-                self.assertIs(self.invoke(
-                    kind='C2R', operand=operand, norm=norm), candidate_out)
-                self.assertEqual(control_plan.resets, 1)
-                self.assertEqual(control_plan.prepared_resets, 0)
-                self.assertEqual(candidate_plan.resets, 0)
-                self.assertEqual(candidate_plan.prepared_resets, 1)
-        self.assertEqual(len(self.cache), 4)
-        self.assertEqual(len(self.compilations), 2)
+        original_output = self.ns['_try_use_nvmath'](
+            operand, None, (0,), 'ortho',
+            fft_type='C2R', fft_direction='inverse')
+        original_plan = self.plans[0]
+        ajay_output = self.invoke(kind='C2R', operand=operand, norm='ortho')
+        ajay_plan = self.plans[1]
+        self.assertIsNot(original_output, ajay_output)
+        self.assertIs(type(original_plan), type(ajay_plan))
+        self.assertIsNone(original_plan.epilog)
+        self.assertIsNotNone(ajay_plan.epilog)
+        self.assertEqual(set(self.cache), {
+            ('nvmath', 7, ((17,), (0,), 'C2R')),
+            ('nvmath', 7, ((17,), (0,), 'C2R'), 'ortho', 'inverse')})
+        self.assertIs(self.ns['_try_use_nvmath'](
+            operand, None, (0,), 'ortho',
+            fft_type='C2R', fft_direction='inverse'), original_output)
+        self.assertIs(self.invoke(kind='C2R', operand=operand, norm='ortho'),
+                      ajay_output)
+        self.assertEqual(original_plan.prepared_resets, 1)
+        self.assertEqual(ajay_plan.prepared_resets, 1)
+        self.assertEqual(len(self.compilations), 1)
 
     def test_other_fft_families_keep_the_base_class_and_key(self):
         for kind in ('C2C', 'R2C'):

@@ -29,18 +29,25 @@ requests, especially 1D and batched single-axis transforms.
 
 | Row | What it measures | Definition |
 | --- | --- | --- |
-| Original | Existing CuPy nvmath adapter, with compiled strides and cached dtype names. | [`_try_use_nvmath`](../../cupy/fft/_fft_nvmath.py#L234) |
-| Ajay | Common-axis shortcuts, fused normalization and prepared C2R rebinding. | [`_try_use_nvmath_ajay`](../../cupy/fft/_fft_nvmath.py#L369), [`_PreparedC2RCachedFFT`](../../cupy/fft/_fft_nvmath.py#L72) |
-| Fused-only | Ajay's adapter with the original nvmath reset; focused C2R comparison only. | `--compare-c2r-reset` in [`main.py`](main.py) |
+| Original | Existing CuPy nvmath adapter, with compiled strides and cached dtype names. | [`_try_use_nvmath`](../../cupy/fft/_fft_nvmath.py#L222) |
+| Ajay | Common-axis shortcuts, fused normalization and nvmath's prepared C2R copying. | [`_try_use_nvmath_ajay`](../../cupy/fft/_fft_nvmath.py#L357), nvmath `FFT.reset_operand_unchecked()` |
+| Fused-only | Ajay's adapter with the original nvmath reset; focused C2R comparison only. | [`reference_reset.py`](reference_reset.py), selected by `--compare-c2r-reset` in [`main.py`](main.py) |
 | Native | Public `cupy.fft` using CuPy's cached cuFFT plans. | [`cupy/fft/_fft.py`](../../cupy/fft/_fft.py) |
 | Minimal | Key creation, dictionary lookup, reset, execution and operand release. Forward C2C only. | [`execute_cached`](minimal_lifecycle.py#L18) |
 | Stateful | Repeated `FFT.execute()` on a continuously bound operand. Forward C2C only. | `stateful.execute` in [`main.py`](main.py) |
 
 All nvmath rows use the same execute/workspace candidate and stride/dtype
 optimizations. Fused normalization uses the documented `compile_epilog` API;
-C2R preparation lives in nvmath's `fft/fft.py` (`FFT._prepare_c2r_reset`) and
+C2R preparation lives inside nvmath's existing `FFT.reset_operand_unchecked()` and
 `internal/tensor_ifc_cupy.py` (`CupyTensor._prepare_c2r_copy_in_current_context`).
 Each C2R call still allocates fresh scratch and copies the current input.
+[`main.py`](main.py) selects the reset method on the existing `CachedFFT` class
+before each row, outside timing: Original and Fused-only use
+[`reference_reset.py`](reference_reset.py), while Ajay uses nvmath's public reset.
+Rows with identical keys share a plan; the CuPy adapter needs no C2R-specific
+subclass or routing change.
+The results below were measured before this public-API integration; that
+refactor still needs a correctness and timing rerun.
 Requests are in [`cases.py`](cases.py).
 
 ## Replicate
