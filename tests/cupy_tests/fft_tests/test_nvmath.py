@@ -35,19 +35,6 @@ def test_normalize_axes(adapter, ndim, axes, expected, canonical):
         assert result is adapter._CANONICAL_AXES[ndim]
 
 
-@pytest.mark.parametrize('norm,direction,policy', [
-    (None, 'forward', 'none'),
-    ('forward', 'inverse', 'none'),
-    (None, 'inverse', 'N'),
-    ('backward', 'inverse', 'N'),
-    ('forward', 'forward', 'N'),
-    ('ortho', 'forward', 'sqrtN'),
-    ('ortho', 'inverse', 'sqrtN'),
-])
-def test_normalization_policy(adapter, norm, direction, policy):
-    assert adapter._normalization_policy(norm, direction) == policy
-
-
 @pytest.mark.parametrize('shape,axes,kind,policy,expected', [
     ((4, 8, 16), (1, 2), 'C2C', 'N', 128),
     ((4, 8, 16), (0, 2), 'R2C', 'N', 64),
@@ -97,8 +84,8 @@ def dispatch(adapter, monkeypatch):
         get_current_callback_manager=lambda: None))
     monkeypatch.setattr(cufft, 'get_current_plan', lambda: None)
     monkeypatch.setattr(adapter.cupy.cuda.runtime, 'getDevice', lambda: 0)
-    monkeypatch.setattr(adapter.cupy.cuda, 'get_current_stream',
-                        lambda: stream)
+    stream_lookup = Mock(return_value=stream)
+    monkeypatch.setattr(adapter.cupy.cuda, 'get_current_stream', stream_lookup)
     monkeypatch.setattr(adapter, 'get_plan_cache', lambda: cache)
     monkeypatch.setattr(adapter, '_create_key_from_operand',
                         Mock(return_value=('metadata',)))
@@ -111,7 +98,27 @@ def dispatch(adapter, monkeypatch):
             fft_type='C2C', fft_direction=direction)
 
     return SimpleNamespace(invoke=invoke, plans=plans, cache=cache,
-                           prepare=prepare, output=output, stream=stream)
+                           prepare=prepare, output=output, stream=stream,
+                           stream_lookup=stream_lookup)
+
+
+@pytest.mark.parametrize('norm,direction,policy', [
+    (None, 'forward', 'none'),
+    ('backward', 'forward', 'none'),
+    ('forward', 'inverse', 'none'),
+    (None, 'inverse', 'N'),
+    ('backward', 'inverse', 'N'),
+    ('forward', 'forward', 'N'),
+    ('ortho', 'forward', 'sqrtN'),
+    ('ortho', 'inverse', 'sqrtN'),
+])
+def test_normalization_policy(dispatch, norm, direction, policy):
+    dispatch.invoke(norm, direction)
+    key = ('nvmath', dispatch.stream.ptr, ('metadata',))
+    if policy != 'none':
+        key += (('normalization', policy),)
+    assert list(dispatch.cache) == [key]
+    assert dispatch.prepare.call_count == (policy != 'none')
 
 
 def test_warm_hit_skips_callback_preparation(dispatch):
@@ -124,6 +131,7 @@ def test_warm_hit_skips_callback_preparation(dispatch):
     assert plan.release_operand.call_count == 2
     assert plan._normalization_epilog is dispatch.prepare.return_value
     assert plan._normalization_stream is dispatch.stream
+    dispatch.stream_lookup.assert_called_with(_Array.data.device_id)
     assert plan.execute.call_args.kwargs['release_workspace'] is True
 
 

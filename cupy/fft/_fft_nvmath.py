@@ -115,18 +115,6 @@ def _warn_fallback(exc):
     )
 
 
-def _normalization_policy(norm, fft_direction):
-    """Identify built-in scaling without resolving lengths or callbacks."""
-    if norm is None:
-        norm = 'backward'
-    if norm == 'ortho':
-        return 'sqrtN'
-    if (norm == 'backward' and fft_direction == 'inverse'
-            or norm == 'forward' and fft_direction == 'forward'):
-        return 'N'
-    return 'none'
-
-
 def _normalization_divisor(operand, axes, fft_type, policy):
     """Compute normalization over logical transform axes, excluding batches."""
     if policy == 'none':
@@ -255,11 +243,17 @@ def _try_use_nvmath(
             f'Unsupported FFT direction: {fft_direction!r}') from None
 
     options = _FFT_OPTIONS[fft_type]
-    scaling_policy = _normalization_policy(norm, fft_direction)
+    if norm == 'ortho':
+        scaling_policy = 'sqrtN'
+    elif (norm == 'backward' and fft_direction == 'inverse'
+            or norm == 'forward' and fft_direction == 'forward'):
+        scaling_policy = 'N'
+    else:
+        scaling_policy = 'none'
     permutation = None
     result_permutation = None
 
-    stream = cupy.cuda.get_current_stream()
+    stream = cupy.cuda.get_current_stream(operand_device)
     try:
         try:
             nvmath_key = _create_key_from_operand(operand, axes, options)
