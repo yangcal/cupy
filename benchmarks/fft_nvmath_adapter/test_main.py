@@ -1,4 +1,4 @@
-"""GPU-free checks for the targeted C2R benchmark comparison."""
+"""GPU-free checks for warm FFT benchmark row selection and measurement."""
 
 from __future__ import annotations
 
@@ -23,6 +23,76 @@ SPEC.loader.exec_module(driver)
 
 
 class TestC2RComparison(unittest.TestCase):
+    def test_default_rows_balance_positions_and_adjacent_pairs(self):
+        for minimal in (False, True):
+            with self.subTest(minimal=minimal):
+                labels = driver.row_labels({'minimal': minimal})
+                expected = ('original', 'axes', 'fused', 'c2r', 'ajay')
+                expected += (('minimal', 'native', 'stateful') if minimal
+                             else ('native',))
+                self.assertEqual(labels, expected)
+                size = len(labels)
+                orders = driver.row_orders(labels, 24)
+                self.assertEqual(len(orders), 24)
+                self.assertEqual(orders, driver.row_orders(labels, 24))
+                self.assertEqual(len(set(orders)), size)
+                for index in range(size):
+                    self.assertEqual(
+                        Counter(order[index] for order in orders),
+                        Counter({label: 24 // size for label in labels}))
+                adjacent = Counter(pair for order in orders
+                                   for pair in zip(order, order[1:]))
+                self.assertEqual(
+                    set(adjacent),
+                    {(a, b) for a in labels for b in labels if a != b})
+                self.assertEqual(set(adjacent.values()), {24 // size})
+
+    def test_default_rows_select_matching_adapter_and_reset(self):
+        tree = ast.parse(PATH.read_text())
+        hooks = next(node.value for node in ast.walk(tree)
+                     if isinstance(node, ast.Assign)
+                     and any(isinstance(target, ast.Name)
+                             and target.id == 'hooks'
+                             for target in node.targets))
+        select = next(node for node in ast.walk(tree)
+                      if isinstance(node, ast.FunctionDef)
+                      and node.name == 'select')
+        original, unfused, fused = object(), object(), object()
+        current, reference = object(), object()
+        cached = type('CachedFFT', (), {})
+        adapter = SimpleNamespace(
+            CachedFFT=cached, _try_use_nvmath=original,
+            _try_use_nvmath_ajay_unfused=unfused,
+            _try_use_nvmath_ajay=fused)
+        namespace = {
+            'adapter': adapter, 'nvmath_reset': current,
+            'reset_reference': SimpleNamespace(
+                reset_operand_unchecked=reference),
+            'cache': (), 'select_reset': driver.select_reset,
+            'cp': SimpleNamespace(fft=SimpleNamespace(
+                config=SimpleNamespace(use_nvmath=None))),
+            'fft_module': SimpleNamespace(),
+        }
+        namespace['hooks'] = eval(
+            compile(ast.Expression(hooks), str(PATH), 'eval'), namespace)
+        exec(compile(ast.Module(body=[select], type_ignores=[]), str(PATH),
+                     'exec'), namespace)
+        expected = {
+            'original': (original, reference),
+            'axes': (unfused, reference),
+            'fused': (fused, reference),
+            'c2r': (unfused, current),
+            'ajay': (fused, current),
+            'native': (original, current),
+        }
+        for label, (hook, reset) in expected.items():
+            with self.subTest(row=label):
+                namespace['select'](label)
+                self.assertIs(namespace['fft_module']._try_use_nvmath, hook)
+                self.assertIs(cached.reset_operand_unchecked, reset)
+                self.assertEqual(
+                    namespace['cp'].fft.config.use_nvmath, label != 'native')
+
     def test_reference_reset_snapshot_is_pinned(self):
         path = PATH.with_name("reference_reset.py")
         source = path.read_text()
@@ -151,13 +221,14 @@ class TestC2RComparison(unittest.TestCase):
             'check': driver.check,
             'adapter': SimpleNamespace(CachedFFT=cached),
             'original_plan': plan, 'fused_plan': plan, 'plan': plan,
+            'separate_scale_plan': plan,
             'nvmath_reset': prepared_reset, 'reset_observations': observations,
             'reset_reference': SimpleNamespace(
                 reset_operand_unchecked=reference_reset)}
         exec(compile(ast.Module(body=[function], type_ignores=[]),
                      str(PATH), 'exec'), namespace)
         verify = namespace['verify_c2r_reset']
-        for label in ('original', 'fused'):
+        for label in ('original', 'axes', 'fused'):
             driver.select_reset(cached, reference_reset, (plan,))
             plan.reset_operand_unchecked(None)
             verify(label)
@@ -170,8 +241,11 @@ class TestC2RComparison(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'Reference control used'):
             verify('fused')
         verify('ajay')
+        verify('c2r')
         self.assertEqual(observations['ajay']['c2r_preparation'], {
             'selected': True, 'info': {'eligible': True}, 'last_used': True})
+        self.assertEqual(observations['c2r']['c2r_preparation'],
+                         observations['ajay']['c2r_preparation'])
         plan._c2r_reset_prepared_info['eligible'] = False
         driver.select_reset(cached, reference_reset, (plan,))
         plan._c2r_reset_prepared_last_used = True
@@ -198,7 +272,8 @@ class TestC2RComparison(unittest.TestCase):
 
     def test_targeted_mode_rejects_mixed_cases_and_unbalanced_blocks(self):
         for arguments in (["--compare-c2r-reset"],
-                          ["--compare-c2r-reset", "--case", "irfft"]):
+                          ["--compare-c2r-reset", "--case", "irfft",
+                           "--blocks", "30"]):
             with self.subTest(arguments=arguments):
                 with patch.object(sys, "argv", [str(PATH), *arguments]):
                     with contextlib.redirect_stderr(io.StringIO()):

@@ -1,17 +1,11 @@
-"""CPU-only checks of Ajay's epilog, reset selection and cache lifecycle.
-
-The real functions are extracted from the adapter so these checks do not import
-CuPy or initialize CUDA. Numerical correctness is checked by the GPU benchmark.
-"""
+"""GPU-free checks of semantic normalization keys and matched controls."""
 
 from __future__ import annotations
 
 import ast
 import math
 from pathlib import Path
-from statistics import median
 from types import ModuleType, SimpleNamespace
-import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -19,40 +13,60 @@ import numpy
 
 
 ADAPTER = Path(__file__).resolve().parents[2] / 'cupy/fft/_fft_nvmath.py'
-FUNCTIONS = {'_compile_normalization_epilog', '_try_use_nvmath',
-             '_try_use_nvmath_ajay'}
+FUNCTIONS = {
+    '_normalization_policy', '_normalization_divisor',
+    '_normalization_epilog', '_scale_result',
+    '_scale_result_ajay', '_create_key_from_operand', '_invert_permutation',
+    '_c_contiguous_element_strides', '_try_use_nvmath',
+    '_try_use_nvmath_ajay', '_try_use_nvmath_ajay_unfused',
+}
 
 
 class Array:
-    def __init__(self, shape=(1024,)):
-        self.shape = shape
-        self.ndim = len(shape)
+    def __init__(self, shape=(1024,), dtype='complex64'):
+        self.shape, self.dtype = shape, numpy.dtype(dtype)
+        self.ndim, self.itemsize = len(shape), self.dtype.itemsize
         self.size = math.prod(shape)
+        self.data = SimpleNamespace(device_id=0)
+        self.divisions = []
+        stride, strides = self.itemsize, []
+        for length in reversed(shape):
+            strides.append(stride)
+            stride *= length
+        self.strides = tuple(reversed(strides))
+
+    def __itruediv__(self, divisor):
+        self.divisions.append(divisor)
+        return self
+
+    def transpose(self, permutation):
+        return Array(tuple(self.shape[axis] for axis in permutation),
+                     self.dtype)
+
+    def copy(self):
+        return Array(self.shape, self.dtype)
 
 
 class Cache(dict):
     is_enabled = True
+    fail_insert = False
 
     def __setitem__(self, key, value):
-        if getattr(self, 'fail_insert', False):
+        if self.fail_insert:
             raise RuntimeError('insertion failed')
         super().__setitem__(key, value)
 
 
 class TestEpilog(unittest.TestCase):
     def setUp(self):
-        self.compilations = []
-        self.callbacks = []
-        self.current_device = 3
-        self.plans = []
-        self.fallbacks = []
-        self.cache = Cache()
+        self.cache, self.plans, self.bindings = Cache(), [], {}
+        self.fallbacks, self.key_callbacks, self.key_metadata = [], [], []
+        self.uploads = self.synchronizations = 0
+        self.current_device = 0
         self.fail_plan = self.fail_execute = False
-        self.stream = SimpleNamespace(ptr=7)
-        self.cupy = ModuleType('cupy')
-        self.cupy.ndarray = Array
-        cuda = ModuleType('cupy.cuda')
-        cuda.get_current_stream = lambda: self.stream
+        self.canonicalize_batches = False
+        self.reject_layout = False
+        self.stream = SimpleNamespace(ptr=7, synchronize=self.synchronize)
         owner = self
 
         class Device:
@@ -67,50 +81,46 @@ class TestEpilog(unittest.TestCase):
             def __exit__(self, *error):
                 owner.current_device = self.previous
 
-        cuda.Device = Device
-        cufft = ModuleType('cupy.cuda.cufft')
-        cufft.get_current_plan = lambda: None
-        cuda.cufft = cufft
-        self.cupy.cuda = cuda
-
-        def compile_callback(function, element_dtype, user_info_dtype):
-            self.assertEqual(element_dtype, user_info_dtype)
-            captured = dict(zip(function.__code__.co_freevars,
-                                function.__closure__))
-            divisor = captured['divisor'].cell_contents
-            self.compilations.append(
-                (divisor, element_dtype, self.current_device))
-            self.callbacks.append(function)
-            return b'compiled-epilog'
-
-        self.nvmath_fft = SimpleNamespace(
-            UnsupportedLayoutError=type(
-                'UnsupportedLayoutError', (Exception,), {}),
-            compile_epilog=compile_callback)
-        self.modules = patch.dict('sys.modules', {
-            'cupy': self.cupy, 'cupy.cuda': cuda,
-            'cupy.cuda.cufft': cufft,
-        })
-        self.modules.start()
-        self.addCleanup(self.modules.stop)
-        owner = self
-
-        class Plan:
-            def __init__(self, operand, *, axes, options, execution, stream):
-                self.freed = self.released = self.resets = 0
-                self.prepared_resets = 0
-                self.device_id = 0
+        class FFT:
+            def __init__(self, operand, *, axes, options, **kwargs):
+                self.device_id = owner.current_device
+                self.inplace = False
                 self.fft_abstract_type = options
+                self.freed = self.released = self.resets = 0
+                self.execute_options = []
                 shape = list(operand.shape)
+                dtype = operand.dtype.name
                 if options == 'C2R':
                     shape[axes[-1]] = 2 * (shape[axes[-1]] - 1)
-                self.result_data_type = (
-                    'float32' if options == 'C2R' else 'complex64')
-                self.output = Array(tuple(shape))
+                    dtype = {'complex64': 'float32',
+                             'complex128': 'float64'}[dtype]
+                elif options == 'R2C':
+                    shape[axes[-1]] = shape[axes[-1]] // 2 + 1
+                    dtype = {'float32': 'complex64',
+                             'float64': 'complex128'}[dtype]
+                self.output = Array(tuple(shape), dtype)
+                self.result_data_type = dtype
                 owner.plans.append(self)
 
-            def get_output_layout(self):
-                return self.output.shape, ()
+            @staticmethod
+            def create_key_from_metadata(shape, dtype, space, **kwargs):
+                epilog = kwargs['epilog']
+                owner.key_callbacks.append(epilog)
+                owner.key_metadata.append((shape, kwargs))
+                if owner.reject_layout and shape == (4, 3, 8):
+                    error = UnsupportedLayoutError('layout')
+                    error.permutation, error.axes = (1, 0, 2), (1, 2)
+                    raise error
+                axes, options = tuple(kwargs['axes']), kwargs['options']
+                if owner.canonicalize_batches:
+                    problem = (math.prod(shape[a] for a in axes),
+                               math.prod(shape) // math.prod(
+                                   shape[a] for a in axes), dtype, options)
+                else:
+                    problem = shape, dtype, axes, kwargs['strides'], options
+                callback = (None if epilog is None
+                            else (epilog.ltoir, epilog.data))
+                return problem, callback
 
             def plan(self, *, stream, epilog=None):
                 self.epilog = epilog
@@ -118,435 +128,332 @@ class TestEpilog(unittest.TestCase):
                     raise RuntimeError('planning failed')
 
             def execute(self, **kwargs):
+                self.execute_options.append(kwargs)
                 if owner.fail_execute:
                     raise RuntimeError('execution failed')
                 return self.output
 
             def reset_operand_unchecked(self, operand, *, stream):
-                if self.fft_abstract_type == 'C2R':
-                    self.prepared_resets += 1
-                    self.prepared_operand = operand
-                    self.prepared_stream = stream
-                else:
-                    self.resets += 1
+                self.resets += 1
+                self.bound = operand
 
             def release_operand(self):
                 self.released += 1
 
             def free(self):
                 self.freed += 1
+                self._cupy_fft_epilog = None
 
-        config = SimpleNamespace(
-            use_nvmath=True, devices=None,
-            get_current_callback_manager=lambda: None)
+        class UnsupportedLayoutError(Exception):
+            pass
+
+        def binding(dtype, divisor, stream_ptr):
+            real = numpy.finfo(dtype).dtype.type
+            key = dtype, real(divisor), stream_ptr, self.current_device
+            if key not in self.bindings:
+                self.uploads += 1
+                self.bindings[key] = SimpleNamespace(
+                    ltoir=b'IR-' + dtype.encode(), data=self.uploads,
+                    _cupy_divisor=real(divisor))
+            return self.bindings[key]
+
+        cupy = ModuleType('cupy')
+        cupy.ndarray = Array
+        cuda = ModuleType('cupy.cuda')
+        cufft = ModuleType('cupy.cuda.cufft')
+        cufft.get_current_plan = lambda: None
+        cuda.cufft, cuda.Device = cufft, Device
+        cuda.runtime = SimpleNamespace(getDevice=lambda: self.current_device)
+        cuda.get_current_stream = lambda: self.stream
+        cupy.cuda = cuda
+        self.modules = patch.dict('sys.modules', {
+            'cupy': cupy, 'cupy.cuda': cuda, 'cupy.cuda.cufft': cufft})
+        self.modules.start()
+        self.addCleanup(self.modules.stop)
+        self.nvmath_fft = SimpleNamespace(
+            FFT=FFT, UnsupportedLayoutError=UnsupportedLayoutError,
+            compile_epilog=Mock(side_effect=AssertionError('Numba compiler')))
         self.ns = {
-            'math': math, 'cupy': self.cupy, 'config': config,
-            'nvmath_fft': self.nvmath_fft,
-            'CachedFFT': Plan, 'get_plan_cache': lambda: self.cache,
-            '_FFT_OPTIONS': {kind: kind for kind in ('C2C', 'R2C', 'C2R')},
+            'math': math, 'cupy': cupy, 'nvmath_fft': self.nvmath_fft,
+            '_nvmath_scaling': SimpleNamespace(get_scaling_epilog=binding),
+            'config': SimpleNamespace(
+                use_nvmath=True, devices=None,
+                get_current_callback_manager=lambda: None),
+            'get_plan_cache': lambda: self.cache,
+            '_FFT_OPTIONS': {x: x for x in ('C2C', 'R2C', 'C2R')},
+            '_RESULT_DTYPES': {
+                'R2C': {'float32': 'complex64', 'float64': 'complex128'},
+                'C2R': {'complex64': 'float32', 'complex128': 'float64'}},
             '_DIRECTIONS': {'forward': -1, 'inverse': 1},
-            '_VALID_NORMS': ('backward', 'forward', 'ortho'),
+            '_VALID_NORMS': ('backward', 'ortho', 'forward'),
             '_RELEASE_WORKSPACE': False,
             '_normalize_axes': lambda ndim, axes: axes,
             '_normalize_axes_ajay': lambda ndim, axes: axes,
-            '_scale_result': lambda *args: None,
-            '_create_key_from_operand': lambda operand, axes, options: (
-                operand.shape, axes, options),
+            '_element_strides': lambda s, size: tuple(x // size for x in s),
+            '_numpy_dtype_name': lambda dtype: dtype.name,
             '_warn_fallback': self.fallbacks.append,
         }
         tree = ast.parse(ADAPTER.read_text())
-        selected = ast.Module(body=[
-            node for node in tree.body
+        selected = ast.Module(body=[node for node in tree.body
             if isinstance(node, ast.FunctionDef) and node.name in FUNCTIONS
-        ], type_ignores=[])
-        self.assertEqual(len(selected.body), len(FUNCTIONS))
+            or isinstance(node, ast.ClassDef) and node.name == 'CachedFFT'],
+            type_ignores=[])
+        self.assertEqual(len(selected.body), len(FUNCTIONS) + 1)
         exec(compile(selected, str(ADAPTER), 'exec'), self.ns)
 
-    def invoke(self, *, norm='backward', direction='inverse', kind='C2C',
-               operand=None, axes=(0,)):
-        return self.ns['_try_use_nvmath_ajay'](
-            operand or Array(), None, axes, norm,
-            fft_type=kind, fft_direction=direction)
+    def synchronize(self):
+        self.synchronizations += 1
 
-    def test_prepares_once_and_keeps_norm_direction_and_stream_separate(self):
-        self.invoke()
-        self.invoke()
-        self.assertEqual(len(self.compilations), 1)
-        self.assertEqual(self.plans[0].resets, 1)
-        self.assertEqual(self.plans[0].released, 2)
-        self.assertEqual(self.plans[0].freed, 0)
-        self.assertEqual(next(iter(self.cache)), (
-            'nvmath', 7, ((1024,), (0,), 'C2C'),
-            'backward', 'inverse'))
-        self.invoke(norm='ortho')
-        self.invoke(direction='forward')
-        self.stream = SimpleNamespace(ptr=8)
-        self.invoke()
-        self.assertEqual(len(self.plans), 4)
-        self.assertEqual(len(self.compilations), 3)
+    def invoke(self, *, norm=None, direction='inverse', kind='C2C',
+               operand=None, axes=(0,), row='ajay'):
+        name = {'ajay': '_try_use_nvmath_ajay',
+                'unfused': '_try_use_nvmath_ajay_unfused',
+                'original': '_try_use_nvmath'}[row]
+        if operand is None:
+            operand = Array(dtype='float32' if kind == 'R2C' else 'complex64')
+        return self.ns[name](operand, None, axes, norm,
+                             fft_type=kind, fft_direction=direction)
 
-    def test_unscaled_requests_share_original_key_without_callback(self):
-        self.invoke(direction='forward')
-        self.invoke(norm='forward', direction='inverse')
-        self.assertEqual(list(self.cache), [
-            ('nvmath', 7, ((1024,), (0,), 'C2C'))])
+    def test_semantic_key_and_plan_owned_descriptor(self):
+        self.invoke()
+        plan = self.plans[0]
+        epilog = plan.epilog
+        key = next(iter(self.cache))
+        self.assertEqual(len(key), 4)
+        self.assertEqual(key[:2], ('nvmath', 7))
+        self.assertEqual(key[3], ('normalization', 'N'))
+        self.assertIsNone(self.key_callbacks[0])
+        self.assertIs(plan._cupy_fft_epilog, epilog)
+        self.assertIsNone(key[2][1])
+        self.assertEqual(plan._cupy_fft_epilog_ltoir, epilog.ltoir)
+        self.assertEqual(plan._cupy_fft_epilog_divisor, 1024)
+        self.nvmath_fft.compile_epilog.assert_not_called()
+
+    def test_warm_hits_skip_all_normalization_preparation(self):
+        self.invoke()
+        prepare = self.ns['_normalization_epilog'] = Mock(
+            side_effect=AssertionError('warm normalization preparation'))
+        divisor = self.ns['_normalization_divisor'] = Mock(
+            side_effect=AssertionError('warm divisor resolution'))
+        binding = self.ns['_nvmath_scaling'].get_scaling_epilog = Mock(
+            side_effect=AssertionError('warm callback binding'))
+        self.invoke()
+        prepare.assert_not_called()
+        divisor.assert_not_called()
+        binding.assert_not_called()
+        self.assertEqual(self.uploads, 1)
         self.assertEqual(len(self.plans), 1)
         self.assertEqual(self.plans[0].resets, 1)
-        self.assertEqual(self.compilations, [])
+        self.assertEqual(self.plans[0].released, 2)
+        self.assertEqual(self.key_callbacks, [None, None])
+        self.assertEqual(self.synchronizations, 0)
+
+    def test_policy_describes_effective_scaling(self):
+        policy = self.ns['_normalization_policy']
+        cases = ((None, 'forward', 'none'),
+                 ('backward', 'forward', 'none'),
+                 ('forward', 'inverse', 'none'),
+                 (None, 'inverse', 'N'),
+                 ('backward', 'inverse', 'N'),
+                 ('forward', 'forward', 'N'),
+                 ('ortho', 'forward', 'sqrtN'),
+                 ('ortho', 'inverse', 'sqrtN'))
+        for norm, direction, expected in cases:
+            with self.subTest(norm=norm, direction=direction):
+                self.assertEqual(policy(norm, direction), expected)
+
+    def test_equivalent_scaling_norms_and_directions_share_plan(self):
+        for norm, direction in ((None, 'inverse'), ('backward', 'inverse'),
+                                ('forward', 'forward')):
+            self.invoke(norm=norm, direction=direction)
+        self.assertEqual(len(self.plans), 1)
+        self.invoke(norm='ortho', direction='forward')
+        self.invoke(norm='ortho', direction='inverse')
+        self.assertEqual(len(self.plans), 2)
+        self.assertEqual(self.uploads, 2)
+        self.assertEqual(len(self.cache), 2)
+        self.assertEqual([p.resets for p in self.plans], [2, 1])
+
+    def test_unscaled_rows_share_callback_free_plan(self):
+        for row, norm, direction in (
+                ('original', None, 'forward'), ('unfused', None, 'forward'),
+                ('ajay', None, 'forward'), ('ajay', 'forward', 'inverse')):
+            self.invoke(row=row, norm=norm, direction=direction)
+        self.assertEqual(len(self.plans), 1)
+        self.assertEqual(self.uploads, 0)
+        self.assertIsNone(self.plans[0].epilog)
+        self.assertEqual(self.plans[0].output.divisions, [])
+
+    def test_control_keeps_separate_division_and_same_workspace_policy(self):
+        for row in ('unfused', 'ajay'):
+            self.invoke(row=row)
+            self.invoke(row=row)
+        unfused, fused = self.plans
+        self.assertEqual(unfused.output.divisions, [1024, 1024])
+        self.assertEqual(fused.output.divisions, [])
+        self.assertEqual(unfused.execute_options, fused.execute_options)
+        self.assertEqual(unfused.resets, fused.resets)
+        self.assertEqual(unfused.released, fused.released)
+
+    def test_family_norm_matrix_excludes_batch_axes_and_matches_precision(self):
+        cases = (
+            ('C2C', (4, 8, 16), 'complex64', 'forward', None, 1),
+            ('C2C', (4, 8, 16), 'complex64', 'inverse', None, 128),
+            ('C2C', (4, 8, 16), 'complex128', 'forward', 'forward', 128),
+            ('C2C', (4, 8, 16), 'complex64', 'inverse', 'forward', 1),
+            ('C2C', (4, 8, 16), 'complex64', 'inverse', 'ortho', math.sqrt(128)),
+            ('R2C', (4, 8, 16), 'float32', 'forward', 'forward', 128),
+            ('R2C', (4, 8, 16), 'float64', 'forward', 'ortho', math.sqrt(128)),
+            ('C2R', (4, 8, 9), 'complex64', 'inverse', None, 128),
+            ('C2R', (4, 8, 9), 'complex128', 'inverse', 'ortho', math.sqrt(128)),
+            ('C2R', (4, 8, 9), 'complex64', 'inverse', 'forward', 1),
+        )
+        for kind, shape, dtype, direction, norm, divisor in cases:
+            with self.subTest(kind=kind, dtype=dtype, norm=norm):
+                operand = Array(shape, dtype)
+                result = self.invoke(kind=kind, operand=operand, axes=(1, 2),
+                                     direction=direction, norm=norm)
+                plan = next(p for p in self.plans if p.output is result)
+                real = numpy.finfo(result.dtype).dtype.type
+                self.assertEqual(self.ns['_normalization_divisor'](
+                    operand, (1, 2), norm, kind, direction), divisor)
+                self.assertEqual(getattr(plan, '_cupy_fft_epilog_divisor', 1),
+                                 real(divisor))
+                if divisor != 1:
+                    self.assertEqual(plan.epilog.ltoir,
+                                     b'IR-' + result.dtype.name.encode())
+
+    def test_unit_transform_avoids_callback(self):
+        self.invoke(operand=Array((1,)), norm='ortho')
+        self.assertEqual(self.uploads, 0)
         self.assertIsNone(self.plans[0].epilog)
 
-    def test_norm_direction_matrix_uses_transform_size_not_batch_size(self):
-        # Each request transforms the last two dimensions; the leading four
-        # batches do not belong to the normalization size, 8 * 16 = 128.
-        expected = (
-            ('C2C', (4, 8, 16), None, 'forward', 1),
-            ('C2C', (4, 8, 16), None, 'inverse', 128),
-            ('C2C', (4, 8, 16), 'backward', 'forward', 1),
-            ('C2C', (4, 8, 16), 'backward', 'inverse', 128),
-            ('C2C', (4, 8, 16), 'forward', 'forward', 128),
-            ('C2C', (4, 8, 16), 'forward', 'inverse', 1),
-            ('C2C', (4, 8, 16), 'ortho', 'forward', math.sqrt(128)),
-            ('C2C', (4, 8, 16), 'ortho', 'inverse', math.sqrt(128)),
-            ('R2C', (4, 8, 16), None, 'forward', 1),
-            ('R2C', (4, 8, 16), 'backward', 'forward', 1),
-            ('R2C', (4, 8, 16), 'forward', 'forward', 128),
-            ('R2C', (4, 8, 16), 'ortho', 'forward', math.sqrt(128)),
-            ('C2R', (4, 8, 9), None, 'inverse', 128),
-            ('C2R', (4, 8, 9), 'backward', 'inverse', 128),
-            ('C2R', (4, 8, 9), 'forward', 'inverse', 1),
-            ('C2R', (4, 8, 9), 'ortho', 'inverse', math.sqrt(128)),
-        )
-        for kind, shape, norm, direction, divisor in expected:
-            with self.subTest(kind=kind, norm=norm, direction=direction):
-                output = self.invoke(
-                    kind=kind, operand=Array(shape), axes=(1, 2),
-                    norm=norm, direction=direction)
-                plan = next(p for p in self.plans if p.output is output)
-                self.assertEqual(plan._cupy_fft_epilog_divisor, divisor)
-                self.assertEqual(plan.epilog is None, divisor == 1)
-
-    def test_alternating_norms_revisit_warm_plans_without_cold_work(self):
-        requests = (
-            (None, 'forward'), ('backward', 'forward'),
-            ('forward', 'inverse'), ('forward', 'forward'),
-            (None, 'inverse'), ('backward', 'inverse'),
-            ('ortho', 'forward'), ('ortho', 'inverse'),
-        )
-        # A fused result must never go through the separate scaling helper.
-        self.ns['_scale_result_ajay'] = Mock(
-            side_effect=AssertionError('separate scaling after fused output'))
-        for norm, direction in requests:
-            self.invoke(norm=norm, direction=direction)
-        self.assertEqual(len(self.plans), 5)
-        self.assertEqual(len(self.compilations), 4)
-        warmed = dict(self.cache)
-        with patch.dict(self.ns, {
-            '_compile_normalization_epilog': Mock(
-                side_effect=AssertionError('cold helper on a warm hit')),
-        }), patch.object(
-                self.nvmath_fft, 'compile_epilog',
-                side_effect=AssertionError('compiler on a warm hit')):
-            for norm, direction in requests[::-1] + requests:
-                self.invoke(norm=norm, direction=direction)
-        self.assertEqual(len(self.plans), 5)
-        self.assertEqual(len(self.compilations), 4)
-        self.assertEqual(self.cache, warmed)
-        self.assertEqual(sum(plan.released for plan in self.plans), 24)
-        self.assertEqual(sum(plan.freed for plan in self.plans), 0)
-        self.ns['_scale_result_ajay'].assert_not_called()
-
-    def test_canonical_batch_aliases_keep_same_transform_scale(self):
-        # A 1D length-eight transform with six batches can be represented by
-        # different batch shapes. Model that same backend key explicitly.
-        self.ns['_create_key_from_operand'] = lambda operand, axes, options: (
-            (8,), 6, options)
-        for norm, divisor in (('forward', 8), ('ortho', math.sqrt(8))):
-            first = self.invoke(
-                operand=Array((2, 3, 8)), axes=(2,),
-                norm=norm, direction='forward')
-            second = self.invoke(
-                operand=Array((6, 8)), axes=(1,),
-                norm=norm, direction='forward')
-            plan = next(p for p in self.plans if p.output is first)
+    def test_canonical_batch_aliases_reuse_same_semantic_key(self):
+        self.canonicalize_batches = True
+        for norm in ('forward', 'ortho'):
+            first = self.invoke(operand=Array((2, 3, 8)), axes=(2,),
+                                norm=norm, direction='forward')
+            second = self.invoke(operand=Array((6, 8)), axes=(1,),
+                                 norm=norm, direction='forward')
             self.assertIs(first, second)
-            self.assertEqual(plan._cupy_fft_epilog_divisor, divisor)
-            self.assertEqual(plan.resets, 1)
         self.assertEqual(len(self.plans), 2)
-        self.assertEqual(len(self.compilations), 2)
-        self.assertEqual(len(self.cache), 2)
+        self.assertEqual(self.uploads, 2)
 
-    def test_string_norm_subclasses_reuse_plain_norm_plan(self):
+    def test_layout_recovery_resolves_divisor_after_materializing_layout(self):
+        self.reject_layout = True
+        prepare = self.ns['_normalization_epilog'] = Mock(
+            wraps=self.ns['_normalization_epilog'])
+        self.invoke(operand=Array((4, 3, 8)), axes=(0, 2), norm='ortho')
+        plan = self.plans[0]
+        self.assertEqual(len(self.key_callbacks), 2)
+        self.assertEqual(self.key_callbacks, [None, None])
+        prepare.assert_called_once()
+        arguments = prepare.call_args.args
+        self.assertEqual(arguments[0].shape, (3, 4, 8))
+        self.assertEqual(arguments[1], (1, 2))
+        self.assertEqual(plan.output.shape, (3, 4, 8))
+        self.assertEqual(plan.epilog._cupy_divisor, numpy.float32(math.sqrt(32)))
+
+    def test_c2r_layout_recovery_uses_logical_unpacked_axis_length(self):
+        self.reject_layout = True
+        operand = Array((4, 3, 8))
+        self.invoke(operand=operand, axes=(0, 2), kind='C2R', norm='ortho')
+        plan = self.plans[0]
+        self.assertEqual(self.key_callbacks, [None, None])
+        self.assertEqual(plan.output.shape, (3, 4, 14))
+        self.assertEqual(plan.epilog._cupy_divisor, numpy.float32(math.sqrt(56)))
+        self.assertIs(plan._cupy_fft_epilog, plan.epilog)
+
+    def test_c2r_uses_existing_reset_api(self):
+        first, second = Array((17,)), Array((17,))
+        self.invoke(kind='C2R', operand=first)
+        self.invoke(kind='C2R', operand=second)
+        plan = self.plans[0]
+        self.assertIs(type(plan), self.ns['CachedFFT'])
+        self.assertIs(plan.bound, second)
+        self.assertEqual(plan.resets, 1)
+        self.assertEqual(plan._cupy_fft_epilog_divisor, 32)
+
+    def test_string_norm_subclasses_use_validated_meaning(self):
         class UnhashableNorm(str):
             __hash__ = None
 
-        class MisleadingStringNorm(str):
+        class MisleadingNorm(str):
             def __str__(self):
                 return 'forward'
 
         expected = self.invoke(norm='ortho')
-        expected_key = next(iter(self.cache))
-        for norm in (UnhashableNorm('ortho'), MisleadingStringNorm('ortho')):
-            with self.subTest(norm_type=type(norm).__name__):
-                self.assertIs(self.invoke(norm=norm), expected)
-                self.assertEqual(list(self.cache), [expected_key])
+        for norm in (UnhashableNorm('ortho'), MisleadingNorm('ortho')):
+            self.assertIs(self.invoke(norm=norm), expected)
         self.assertEqual(len(self.plans), 1)
-        self.assertEqual(self.plans[0].resets, 2)
-        self.assertEqual(len(self.compilations), 1)
 
-    def test_scaled_request_does_not_reuse_original_plan(self):
-        self.invoke(direction='forward')
-        original = self.plans[0]
-        self.invoke(norm='ortho')
-        self.assertEqual(len(self.cache), 2)
-        self.assertEqual(original.resets, 0)
-        self.assertIsNone(original.epilog)
-        self.assertIsNotNone(self.plans[1].epilog)
-
-    def test_c2r_divisor_uses_logical_real_output(self):
-        self.invoke(kind='C2R', operand=Array((8, 9)), axes=(0, 1))
-        self.assertEqual(self.plans[0]._cupy_fft_epilog_divisor, 128)
-        self.assertEqual(self.compilations, [(128, 'float32', 0)])
-
-    def test_c2r_uses_normal_reset_api_and_epilog_key(self):
-        candidate = self.ns['CachedFFT']
-        first, second = Array((17,)), Array((17,))
-        self.invoke(kind='C2R', operand=first)
-        plan = self.plans[0]
-        self.assertIs(type(plan), candidate)
-        self.assertEqual(list(self.cache), [
-            ('nvmath', 7, ((17,), (0,), 'C2R'), 'backward', 'inverse')])
-        self.invoke(kind='C2R', operand=second)
-        self.assertEqual(plan.prepared_resets, 1)
-        self.assertIs(plan.prepared_operand, second)
-        self.assertIs(plan.prepared_stream, self.stream)
-        self.assertEqual(plan.released, 2)
-        self.assertEqual(len(self.compilations), 1)
-
-    def test_unscaled_c2r_original_and_ajay_share_plan_and_normal_reset(self):
-        operand = Array((17,))
-        original_output = self.ns['_try_use_nvmath'](
-            operand, None, (0,), 'forward',
-            fft_type='C2R', fft_direction='inverse')
-        plan = self.plans[0]
-        self.assertIs(type(plan), self.ns['CachedFFT'])
-        self.assertIs(self.invoke(kind='C2R', operand=operand, norm='forward'),
-                      original_output)
-        self.assertEqual(list(self.cache), [
-            ('nvmath', 7, ((17,), (0,), 'C2R'))])
-        self.assertEqual(len(self.plans), 1)
-        self.assertEqual(plan.prepared_resets, 1)
-        self.assertEqual(plan.released, 2)
-        self.assertEqual(self.compilations, [])
-
-    def test_scaled_c2r_epilog_keeps_original_plan_separate(self):
-        operand = Array((17,))
-        original_output = self.ns['_try_use_nvmath'](
-            operand, None, (0,), 'ortho',
-            fft_type='C2R', fft_direction='inverse')
-        original_plan = self.plans[0]
-        ajay_output = self.invoke(kind='C2R', operand=operand, norm='ortho')
-        ajay_plan = self.plans[1]
-        self.assertIsNot(original_output, ajay_output)
-        self.assertIs(type(original_plan), type(ajay_plan))
-        self.assertIsNone(original_plan.epilog)
-        self.assertIsNotNone(ajay_plan.epilog)
-        self.assertEqual(set(self.cache), {
-            ('nvmath', 7, ((17,), (0,), 'C2R')),
-            ('nvmath', 7, ((17,), (0,), 'C2R'), 'ortho', 'inverse')})
-        self.assertIs(self.ns['_try_use_nvmath'](
-            operand, None, (0,), 'ortho',
-            fft_type='C2R', fft_direction='inverse'), original_output)
-        self.assertIs(self.invoke(kind='C2R', operand=operand, norm='ortho'),
-                      ajay_output)
-        self.assertEqual(original_plan.prepared_resets, 1)
-        self.assertEqual(ajay_plan.prepared_resets, 1)
-        self.assertEqual(len(self.compilations), 1)
-
-    def test_other_fft_families_keep_the_base_class_and_key(self):
-        for kind in ('C2C', 'R2C'):
-            with self.subTest(kind=kind):
-                self.invoke(kind=kind, direction='forward')
-                plan = self.plans[-1]
-                self.assertIs(type(plan), self.ns['CachedFFT'])
-                self.assertIn(
-                    ('nvmath', 7, ((1024,), (0,), kind)), self.cache)
-                self.assertEqual(plan.prepared_resets, 0)
-
-    def test_r2c_divisor_uses_real_input(self):
-        self.invoke(kind='R2C', direction='forward', norm='forward',
-                    operand=Array((33,)))
-        self.assertEqual(self.plans[0]._cupy_fft_epilog_divisor, 33)
-
-    def test_partial_axes_exclude_batch_dimensions(self):
-        self.invoke(operand=Array((4, 3, 8)), axes=(0, 2), norm='ortho')
-        self.assertEqual(
-            self.plans[0]._cupy_fft_epilog_divisor, math.sqrt(32))
-
-    def test_divisor_one_avoids_callback(self):
-        self.invoke(operand=Array((1,)), norm='ortho')
-        self.assertEqual(self.compilations, [])
-        self.assertIsNone(self.plans[0].epilog)
-
-    def test_delegates_output_dtype_and_device_to_nvmath(self):
-        for dtype in ('float32', 'float64', 'complex64', 'complex128'):
-            with self.subTest(dtype=dtype):
-                plan = SimpleNamespace(
-                    fft_abstract_type='C2C', result_data_type=dtype,
-                    device_id=2)
-                self.ns['_compile_normalization_epilog'](
-                    plan, Array((32,)), (0,), 'forward', 'forward')
-                self.assertEqual(self.compilations[-1], (32, dtype, 2))
-                self.assertEqual(self.current_device, 3)
-                self.assertEqual(
-                    self.compilations[-1][0].dtype,
-                    numpy.finfo(dtype).dtype)
-                output = [None]
-                value = numpy.dtype(dtype).type(64)
-                self.callbacks[-1](output, 0, value, None, None)
-                self.assertEqual(output[0], 2)
-                self.assertEqual(output[0].dtype, numpy.dtype(dtype))
-
-    def test_warm_hit_never_calls_nvmath_compiler(self):
+    def test_streams_keep_separate_bindings_and_plans(self):
         self.invoke()
-        self.assertEqual(self.compilations, [(1024, 'complex64', 0)])
+        self.stream = SimpleNamespace(ptr=8, synchronize=self.synchronize)
         self.invoke()
-        self.assertEqual(self.compilations, [(1024, 'complex64', 0)])
+        self.assertEqual(len(self.plans), 2)
+        self.assertEqual(self.uploads, 2)
+        self.assertNotEqual(self.plans[0].epilog.data, self.plans[1].epilog.data)
 
-    def test_preparation_collection_restores_hooks_before_warm_calls(self):
-        path = ADAPTER.parents[2] / 'benchmarks/fft_nvmath_adapter/main.py'
-        function = next(node for node in ast.parse(path.read_text()).body
-                        if isinstance(node, ast.FunctionDef)
-                        and node.name == 'prepare_call')
-        namespace = {'time': time}
-        exec(compile(ast.Module(body=[function], type_ignores=[]),
-                     str(path), 'exec'), namespace)
-        prepare = namespace['prepare_call']
-        derived = type('DerivedPlan', (self.ns['CachedFFT'],), {})
-        self.ns['CachedFFT'] = derived
-        adapter = SimpleNamespace(CachedFFT=derived)
-        original_compiler = self.nvmath_fft.compile_epilog
+    def test_operand_device_scopes_callback_key_and_plan_and_restores_caller(self):
+        for row in ('ajay', 'unfused'):
+            with self.subTest(row=row):
+                operand = Array()
+                operand.data.device_id = 1
+                self.invoke(operand=operand, row=row)
+                self.assertEqual(self.current_device, 0)
+                self.assertEqual(self.plans[-1].device_id, 1)
+        self.assertTrue(all(key[-1] == 1 for key in self.bindings))
 
-        def public(operand):
-            return self.invoke(operand=operand, norm='ortho')
-
-        result, phases = prepare(public, Array(), {}, adapter, self.nvmath_fft)
-        self.assertIs(result, self.plans[0].output)
-        self.assertEqual(set(phases), {
-            'construct_cpu_us', 'compile_epilog_cpu_us', 'plan_cpu_us'})
-        self.assertTrue(all(value > 0 for value in phases.values()))
-        self.assertNotIn('__init__', vars(derived))
-        self.assertNotIn('plan', vars(derived))
-        self.assertIs(self.nvmath_fft.compile_epilog, original_compiler)
-        public(Array())
-        self.assertEqual(len(self.compilations), 1)
-
-        def fail(operand):
-            raise RuntimeError('preparation failed')
-
-        with self.assertRaisesRegex(RuntimeError, 'preparation failed'):
-            prepare(fail, Array(), {}, adapter, self.nvmath_fft)
-        self.assertNotIn('__init__', vars(derived))
-        self.assertNotIn('plan', vars(derived))
-        self.assertIs(self.nvmath_fft.compile_epilog, original_compiler)
-
-    def test_summary_keeps_cpu_results_and_pairs_gpu_block_medians(self):
-        path = ADAPTER.parents[2] / 'benchmarks/fft_nvmath_adapter/main.py'
-        tree = ast.parse(path.read_text())
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef)
-                        and node.name == 'summarize')
-        pairs = ast.literal_eval(next(
-            node.value for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == 'PAIRS'
-                    for target in node.targets)))
-        labels = ('original', 'ajay', 'native')
-        pairs = {name: (a, b) for name, (a, b) in pairs.items()
-                 if a in labels and b in labels}
-        namespace = {'median': median, 'math': math, 'PAIRS': pairs}
-        exec(compile(ast.Module(body=[function], type_ignores=[]),
-                     str(path), 'exec'), namespace)
-        blocks = []
-        for index, gpu_values in enumerate(((10, 9, 20),
-                                             (100, 99, 21),
-                                             (101, 0, 22))):
-            rows = {
-                label: {'cpu_median_us': cpu + index, 'gpu_median_us': gpu}
-                for label, cpu, gpu in zip(labels, (20, 10, 9), gpu_values)
-            }
-            blocks.append({
-                'rows': rows,
-                'paired_cpu_us': {
-                    name: rows[a]['cpu_median_us'] - rows[b]['cpu_median_us']
-                    for name, (a, b) in pairs.items()},
-                'paired_gpu_us': {
-                    name: rows[a]['gpu_median_us'] - rows[b]['gpu_median_us']
-                    for name, (a, b) in pairs.items()},
-            })
-        result = namespace['summarize'](blocks, labels)
-        self.assertEqual(result['rows_cpu_us'], {
-            'original': 21, 'ajay': 11, 'native': 10})
-        self.assertEqual(result['original_minus_ajay'], 10)
-        self.assertEqual(result['rows_gpu_us'], {
-            'original': 100, 'ajay': 9, 'native': 21})
-        # Preserve paired-block statistics; subtracting row medians gives 91.
-        self.assertEqual(result['paired_gpu_us']['original_minus_ajay'], 1)
-        self.assertEqual(result['paired_gpu_us']['ajay_minus_native'], -11)
-
-    def test_key_rejection_keeps_existing_fallback_policy(self):
-        def fail(*args):
-            raise ValueError('unsupported layout')
-        self.ns['_create_key_from_operand'] = fail
-        self.assertIsNone(self.invoke())
-        self.assertEqual(str(self.fallbacks[0]), 'unsupported layout')
-        self.assertEqual(self.plans, [])
-
-    def test_planning_failure_frees_and_does_not_cache(self):
+    def test_planning_failure_waits_before_releasing_scalar(self):
         self.fail_plan = True
         self.assertIsNone(self.invoke())
         self.assertEqual(str(self.fallbacks[0]), 'planning failed')
         self.assertEqual(self.plans[0].freed, 1)
+        self.assertEqual(self.synchronizations, 1)
+        self.assertIsNone(self.plans[0]._cupy_fft_epilog)
         self.assertFalse(self.cache)
 
-    def test_execution_failure_releases_and_frees_cold_plan(self):
-        self.fail_execute = True
-        with self.assertRaisesRegex(RuntimeError, 'execution failed'):
-            self.invoke()
-        self.assertEqual(self.plans[0].released, 1)
-        self.assertEqual(self.plans[0].freed, 1)
-        self.assertFalse(self.cache)
-
-    def test_warm_execution_failure_preserves_cache_ownership(self):
-        self.invoke()
-        self.fail_execute = True
-        with self.assertRaisesRegex(RuntimeError, 'execution failed'):
-            self.invoke()
-        self.assertEqual(self.plans[0].released, 2)
-        self.assertEqual(self.plans[0].freed, 0)
-        self.assertEqual(len(self.cache), 1)
-
-    def test_compilation_failure_frees_cold_plan(self):
-        def fail(*args, **kwargs):
-            raise RuntimeError('compilation failed')
-        self.nvmath_fft.compile_epilog = fail
+    def test_compilation_failure_does_not_create_a_plan(self):
+        self.ns['_nvmath_scaling'].get_scaling_epilog = Mock(
+            side_effect=RuntimeError('compilation failed'))
         self.assertIsNone(self.invoke())
         self.assertEqual(str(self.fallbacks[0]), 'compilation failed')
-        self.assertEqual(self.current_device, 3)
-        self.assertEqual(self.plans[0].freed, 1)
+        self.assertFalse(self.plans)
         self.assertFalse(self.cache)
 
-    def test_disabled_cache_releases_plan_after_execution(self):
+    def test_execution_failures_preserve_existing_ownership_policy(self):
+        self.fail_execute = True
+        with self.assertRaisesRegex(RuntimeError, 'execution failed'):
+            self.invoke()
+        cold = self.plans[0]
+        self.assertEqual((cold.released, cold.freed), (1, 1))
+        self.assertFalse(self.cache)
+        self.fail_execute = False
+        self.invoke()
+        warm = self.plans[1]
+        self.fail_execute = True
+        with self.assertRaisesRegex(RuntimeError, 'execution failed'):
+            self.invoke()
+        self.assertEqual((warm.released, warm.freed), (2, 0))
+        self.assertEqual(len(self.cache), 1)
+
+    def test_disabled_cache_and_failed_insertion_wait_on_eviction(self):
         self.cache.is_enabled = False
         self.invoke()
         self.assertFalse(self.cache)
-        self.assertEqual(self.plans[0].released, 1)
-        self.assertEqual(self.plans[0].freed, 1)
-
-    def test_insertion_failure_frees_plan(self):
+        self.assertEqual(self.synchronizations, 1)
+        self.cache.is_enabled = True
         self.cache.fail_insert = True
         with self.assertRaisesRegex(RuntimeError, 'insertion failed'):
             self.invoke()
-        self.assertEqual(self.plans[0].freed, 1)
+        self.assertEqual(self.synchronizations, 2)
+        self.assertTrue(all(p.freed == 1 for p in self.plans))
+
+    def test_original_cleanup_does_not_add_a_stream_wait(self):
+        self.invoke(row='original')
+        self.plans[0].free()
+        self.assertEqual(self.synchronizations, 0)
 
 
 if __name__ == '__main__':

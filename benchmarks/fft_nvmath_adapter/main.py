@@ -4,8 +4,14 @@ The sweep measures CPU host latency and GPU event intervals, with the exact
 minimal cached lifecycle
 included only for comparable C2C default-forward cases. GPU event intervals
 include host submission gaps. This is coverage, not a workload frequency model.
+Original uses the reference adapter. Axes adds common-axis normalization and
+no-op scaling skips. Fused adds runtime-divisor NVRTC fusion to Axes; C2R adds
+prepared operand reset to Axes. Ajay combines both. Native uses CuPy's existing
+backend.
 Use --case irfft --compare-c2r-reset --blocks 24 to isolate prepared C2R
 reset against the same fused adapter using the original operand reset.
+Use --compare-fusion --blocks 24 to compare separate CuPy scaling with
+NVRTC fusion while holding the Ajay request/reset path fixed.
 Install this checkout with prepared copying in nvmath reset_operand_unchecked;
 its execute implementation remains pinned to candidate 84d59bc.
 """
@@ -47,10 +53,19 @@ PAIRS = {
     "original_minus_minimal": ("original", "minimal"),
     "ajay_minus_minimal": ("ajay", "minimal"),
     "original_minus_ajay": ("original", "ajay"),
+    "original_minus_axes": ("original", "axes"),
+    "axes_minus_ajay": ("axes", "ajay"),
+    "axes_minus_fused": ("axes", "fused"),
+    "axes_minus_c2r": ("axes", "c2r"),
+    "axes_minus_native": ("axes", "native"),
+    "axes_minus_minimal": ("axes", "minimal"),
+    "c2r_minus_ajay": ("c2r", "ajay"),
+    "c2r_minus_native": ("c2r", "native"),
     "original_minus_native": ("original", "native"),
     "ajay_minus_native": ("ajay", "native"),
     "fused_minus_ajay": ("fused", "ajay"),
     "fused_minus_native": ("fused", "native"),
+    "unfused_minus_ajay": ("unfused", "ajay"),
     "minimal_minus_native": ("minimal", "native"),
     "minimal_minus_stateful": ("minimal", "stateful"),
     "ajay_minus_stateful": ("ajay", "stateful"),
@@ -71,6 +86,17 @@ def identity(path):
     }
 
 
+def check_source_copy(imported, expected):
+    """Accept editable or regular installs of the exact benchmark candidate."""
+    imported, expected = Path(imported).resolve(), Path(expected).resolve()
+    check(
+        imported.is_file() and expected.is_file()
+        and imported.read_bytes() == expected.read_bytes(),
+        "Installed CuPy source differs from the benchmark candidate. "
+        f"Imported: {imported}; expected matching contents: {expected}",
+    )
+
+
 def installed_version(package):
     try:
         return importlib.metadata.version(package)
@@ -78,9 +104,23 @@ def installed_version(package):
         return None
 
 
+def cpu_model():
+    """Report the processor model for host-latency comparisons."""
+    try:
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            field, separator, value = line.partition(":")
+            if separator and field.strip().lower() in (
+                "model name", "hardware"
+            ):
+                return value.strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine()
+
+
 def prepare_call(function, operand, kwargs, adapter, nf):
     """Record miss preparation; remove all wrappers before warm timing."""
-    elapsed = {name: 0 for name in ("construct", "compile_epilog", "plan")}
+    elapsed = {name: 0 for name in ("construct", "epilog_prepare", "plan")}
     missing, previous = object(), []
 
     def measured(name, target):
@@ -95,7 +135,7 @@ def prepare_call(function, operand, kwargs, adapter, nf):
     try:
         for owner, attribute, phase in (
             (adapter.CachedFFT, "__init__", "construct"),
-            (nf, "compile_epilog", "compile_epilog"),
+            (adapter, "_normalization_epilog", "epilog_prepare"),
             (adapter.CachedFFT, "plan", "plan"),
         ):
             previous.append(
@@ -149,7 +189,19 @@ def save(path, payload):
 
 def row_orders(labels, blocks):
     rng, orders = random.Random(0), []
-    if len(labels) == 5:
+    if len(labels) >= 6 and len(labels) % 2 == 0:
+        # An even-sized Williams design balances positions and every ordered
+        # adjacent pair over n blocks. Six and eight rows both fit 24 blocks.
+        size = len(labels)
+        base = [0]
+        for index in range(1, size // 2):
+            base.extend((index, size - index))
+        base.append(size // 2)
+        permutations = [
+            tuple(labels[(x + offset) % size] for x in base)
+            for offset in range(size)
+        ]
+    elif len(labels) == 5:
         # Williams design: each row occupies each position twice, and every
         # ordered adjacent pair occurs twice over ten blocks.
         base = (0, 1, 4, 2, 3)
@@ -215,6 +267,95 @@ def transform_axes(spec, kwargs, ndim):
     if axes is None:
         axes = tuple(range(ndim))
     return tuple(int(axis) % ndim for axis in axes)
+
+
+def row_labels(spec, *, compare_c2r_reset=False, compare_fusion=False):
+    if compare_fusion:
+        return ("original", "unfused", "ajay", "native")
+    if compare_c2r_reset:
+        return ("original", "fused", "ajay", "native")
+    return (("original", "axes", "fused", "c2r", "ajay", "minimal",
+             "native", "stateful") if spec["minimal"] else
+            ("original", "axes", "fused", "c2r", "ajay", "native"))
+
+
+def callback_free_key(adapter, operand, spec, kwargs, stream_ptr):
+    """Describe Original's plan without deriving it from a callback key."""
+    public = spec["public"]
+    kind = ("C2R" if public.startswith("irfft") else
+            "R2C" if public.startswith("rfft") else "C2C")
+    axes = transform_axes(spec, kwargs, operand.ndim)
+    options = adapter._FFT_OPTIONS[kind]
+    try:
+        key = adapter._create_key_from_operand(operand, axes, options)
+    except adapter.nvmath_fft.UnsupportedLayoutError as error:
+        key = adapter._create_key_from_operand(
+            operand, tuple(error.axes), options, tuple(error.permutation))
+    return ("nvmath", stream_ptr, key)
+
+
+def normalization_metadata(np, spec, kwargs, operand_shape, output_shape,
+                           output_dtype):
+    """Record effective scaling, including C2R's full real transform size."""
+    norm = kwargs.get("norm")
+    effective = "backward" if norm is None else norm
+    inverse = spec["public"].startswith("i")
+    axes = transform_axes(spec, kwargs, len(operand_shape))
+    shape = (output_shape if spec["public"].startswith("irfft")
+             else operand_shape)
+    size = math.prod(shape[axis] for axis in axes)
+    divisor = (math.sqrt(size) if effective == "ortho" else size
+               if (effective == "backward" and inverse
+                   or effective == "forward" and not inverse) else 1)
+    real_dtype = np.finfo(output_dtype).dtype
+    return {
+        "requested_norm": norm,
+        "effective_norm": effective,
+        "direction": "inverse" if inverse else "forward",
+        "transformed_points": size,
+        "divisor": divisor,
+        "divisor_dtype": real_dtype.name,
+        "typed_divisor": float(real_dtype.type(divisor)),
+        "scaling_applies": divisor != 1,
+    }
+
+
+def fusion_report(payload):
+    """Render same-run fusion contrasts separately from historical results."""
+    cases = sorted(payload["cases"], key=lambda case: (
+        not case["normalization"]["scaling_applies"],
+        -case["summary"]["unfused_minus_ajay"], case["case_id"]))
+    lines = [
+        "# Isolated normalization fusion", "",
+        "Unfused and Fused use the same Ajay request path, nvmath reset, "
+        "metadata helpers and workspace policy. Unfused scales through a "
+        "separate CuPy division; Fused uses an NVRTC store callback.", "",
+        "Times are median CPU or CUDA-event µs. Saved is the median paired "
+        "block difference, Unfused minus Fused. GPU intervals include host "
+        "submission gaps. Scaled requests precede unscaled controls.", "",
+        "| ID | Request | Operand | Effective norm | Divisor | Unfused CPU | "
+        "Fused CPU | Saved CPU | Unfused GPU | Fused GPU | Saved GPU |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "---: |",
+    ]
+    for case in cases:
+        spec, normal, summary = (case["case"], case["normalization"],
+                                  case["summary"])
+        arguments = ", ".join(f"{key}={value!r}"
+                              for key, value in spec["kwargs"].items())
+        request = f"{spec['public']}(a{', ' if arguments else ''}{arguments})"
+        norm = ("None→backward" if normal["requested_norm"] is None
+                else normal["effective_norm"])
+        operand = (f"{tuple(case['operand_shape'])} {spec['dtype']} "
+                   f"{spec['layout']}")
+        cpu, gpu = summary["rows_cpu_us"], summary["rows_gpu_us"]
+        lines.append(
+            f"| {case['case_id']} | `{request}` | `{operand}` | {norm} | "
+            f"{normal['typed_divisor']:.9g} | {cpu['unfused']:.3f} | "
+            f"{cpu['ajay']:.3f} | {summary['unfused_minus_ajay']:.3f} | "
+            f"{gpu['unfused']:.3f} | {gpu['ajay']:.3f} | "
+            f"{summary['paired_gpu_us']['unfused_minus_ajay']:.3f} |")
+    return "\n".join(lines) + "\n"
 
 
 def reference_error(np, actual, wanted, axes, input_dtype):
@@ -308,6 +449,16 @@ def summarize(blocks, labels):
             and result["sign_counts"]["fused_minus_ajay"]["negative"]
             >= math.ceil(len(blocks) * 10 / 12)
         )
+    if "unfused" in labels:
+        delta = result["unfused_minus_ajay"]
+        percent = 100 * delta / rows["unfused"]
+        result["unfused_minus_ajay_percent"] = percent
+        result["fusion_negative_median"] = delta < 0
+        result["fusion_material_regression_candidate"] = (
+            delta <= -0.2 and percent <= -2
+            and result["sign_counts"]["unfused_minus_ajay"]["negative"]
+            >= math.ceil(len(blocks) * 10 / 12)
+        )
     return result
 
 
@@ -326,20 +477,27 @@ def main():
     )
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument(
-        "--blocks", type=int, default=30,
-        help="Multiple of 30; multiple of 6 if no minimal cases are selected",
+        "--blocks", type=int, default=24,
+        help="Positive multiple of 24 for balanced row orders",
     )
     parser.add_argument("--repeats", type=int, default=500)
     parser.add_argument("--warmups", type=int, default=20)
     parser.add_argument("--release-workspace", action="store_true")
-    parser.add_argument(
+    comparison = parser.add_mutually_exclusive_group()
+    comparison.add_argument(
         "--compare-c2r-reset", action="store_true",
         help="C2R cases only: compare the fused adapter with original versus "
              "prepared operand reset; requires blocks divisible by 24",
     )
+    comparison.add_argument(
+        "--compare-fusion", action="store_true",
+        help="Compare separate CuPy scaling with NVRTC fusion using the "
+             "same Ajay request/reset path; requires blocks divisible by 24",
+    )
     args = parser.parse_args()
     catalog = load("cases.py")
     cases = getattr(catalog, args.suite)()
+    case_ids = {spec["name"]: index for index, spec in enumerate(cases, 1)}
     if args.case_filter:
         cases = [s for s in cases if args.case_filter in s["name"]]
     if not cases:
@@ -351,11 +509,9 @@ def main():
                      "use --case irfft")
     if args.list_cases:
         for spec in cases:
-            rows = (
-                "original/fused/ajay/native" if args.compare_c2r_reset else (
-                "original/ajay/minimal/native/stateful"
-                if spec["minimal"] else "original/ajay/native"
-            ))
+            rows = "/".join(row_labels(
+                spec, compare_c2r_reset=args.compare_c2r_reset,
+                compare_fusion=args.compare_fusion))
             print(
                 f"{spec['name']}: {spec['public']} {spec['shape']} "
                 f"{spec['dtype']} {spec['layout']} {spec['kwargs']} "
@@ -363,10 +519,7 @@ def main():
             )
         print(f"{len(cases)} cases")
         return
-    permutation_count = (
-        24 if args.compare_c2r_reset
-        else 30 if any(s["minimal"] for s in cases) else 6
-    )
+    permutation_count = 24
     if (
         args.blocks < permutation_count
         or args.blocks % permutation_count
@@ -395,19 +548,10 @@ def main():
     from cupyx.profiler import benchmark
 
     adapter = importlib.import_module("cupy.fft._fft_nvmath")
-    check(
-        hasattr(nf, "compile_epilog"),
-        "Requires nvmath's documented compile_epilog API",
-    )
     expected_adapter = (
         Path(__file__).resolve().parents[2] / "cupy" / "fft" / "_fft_nvmath.py"
     )
-    check(
-        Path(adapter.__file__).resolve() == expected_adapter.resolve(),
-        "CuPy was imported from another checkout. Install this checkout "
-        "with its editable build, and run this source tree's benchmark. "
-        f"Imported: {adapter.__file__}; expected: {expected_adapter}",
-    )
+    check_source_copy(adapter.__file__, expected_adapter)
     minimal = load("minimal_lifecycle.py")
     execute = hashlib.sha256(
         inspect.getsource(nf.FFT.execute).encode()
@@ -476,9 +620,10 @@ def main():
     gc_enabled, cache, cache_owned = gc.isenabled(), None, False
     files = {
         "benchmark": __file__,
+        "report": Path(__file__).with_name("report.py"),
         "cases": catalog.__file__,
         "adapter": adapter.__file__,
-        "normalization": inspect.getfile(inspect.unwrap(nf.compile_epilog)),
+        "normalization": inspect.getfile(adapter._normalization_epilog),
         "minimal_lifecycle": minimal.__file__,
         "reference_reset": reset_reference.__file__,
         "nvmath_fft": inspect.getfile(nf.FFT),
@@ -490,6 +635,16 @@ def main():
             _numpy_dtype_name.__module__
         ).__file__,
     }
+    scaling_module = importlib.import_module("cupy.fft._nvmath_scaling")
+    check_source_copy(scaling_module.__file__,
+                      expected_adapter.with_name("_nvmath_scaling.py"))
+    check_source_copy(Path(scaling_module.__file__).with_suffix(".cu"),
+                      expected_adapter.with_name("_nvmath_scaling.cu"))
+    files["nvrtc_scaling"] = scaling_module.__file__
+    files["nvrtc_scaling_cuda"] = str(
+        Path(scaling_module.__file__).with_suffix(".cu"))
+    files["cupy_compiler"] = importlib.import_module(
+        "cupy.cuda.compiler").__file__
     for name in (
         "nvmath.internal.tensor_ifc_cupy",
         "nvmath.internal._strides_helpers",
@@ -525,7 +680,7 @@ def main():
         "not isolated kernel time.",
         "preparation_measurement": (
             "Single first-miss host intervals for construction, "
-            "compile_epilog and plan; execution excluded. "
+            "epilog preparation and plan; execution excluded. "
             "Wrappers removed before warm timing. "
             "Compiler first use and driver caches affect these observations."
         ),
@@ -576,6 +731,8 @@ def main():
             payload["environment"] = {
                 "gpu": name.decode() if isinstance(name, bytes) else str(name),
                 "host": platform.uname()._asdict(),
+                "node": platform.node(),
+                "cpu_model": cpu_model(),
                 "python": sys.version,
                 "python_executable": sys.executable,
                 "numpy": np.__version__,
@@ -586,7 +743,8 @@ def main():
                 "stream_ptr": stream.ptr,
                 "callback_compiler": {
                     package: installed_version(package)
-                    for package in ("numba", "numba-cuda", "llvmlite")
+                    for package in (
+                        "nvidia-cuda-nvrtc", "cuda-bindings", "numba")
                 },
             }
             block_path.parent.mkdir(parents=True, exist_ok=True)
@@ -612,16 +770,16 @@ def main():
                 )
                 hooks = {
                     "original": adapter._try_use_nvmath,
+                    "axes": adapter._try_use_nvmath_ajay_unfused,
                     "fused": adapter._try_use_nvmath_ajay,
+                    "c2r": adapter._try_use_nvmath_ajay_unfused,
                     "ajay": adapter._try_use_nvmath_ajay,
+                    "unfused": adapter._try_use_nvmath_ajay_unfused,
                 }
-                labels = (
-                    ("original", "fused", "ajay", "native")
-                    if args.compare_c2r_reset else (
-                    ("original", "ajay", "minimal", "native", "stateful")
-                    if spec["minimal"]
-                    else ("original", "ajay", "native")
-                ))
+                labels = row_labels(
+                    spec, compare_c2r_reset=args.compare_c2r_reset,
+                    compare_fusion=args.compare_fusion)
+                include_minimal = "minimal" in labels
                 axes = tuple(range(operand.ndim))
                 options = adapter._FFT_OPTIONS["C2C"]
                 outputs, minimal_cache = [], {}
@@ -630,7 +788,8 @@ def main():
                 nvmath_plans = {}
                 reset_observations = {}
                 hits_per_call = {
-                    "original": 1, "fused": 1, "ajay": 1,
+                    "original": 1, "axes": 1, "fused": 1,
+                    "c2r": 1, "ajay": 1, "unfused": 1,
                     "minimal": 0, "stateful": 0}
 
                 def select(label):
@@ -638,7 +797,7 @@ def main():
                     # only this subclass's method keeps control selection
                     # outside the timed public call and leaves nf.FFT intact.
                     method = (reset_reference.reset_operand_unchecked
-                              if label in ("original", "fused")
+                              if label in ("original", "axes", "fused")
                               else nvmath_reset)
                     select_reset(adapter.CachedFFT, method,
                                  (node.plan for _, node in cache))
@@ -667,8 +826,11 @@ def main():
                     cache_key, node = entries[0]
                     check(
                         isinstance(cache_key, tuple)
-                        and len(cache_key) in (3, 5)
-                        and cache_key[:2] == ("nvmath", stream.ptr),
+                        and cache_key[:2] == ("nvmath", stream.ptr)
+                        and (len(cache_key) == 3 or (
+                            len(cache_key) == 4 and cache_key[3] in (
+                                ("normalization", "N"),
+                                ("normalization", "sqrtN")))),
                         "Warm request did not route to nvmath",
                     )
                     plan = node.plan
@@ -681,10 +843,11 @@ def main():
                         not plan.logger.isEnabledFor(logging.INFO),
                         "Disable nvmath INFO/DEBUG logging",
                     )
-                    # Baked scaling distinguishes Ajay plans from Original;
+                    # Scaling-policy keys distinguish Ajay from Original;
                     # reset selection never changes the production cache key.
                     original_warm = None
-                    original_key = ("nvmath", stream.ptr, cache_key[2])
+                    original_key = callback_free_key(
+                        adapter, warm_operand, spec, kwargs, stream.ptr)
                     if cache_key != original_key:
                         select("original")
                         original_warm, original_preparation = prepare_call(
@@ -694,7 +857,7 @@ def main():
                     else:
                         preparation["original"] = {"shared_plan_with": "ajay"}
                     fused_warm, fused_plan, fused_key = None, None, None
-                    if args.compare_c2r_reset:
+                    if "fused" in labels:
                         before_fused = {key: node.plan for key, node in cache}
                         select("fused")
                         fused_warm, fused_preparation = prepare_call(
@@ -717,7 +880,45 @@ def main():
                         and nvmath_plans.get(cache_key) is plan,
                         "Original and Ajay warmups must use nvmath",
                     )
-                    if spec["minimal"]:
+                    separate_scale_label = (
+                        "unfused" if args.compare_fusion else
+                        None if args.compare_c2r_reset else "axes")
+                    separate_scale_warm, separate_scale_plan = None, None
+                    if separate_scale_label is not None:
+                        select(separate_scale_label)
+                        (separate_scale_warm,
+                         separate_preparation) = prepare_call(
+                             public, warm_operand, kwargs, adapter, nf)
+                        preparation[separate_scale_label] = {
+                            **separate_preparation,
+                            "shared_plan_with": "original"}
+                        outputs.append((separate_scale_warm, warm_expected))
+                        after_separate = {
+                            key: node.plan for key, node in cache}
+                        check(after_separate == nvmath_plans,
+                              "Separate scaling must reuse Original's "
+                              "callback-free plan without inserting "
+                              "another plan")
+                        separate_scale_plan = after_separate[original_key]
+                        check(separate_scale_plan is original_plan,
+                              "Separate scaling and Original use different "
+                              "base plans")
+                    c2r_warm = None
+                    if "c2r" in labels:
+                        select("c2r")
+                        c2r_warm, c2r_preparation = prepare_call(
+                            public, warm_operand, kwargs, adapter, nf)
+                        preparation["c2r"] = {
+                            **c2r_preparation,
+                            "shared_plan_with": "original"}
+                        outputs.append((c2r_warm, warm_expected))
+                        after_c2r = {key: node.plan for key, node in cache}
+                        check(after_c2r == nvmath_plans
+                              and after_c2r.get(original_key)
+                              is separate_scale_plan,
+                              "C2R and Axes must share Original's "
+                              "callback-free plan")
+                    if include_minimal:
                         check(original_plan is plan and len(cache_key) == 3,
                               "Unscaled rows must share one cached plan")
                         key = adapter._create_key_from_operand(
@@ -769,7 +970,7 @@ def main():
                             "CuPy cache identities changed; both backend "
                             "families must fit without eviction",
                         )
-                        if spec["minimal"]:
+                        if include_minimal:
                             check(
                                 len(minimal_cache) == 1
                                 and minimal_cache[(stream.ptr, key)] is plan,
@@ -789,10 +990,13 @@ def main():
                             )
 
                     def verify_c2r_reset(label):
-                        if label not in ("original", "fused", "ajay"):
+                        if label not in ("original", "axes", "fused", "c2r",
+                                         "ajay", "unfused"):
                             return
                         cached = (original_plan if label == "original"
                                   else fused_plan if label == "fused"
+                                  else separate_scale_plan
+                                  if label in ("axes", "c2r", "unfused")
                                   else plan)
                         method = cached.reset_operand_unchecked.__func__
                         prepared = (cached.fft_abstract_type == "C2R"
@@ -803,14 +1007,15 @@ def main():
                             cached, "_c2r_reset_prepared_last_used", False)
                         check(type(cached) is adapter.CachedFFT,
                               "Unexpected nvmath cached plan class")
-                        if label in ("original", "fused"):
+                        if label in ("original", "axes", "fused"):
                             check(method is (
                                       reset_reference.reset_operand_unchecked)
                                   and not last_used,
                                   "Reference control used prepared C2R reset")
                         else:
                             check(method is nvmath_reset,
-                                  "Ajay must use nvmath's existing reset API")
+                                  "Ajay, C2R and Unfused must use nvmath's "
+                                  "existing reset API")
                         if prepared:
                             check(info is not None and info["eligible"]
                                   and last_used,
@@ -948,14 +1153,19 @@ def main():
                     }
                     outputs.clear()
                     native_outputs.clear()
+                    normalization = normalization_metadata(
+                        np, spec, kwargs, operand.shape, warm.shape,
+                        warm.dtype)
                     del (out, warm, original_warm, fused_warm,
+                         separate_scale_warm, c2r_warm,
                          native_warm, fresh)
                     calls = {
                         label: (public, (operand,), kwargs)
-                        for label in ("original", "fused", "ajay", "native")
+                        for label in ("original", "axes", "fused", "c2r",
+                                      "unfused", "ajay", "native")
                         if label in labels
                     }
-                    if spec["minimal"]:
+                    if include_minimal:
                         calls["minimal"] = (
                             minimal.execute_cached,
                             (operand, axes, options, minimal_cache),
@@ -972,9 +1182,17 @@ def main():
                         )
                     plan_rows = [("original", original_key, original_plan),
                                  ("ajay", cache_key, plan)]
-                    if args.compare_c2r_reset:
+                    if "fused" in labels:
                         plan_rows.insert(1, ("fused", fused_key, fused_plan))
+                    if separate_scale_label is not None:
+                        plan_rows.insert(
+                            1, (separate_scale_label, original_key,
+                                separate_scale_plan))
+                    if "c2r" in labels:
+                        plan_rows.insert(
+                            3, ("c2r", original_key, separate_scale_plan))
                     case = {
+                        "case_id": case_ids[spec["name"]],
                         "case": spec,
                         "rows": labels,
                         "operand_shape": operand.shape,
@@ -984,6 +1202,7 @@ def main():
                         "runtime_axes": repr(
                             kwargs.get("axes", kwargs.get("axis"))
                         ),
+                        "normalization": normalization,
                         "correctness": True,
                         "reference_error": accuracy,
                         "route": {
@@ -1097,12 +1316,16 @@ def main():
                     np.testing.assert_array_equal(operand.get(), host)
                     summary = case["summary"]
                     reference_pair = (
+                        "unfused_minus_ajay" if args.compare_fusion else
                         "fused_minus_ajay" if args.compare_c2r_reset
                         else "original_minus_ajay")
                     negative_key = (
+                        "fusion_negative_median" if args.compare_fusion else
                         "fused_negative_median" if args.compare_c2r_reset
                         else "negative_median")
                     material_key = (
+                        "fusion_material_regression_candidate"
+                        if args.compare_fusion else
                         "fused_material_regression_candidate"
                         if args.compare_c2r_reset
                         else "material_regression_candidate")
@@ -1124,7 +1347,7 @@ def main():
                         f"ajay slower in {slower}/{args.blocks} blocks",
                         flush=True,
                     )
-                    if spec["minimal"]:
+                    if include_minimal:
                         print(
                             "  original-minus-minimal "
                             f"{summary['original_minus_minimal']:.3f} us; "
@@ -1172,6 +1395,7 @@ def main():
                 c["case"]["name"]
                 for c in payload["cases"]
                 if c["summary"][
+                    "fusion_negative_median" if args.compare_fusion else
                     "fused_negative_median" if args.compare_c2r_reset
                     else "negative_median"]
             ]
@@ -1181,6 +1405,14 @@ def main():
                 flush=True,
             )
             payload["status"] = "complete"
+            if args.compare_fusion:
+                report = args.json.with_suffix(".md")
+                report.write_text(fusion_report(payload))
+                print(f"Fusion table: {report}", flush=True)
+            elif not args.compare_c2r_reset:
+                report = args.json.with_suffix(".md")
+                report.write_text(load("report.py").render(payload))
+                print(f"Comparison table: {report}", flush=True)
     except BaseException as exc:
         payload["status"], payload["error"] = "failed", repr(exc)
         raise
