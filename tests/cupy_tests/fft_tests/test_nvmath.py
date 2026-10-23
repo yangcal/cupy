@@ -186,7 +186,7 @@ def test_failed_layout_retry_falls_back_without_preparing_callback(
     ('C2R', 'complex64', 'float32'),
 ])
 def test_epilog_uses_result_dtype(adapter, monkeypatch, kind, input_type,
-                                output_type):
+                                  output_type):
     prepare = Mock(return_value=object())
     monkeypatch.setattr(adapter._nvmath_scaling, 'get_scaling_epilog', prepare)
     operand = SimpleNamespace(shape=(8,), dtype=np.dtype(input_type))
