@@ -14,25 +14,39 @@ def adapter():
     return _fft_nvmath
 
 
-@pytest.mark.parametrize('ndim,axes,expected,canonical', [
-    (1, None, (0,), True),
-    (2, (0, 1), (0, 1), True),
-    (3, (-3, -2, -1), (0, 1, 2), True),
-    (2, [-2, -1], (0, 1), False),
-    (3, np.int64(-1), (2,), False),
-    (3, (np.int64(-3), np.int64(-1)), (0, 2), False),
-    (3, (2, 0), (2, 0), False),
-    (3, (0, -3), None, False),
-    (2, (2,), None, False),
-    (2, (-3,), None, False),
-    (4, None, None, False),
-    (4, (0, 1, 2, 3), None, False),
+@pytest.mark.parametrize('ndim,axes,expected', [
+    (1, None, (0,)),
+    (2, (0, 1), (0, 1)),
+    (3, (-3, -2, -1), (0, 1, 2)),
+    (2, [-2, -1], (0, 1)),
+    (2, np.array([-2, -1]), (0, 1)),
+    (3, np.int64(-1), (2,)),
+    (3, (np.int64(-3), np.int64(-1)), (0, 2)),
+    (3, (2, 0), (2, 0)),
+    (3, (0, -3), None),
+    (2, (2,), None),
+    (2, (-3,), None),
+    (4, None, None),
+    (4, (0, 1, 2, 3), None),
+    (0, None, ()),
+    (0, 0, None),
 ])
-def test_normalize_axes(adapter, ndim, axes, expected, canonical):
-    result = adapter._normalize_axes(ndim, axes)
-    assert result == expected
-    if canonical:
-        assert result is adapter._CANONICAL_AXES[ndim]
+def test_normalize_axes(adapter, ndim, axes, expected):
+    assert adapter._normalize_axes(ndim, axes) == expected
+
+
+def test_axes_cache_preserves_uncacheable_inputs(adapter):
+    cached = adapter._normalize_axes_cached
+    cached.cache_clear()
+    first = adapter._normalize_axes(2, (1,))
+    assert adapter._normalize_axes(2, (1,)) is first
+    hits = cached.cache_info().hits
+    assert type(adapter._normalize_axes(2, (1.0,))[0]) is float
+    axes = [0]
+    assert adapter._normalize_axes(2, axes) == (0,)
+    axes[0] = 1
+    assert adapter._normalize_axes(2, axes) == (1,)
+    assert cached.cache_info().hits == hits
 
 
 @pytest.mark.parametrize('shape,axes,kind,policy,expected', [

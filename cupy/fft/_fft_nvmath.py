@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import math
 import operator
 import warnings
@@ -27,20 +28,6 @@ _FFT_OPTIONS = {
         result_layout='optimized',
     )
     for fft_type in ('C2C', 'R2C', 'C2R')
-}
-
-
-_CANONICAL_AXES = ((), (0,), (0, 1), (0, 1, 2))
-
-# Reuse normalized tuples for common full-axis spellings. Other axis objects
-# still use the general validation.
-_COMMON_AXIS_TUPLES = {
-    (1, (0,)): _CANONICAL_AXES[1],
-    (1, (-1,)): _CANONICAL_AXES[1],
-    (2, (0, 1)): _CANONICAL_AXES[2],
-    (2, (-2, -1)): _CANONICAL_AXES[2],
-    (3, (0, 1, 2)): _CANONICAL_AXES[3],
-    (3, (-3, -2, -1)): _CANONICAL_AXES[3],
 }
 
 
@@ -73,19 +60,19 @@ class CachedFFT(nvmath_fft.FFT):
 
 
 def _normalize_axes(ndim, axes):
+    # Lists/arrays are valid axes, and tuple cache keys do not distinguish
+    # integer elements from hash-equal floats. Cache only plain integer inputs.
+    if (axes is None or type(axes) is int
+            or type(axes) is tuple
+            and all(type(axis) is int for axis in axes)):
+        return _normalize_axes_cached(ndim, axes)
+    return _normalize_axes_cached.__wrapped__(ndim, axes)
+
+
+@lru_cache(maxsize=128)
+def _normalize_axes_cached(ndim, axes):
     if axes is None:
-        return _CANONICAL_AXES[ndim] if 0 <= ndim <= 3 else None
-
-    if type(axes) is int:
-        return (axes % ndim,) if -ndim <= axes < ndim else None
-
-    if type(axes) is tuple:
-        if len(axes) > 3:
-            return None
-        if all(type(axis) is int for axis in axes):
-            common = _COMMON_AXIS_TUPLES.get((ndim, axes))
-            if common is not None:
-                return common
+        axes = tuple(range(ndim))
     else:
         try:
             axis = operator.index(axes)
