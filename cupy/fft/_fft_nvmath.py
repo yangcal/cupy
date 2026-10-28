@@ -104,7 +104,7 @@ def _warn_fallback(exc):
 
 def _normalization_divisor(operand, axes, fft_type, policy):
     """Compute normalization over logical transform axes, excluding batches."""
-    if policy == 'none':
+    if policy is None:
         return 1
     size = math.prod(operand.shape[axis] for axis in axes)
     if fft_type == 'C2R':
@@ -229,7 +229,7 @@ def _try_use_nvmath(
             or norm == 'forward' and fft_direction == 'forward'):
         scaling_policy = 'N'
     else:
-        scaling_policy = 'none'
+        scaling_policy = None
     permutation = None
     result_permutation = None
 
@@ -254,7 +254,7 @@ def _try_use_nvmath(
     # Metadata and scaling policy identify this built-in callback without
     # resolving code or allocating its scalar on warm hits.
     key = ('nvmath', stream.ptr, nvmath_key)
-    if scaling_policy != 'none':
+    if scaling_policy is not None:
         key += (('normalization', scaling_policy),)
     cache = get_plan_cache()
     plan = cache.get(key)
@@ -270,7 +270,7 @@ def _try_use_nvmath(
         try:
             epilog = (_normalization_epilog(
                 operand, axes, fft_type, scaling_policy)
-                if scaling_policy != 'none' else None)
+                if scaling_policy is not None else None)
             plan = CachedFFT(
                 operand,
                 axes=axes,

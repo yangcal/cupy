@@ -55,7 +55,7 @@ def test_axes_cache_preserves_uncacheable_inputs(adapter):
     ((4, 8, 9), (1, 2), 'C2R', 'N', 128),
     ((4, 8, 9), (2, 0), 'C2R', 'N', 54),
     ((4, 8, 9), (1, 2), 'C2R', 'sqrtN', np.sqrt(128)),
-    ((4, 8, 9), (1, 2), 'C2R', 'none', 1),
+    ((4, 8, 9), (1, 2), 'C2R', None, 1),
 ])
 def test_normalization_divisor(adapter, shape, axes, kind, policy, expected):
     operand = SimpleNamespace(shape=shape)
@@ -117,9 +117,9 @@ def dispatch(adapter, monkeypatch):
 
 
 @pytest.mark.parametrize('norm,direction,policy', [
-    (None, 'forward', 'none'),
-    ('backward', 'forward', 'none'),
-    ('forward', 'inverse', 'none'),
+    (None, 'forward', None),
+    ('backward', 'forward', None),
+    ('forward', 'inverse', None),
     (None, 'inverse', 'N'),
     ('backward', 'inverse', 'N'),
     ('forward', 'forward', 'N'),
@@ -129,10 +129,10 @@ def dispatch(adapter, monkeypatch):
 def test_normalization_policy(dispatch, norm, direction, policy):
     dispatch.invoke(norm, direction)
     key = ('nvmath', dispatch.stream.ptr, ('metadata',))
-    if policy != 'none':
+    if policy is not None:
         key += (('normalization', policy),)
     assert list(dispatch.cache) == [key]
-    assert dispatch.prepare.call_count == (policy != 'none')
+    assert dispatch.prepare.call_count == (policy is not None)
 
 
 def test_warm_hit_skips_callback_preparation(dispatch):
