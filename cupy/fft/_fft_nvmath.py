@@ -200,14 +200,7 @@ def _try_use_nvmath(
     if cufft.get_current_plan() is not None:
         return None
 
-    # Resolve the stream, cache and callback data on the operand's device.
     operand_device = operand.data.device_id
-    if operand_device != cupy.cuda.runtime.getDevice():
-        with cupy.cuda.Device(operand_device):
-            return _try_use_nvmath(
-                operand, requested_shape, axes, norm,
-                fft_type=fft_type, fft_direction=fft_direction)
-
     axes = _normalize_axes(operand.ndim, axes)
     if axes is None:
         return None
