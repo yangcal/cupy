@@ -144,7 +144,6 @@ def test_warm_hit_skips_callback_preparation(dispatch):
     plan.reset_operand_unchecked.assert_called_once()
     assert plan.release_operand.call_count == 2
     assert plan._normalization_epilog is dispatch.prepare.return_value
-    assert plan._normalization_stream is dispatch.stream
     dispatch.stream_lookup.assert_called_with(_Array.data.device_id)
     assert plan.execute.call_args.kwargs['release_workspace'] is True
 
@@ -267,26 +266,3 @@ def test_unit_divisor_does_not_compile_or_upload(adapter, monkeypatch):
     assert scaling.get_scaling_epilog('complex64', 1) is None
     compile_code.assert_not_called()
     upload.assert_not_called()
-
-
-def test_cleanup_completes_callback_reads_before_dropping_owner(
-        adapter, monkeypatch):
-    from contextlib import nullcontext
-
-    plan = object.__new__(adapter.CachedFFT)
-    plan.device_id = 0
-    plan._normalization_epilog = object()
-    events = []
-    plan._normalization_stream = SimpleNamespace(
-        synchronize=lambda: events.append('synchronize'))
-
-    def release(self):
-        assert self._normalization_epilog is not None
-        events.append('free')
-        self._normalization_epilog = None
-
-    monkeypatch.setattr(adapter.cupy.cuda, 'Device',
-                        lambda device: nullcontext())
-    monkeypatch.setattr(adapter.nvmath_fft.FFT, 'free', release)
-    plan.free()
-    assert events == ['synchronize', 'free']

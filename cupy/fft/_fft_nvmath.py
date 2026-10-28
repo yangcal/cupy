@@ -36,14 +36,6 @@ class CachedFFT(nvmath_fft.FFT):
     # and PlanNd labels it uses for CuPy's own plans.
     _cupy_fft_cache_name = 'nvmath FFT'
 
-    def free(self):
-        # nvmath clears custom attributes during free(). Complete callback
-        # reads before releasing the device scalar owned by the descriptor.
-        if getattr(self, '_normalization_epilog', None) is not None:
-            with cupy.cuda.Device(self.device_id):
-                self._normalization_stream.synchronize()
-        super().free()
-
     def _cupy_fft_cache_cleanup(self):
         """Release resources when PlanCache relinquishes ownership."""
         self.free()
@@ -280,7 +272,6 @@ def _try_use_nvmath(
             )
             # DeviceCallable.data is a raw pointer; retain its scalar owner.
             plan._normalization_epilog = epilog
-            plan._normalization_stream = stream
             plan.plan(stream=stream, epilog=epilog)
         except Exception as e:
             if plan is not None:
