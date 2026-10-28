@@ -3,9 +3,6 @@
 #ifndef CUPY_FFT_CALLBACK_TYPE
 #error "CUPY_FFT_CALLBACK_TYPE must select one supported output dtype"
 #endif
-#ifndef CUPY_FFT_CALLBACK_OFFSET_UINT64
-#error "CUPY_FFT_CALLBACK_OFFSET_UINT64 must select the cuFFT offset ABI"
-#endif
 
 #if CUPY_FFT_CALLBACK_TYPE == 0
 using CallbackOutput = float;
@@ -31,11 +28,7 @@ using CallbackReal = double;
 #error "Unsupported callback output dtype"
 #endif
 
-#if CUPY_FFT_CALLBACK_OFFSET_UINT64
 using CallbackOffset = unsigned long long;
-#else
-using CallbackOffset = size_t;
-#endif
 
 // Preserve C++ linkage: nvmath uses cuFFT's default mangled callback symbol.
 __device__ void CUPY_FFT_CALLBACK_NAME(

@@ -22,16 +22,21 @@ _OUTPUT_TYPES = {
 _compile_lock = threading.Lock()
 
 
+@lru_cache(maxsize=1)
+def supports_lto_callbacks():
+    """Standard LTO callbacks require cuFFT 11.3 (CUDA 12.6U2)."""
+    return cufft.get_version() >= 11300
+
+
 @lru_cache(maxsize=128)
-def _compile_code(dtype_name, arch, offset_uint64):
-    """Cache IR by output type, GPU target and cuFFT offset ABI."""
+def _compile_code(dtype_name, arch):
+    """Cache IR by output type and GPU target."""
     from cupy.cuda import compiler
 
     source = Path(__file__).with_suffix('.cu').read_text()
     options = (
         '--std=c++17',
         f'-DCUPY_FFT_CALLBACK_TYPE={_OUTPUT_TYPES[dtype_name][0]}',
-        f'-DCUPY_FFT_CALLBACK_OFFSET_UINT64={int(offset_uint64)}',
     )
     return compiler._compile_module_with_cache(
         source, options, arch=arch, to_ltoir=True)
@@ -50,9 +55,8 @@ def get_scaling_epilog(dtype_name, divisor):
     from cupy.cuda import compiler
 
     arch = compiler._get_arch()
-    offset_uint64 = cufft.get_version() >= 11300
     with _compile_lock:
-        ltoir = _compile_code(dtype_name, arch, offset_uint64)
+        ltoir = _compile_code(dtype_name, arch)
     # Complete the upload before the temporary host buffer is released.
     scalar = cupy.asarray(numpy.asarray([divisor]), blocking=True)
     epilog = nvmath_fft.DeviceCallable(ltoir=ltoir, data=scalar.data.ptr)

@@ -222,6 +222,7 @@ def _try_use_nvmath(
         scaling_policy = 'N'
     else:
         scaling_policy = None
+    post_scale_policy = None
     permutation = None
     result_permutation = None
 
@@ -237,6 +238,9 @@ def _try_use_nvmath(
             # contiguous input, which must never be overwritten.
             nvmath_key = _create_key_from_operand(
                 operand, axes, options, permutation)
+        if (scaling_policy is not None
+                and not _nvmath_scaling.supports_lto_callbacks()):
+            post_scale_policy, scaling_policy = scaling_policy, None
     except Exception as e:
         _warn_fallback(e)
         return None
@@ -290,6 +294,11 @@ def _try_use_nvmath(
             )
         finally:
             plan.release_operand()
+        if post_scale_policy is not None:
+            divisor = _normalization_divisor(
+                operand, axes, fft_type, post_scale_policy)
+            if divisor != 1:
+                out /= divisor
     except Exception:
         if cache_miss:
             plan.free()
