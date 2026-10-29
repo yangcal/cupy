@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import lru_cache
 import math
-import operator
 import warnings
 
 import nvmath.fft as nvmath_fft
@@ -52,34 +52,19 @@ class CachedFFT(nvmath_fft.FFT):
 
 
 def _normalize_axes(ndim, axes):
-    # Lists/arrays are valid axes, and tuple cache keys do not distinguish
-    # integer elements from hash-equal floats. Cache only plain integer inputs.
-    if (axes is None or type(axes) is int
-            or type(axes) is tuple
-            and all(type(axis) is int for axis in axes)):
-        return _normalize_axes_cached(ndim, axes)
-    return _normalize_axes_cached.__wrapped__(ndim, axes)
+    if isinstance(axes, Sequence):
+        axes = tuple(axes)
+    return _normalize_axes_cached(ndim, axes)
 
 
 @lru_cache(maxsize=128)
 def _normalize_axes_cached(ndim, axes):
     if axes is None:
-        axes = tuple(range(ndim))
-    else:
-        try:
-            axis = operator.index(axes)
-        except TypeError:
-            axes = tuple(axes)
-        else:
-            axes = (axis,)
-
-    if not axes:
-        return axes
-    if len(axes) > 3:
+        return tuple(range(ndim)) if ndim <= 3 else None
+    if isinstance(axes, int):
+        return (axes % ndim,) if -ndim <= axes < ndim else None
+    if len(axes) > 3 or any(not -ndim <= axis < ndim for axis in axes):
         return None
-    if any(axis >= ndim or axis < -ndim for axis in axes):
-        return None
-
     axes = tuple(axis % ndim for axis in axes)
     return axes if len(set(axes)) == len(axes) else None
 
