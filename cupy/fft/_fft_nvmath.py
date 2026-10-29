@@ -102,7 +102,8 @@ def _normalization_epilog(operand, axes, fft_type, policy):
         dtype = {'float32': 'complex64', 'float64': 'complex128'}[dtype]
     elif fft_type == 'C2R':
         dtype = {'complex64': 'float32', 'complex128': 'float64'}[dtype]
-    return _nvmath_scaling.get_scaling_epilog(dtype, divisor)
+    return _nvmath_scaling.get_scaling_epilog(
+        dtype, divisor, operand.data.device_id)
 
 
 def _c_contiguous_element_strides(shape):

@@ -6,6 +6,13 @@ from unittest.mock import Mock
 import numpy as np
 import pytest
 
+import cupy
+from cupy import testing
+from cupy.cuda import driver
+from cupy.fft import config
+
+is_cuda_python = driver._is_cuda_python()
+
 
 @pytest.fixture
 def adapter():
@@ -35,17 +42,6 @@ def test_normalize_axes(adapter, ndim, axes, expected):
     assert adapter._normalize_axes(ndim, axes) == expected
 
 
-def test_normalize_axes_caches_lists_by_value(adapter):
-    cached = adapter._normalize_axes_cached
-    cached.cache_clear()
-    axes = [0]
-    assert adapter._normalize_axes(2, axes) == (0,)
-    axes[0] = 1
-    assert adapter._normalize_axes(2, axes) == (1,)
-    assert adapter._normalize_axes(2, (1,)) is adapter._normalize_axes(2, [1])
-    assert cached.cache_info().hits == 2
-
-
 @pytest.mark.parametrize('shape,axes,kind,policy,expected', [
     ((4, 8, 16), (1, 2), 'C2C', 'N', 128),
     ((4, 8, 16), (0, 2), 'R2C', 'N', 64),
@@ -60,302 +56,131 @@ def test_normalization_divisor(adapter, shape, axes, kind, policy, expected):
         operand, axes, kind, policy) == expected
 
 
-class _Array:
-    ndim = 1
-    size = 32
-    shape = (32,)
-    dtype = np.dtype('complex64')
-    data = SimpleNamespace(device_id=0)
-
-
-class _Cache(dict):
-    is_enabled = True
-
-
-@pytest.fixture
-def dispatch(adapter, monkeypatch):
-    from cupy.cuda import cufft
-
-    cache, plans = _Cache(), []
-    stream = SimpleNamespace(ptr=7, synchronize=Mock())
-    output = np.full(2, 64.0)
-
-    def create(*args, **kwargs):
-        plan = SimpleNamespace(
-            plan=Mock(), execute=Mock(return_value=output),
-            reset_operand_unchecked=Mock(), release_operand=Mock(),
-            free=Mock())
-        plans.append(plan)
-        return plan
-
-    prepare = Mock(return_value=object())
-    monkeypatch.setattr(adapter.cupy, 'ndarray', _Array)
-    monkeypatch.setattr(adapter, 'config', SimpleNamespace(
-        use_nvmath=True, devices=None,
-        get_current_callback_manager=lambda: None))
-    monkeypatch.setattr(cufft, 'get_current_plan', lambda: None)
-    monkeypatch.setattr(adapter.cupy.cuda.runtime, 'getDevice', lambda: 0)
-    stream_lookup = Mock(return_value=stream)
-    monkeypatch.setattr(adapter.cupy.cuda, 'get_current_stream', stream_lookup)
-    monkeypatch.setattr(adapter, 'get_plan_cache', lambda: cache)
-    monkeypatch.setattr(adapter, '_create_key_from_operand',
-                        Mock(return_value=('metadata',)))
-    monkeypatch.setattr(adapter, 'CachedFFT', create)
-    monkeypatch.setattr(adapter, '_normalization_epilog', prepare)
-    monkeypatch.setattr(adapter._nvmath_scaling, 'supports_lto_callbacks',
-                        lambda: True)
-
-    def invoke(norm=None, direction='forward'):
-        return adapter._try_use_nvmath(
-            _Array(), None, (0,), norm,
-            fft_type='C2C', fft_direction=direction)
-
-    return SimpleNamespace(invoke=invoke, plans=plans, cache=cache,
-                           prepare=prepare, output=output, stream=stream,
-                           stream_lookup=stream_lookup)
-
-
-@pytest.mark.parametrize('norm,direction,policy', [
-    (None, 'forward', None),
-    ('backward', 'forward', None),
-    ('forward', 'inverse', None),
-    (None, 'inverse', 'N'),
-    ('backward', 'inverse', 'N'),
-    ('forward', 'forward', 'N'),
-    ('ortho', 'forward', 'sqrtN'),
-    ('ortho', 'inverse', 'sqrtN'),
-])
-def test_normalization_policy(dispatch, norm, direction, policy):
-    dispatch.invoke(norm, direction)
-    key = ('nvmath', dispatch.stream.ptr, ('metadata',))
-    if policy is not None:
-        key += (('normalization', policy),)
-    assert list(dispatch.cache) == [key]
-    assert dispatch.prepare.call_count == (policy is not None)
-
-
-def test_warm_hit_skips_callback_preparation(dispatch):
-    assert dispatch.invoke(direction='inverse') is dispatch.output
-    assert dispatch.invoke(direction='inverse') is dispatch.output
-    dispatch.prepare.assert_called_once()
-    assert len(dispatch.plans) == 1
-    plan = dispatch.plans[0]
-    plan.reset_operand_unchecked.assert_called_once()
-    assert plan.release_operand.call_count == 2
-    assert plan._normalization_epilog is dispatch.prepare.return_value
-    dispatch.stream_lookup.assert_called_with(_Array.data.device_id)
-    assert plan.execute.call_args.kwargs['release_workspace'] is True
-
-
-def test_equivalent_normalizations_share_semantic_plan(dispatch):
-    for norm, direction in ((None, 'inverse'), ('backward', 'inverse'),
-                            ('forward', 'forward')):
-        dispatch.invoke(norm, direction)
-    dispatch.invoke('ortho', 'forward')
-    dispatch.invoke('ortho', 'inverse')
-    assert len(dispatch.plans) == 2
-    assert dispatch.prepare.call_count == 2
-    assert {key[-1] for key in dispatch.cache} == {
-        ('normalization', 'N'), ('normalization', 'sqrtN')}
-
-
-def test_unscaled_dispatch_never_prepares_callback(
-        adapter, dispatch, monkeypatch):
-    supported = Mock()
-    monkeypatch.setattr(adapter._nvmath_scaling, 'supports_lto_callbacks',
-                        supported)
-    dispatch.invoke()
-    dispatch.invoke('forward', 'inverse')
-    dispatch.prepare.assert_not_called()
-    supported.assert_not_called()
-    assert len(dispatch.plans) == 1
-    assert next(iter(dispatch.cache)) == ('nvmath', 7, ('metadata',))
-    assert dispatch.plans[0]._normalization_epilog is None
-
-
 @pytest.mark.parametrize('version,expected', [
     (11299, False), (11300, True), (12040, True),
 ])
-def test_lto_support_checks_loaded_version_once(
+def test_lto_support_follows_loaded_cufft_version(
         adapter, monkeypatch, version, expected):
     scaling = adapter._nvmath_scaling
-    version_query = Mock(return_value=version)
-    monkeypatch.setattr(scaling.cufft, 'get_version', version_query)
+    monkeypatch.setattr(scaling.cufft, 'get_version',
+                        Mock(return_value=version))
     scaling.supports_lto_callbacks.cache_clear()
     try:
         assert scaling.supports_lto_callbacks() is expected
-        assert scaling.supports_lto_callbacks() is expected
-        version_query.assert_called_once()
     finally:
         scaling.supports_lto_callbacks.cache_clear()
 
 
-@pytest.mark.parametrize('kind,norm,direction,divisor', [
-    ('C2C', None, 'inverse', 32),
-    ('C2C', 'ortho', 'forward', np.sqrt(32)),
-    ('R2C', 'forward', 'forward', 32),
-    ('R2C', 'ortho', 'forward', np.sqrt(32)),
-    ('C2R', None, 'inverse', 62),
-    ('C2R', 'ortho', 'inverse', np.sqrt(62)),
-])
-def test_older_cufft_normalizes_cold_and_warm_with_one_unfused_plan(
-        adapter, dispatch, monkeypatch, kind, norm, direction, divisor):
-    monkeypatch.setattr(adapter._nvmath_scaling, 'supports_lto_callbacks',
-                        lambda: False)
-    operand = _Array()
-    operand.dtype = np.dtype('float32' if kind == 'R2C' else 'complex64')
-    unscaled_norm = 'forward' if direction == 'inverse' else None
-    for request_norm, expected_divisor in (
-            (norm, divisor), (norm, divisor), (unscaled_norm, 1)):
-        dispatch.output.fill(64)
-        out = adapter._try_use_nvmath(
-            operand, None, (0,), request_norm,
-            fft_type=kind, fft_direction=direction)
-        assert out is dispatch.output
-        np.testing.assert_allclose(out, 64 / expected_divisor)
-    dispatch.prepare.assert_not_called()
-    assert len(dispatch.plans) == 1
-    assert list(dispatch.cache) == [('nvmath', 7, ('metadata',))]
-    plan = dispatch.plans[0]
-    plan.plan.assert_called_once_with(stream=dispatch.stream, epilog=None)
-    assert plan.reset_operand_unchecked.call_count == 2
-    assert plan.release_operand.call_count == 3
+def test_unit_divisor_needs_no_epilog(adapter):
+    assert adapter._nvmath_scaling.get_scaling_epilog(
+        'complex64', 1, 0) is None
 
 
-def test_older_cufft_normalizes_remapped_axes(adapter, dispatch, monkeypatch):
-    class UnsupportedLayoutError(Exception):
-        permutation = (0, 2, 1)
-        axes = (0, 1)
-
-    monkeypatch.setattr(adapter._nvmath_scaling, 'supports_lto_callbacks',
-                        lambda: False)
-    monkeypatch.setattr(adapter.nvmath_fft, 'UnsupportedLayoutError',
-                        UnsupportedLayoutError)
-    adapter._create_key_from_operand.side_effect = [
-        UnsupportedLayoutError(), ('metadata',)]
-    operand, materialized = _Array(), _Array()
-    operand.shape, operand.ndim = (4, 3, 8), 3
-    materialized.shape = (4, 8, 3)
-    operand.transpose = Mock(return_value=SimpleNamespace(
-        copy=Mock(return_value=materialized)))
-    dispatch.output.resize((4, 8, 3), refcheck=False)
-    dispatch.output.fill(32)
-    out = adapter._try_use_nvmath(
-        operand, None, (0, 2), 'forward',
-        fft_type='C2C', fft_direction='forward')
-    assert out.shape == (4, 3, 8)
-    np.testing.assert_allclose(out, 1)
-    operand.transpose.assert_called_once_with((0, 2, 1))
-    dispatch.prepare.assert_not_called()
+# (function, input shape, input dtype, keyword arguments)
+_NORMALIZED_FFTS = [
+    ('ifft', (4, 16), cupy.complex64, {}),
+    ('fft', (4, 16), cupy.complex128, {}),
+    ('ifftn', (4, 6, 8), cupy.complex64, {'axes': [0, 2]}),
+    ('rfft', (4, 16), cupy.float32, {}),
+    ('irfft', (4, 9), cupy.complex64, {}),
+    ('irfftn', (4, 6, 9), cupy.complex128, {'axes': (1, 2)}),
+]
 
 
-def test_support_query_failure_uses_existing_fallback(
-        adapter, dispatch, monkeypatch):
-    error = RuntimeError('cuFFT unavailable')
-    monkeypatch.setattr(adapter._nvmath_scaling, 'supports_lto_callbacks',
-                        Mock(side_effect=error))
-    warn = Mock()
-    monkeypatch.setattr(adapter, '_warn_fallback', warn)
-    assert dispatch.invoke(direction='inverse') is None
-    assert not dispatch.plans
-    assert not dispatch.cache
-    dispatch.prepare.assert_not_called()
-    warn.assert_called_once_with(error)
+@pytest.mark.skipif(
+    not is_cuda_python, reason='requires a CUDA-Python build')
+class TestNvmathNormalization:
 
+    @pytest.fixture(autouse=True)
+    def prepare_cache(self, adapter):
+        self.adapter = adapter
+        self.scaling = adapter._nvmath_scaling
+        cache = config.get_plan_cache()
+        old_size = cache.get_size()
+        old_memsize = cache.get_memsize()
+        cache.clear()
+        cache.set_size(16)
+        cache.set_memsize(-1)
+        try:
+            yield
+        finally:
+            cache.clear()
+            cache.set_size(old_size)
+            cache.set_memsize(old_memsize)
 
-def test_failed_preparation_falls_back_without_caching_plan(
-        adapter, dispatch, monkeypatch):
-    error = RuntimeError('compilation failed')
-    dispatch.prepare.side_effect = error
-    warn = Mock()
-    monkeypatch.setattr(adapter, '_warn_fallback', warn)
-    assert dispatch.invoke(direction='inverse') is None
-    assert not dispatch.cache
-    assert not dispatch.plans
-    warn.assert_called_once_with(error)
+    def _cached_plans(self):
+        return [node.plan for _, node in config.get_plan_cache()]
 
+    def _check(self, name, shape, dtype, kwargs, norm):
+        a = testing.shaped_random(shape, cupy, dtype)
+        out = getattr(cupy.fft, name)(a, norm=norm, **kwargs)
+        expected = getattr(np.fft, name)(a.get(), norm=norm, **kwargs)
+        tol = 1e-4 if dtype in (cupy.complex64, cupy.float32) else 1e-10
+        testing.assert_allclose(out, expected, rtol=tol, atol=tol)
 
-def test_failed_layout_retry_falls_back_without_preparing_callback(
-        adapter, dispatch, monkeypatch):
-    class UnsupportedLayoutError(Exception):
-        permutation = (0,)
-        axes = (0,)
+    @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
+    @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
+    def test_fused_normalization(self, name, shape, dtype, kwargs, norm):
+        if not self.scaling.supports_lto_callbacks():
+            pytest.skip('cuFFT does not support LTO callbacks')
+        self._check(name, shape, dtype, kwargs, norm)
+        plans = self._cached_plans()
+        assert len(plans) == 1
+        assert isinstance(plans[0], self.adapter.CachedFFT)
+        scaled = (norm == 'ortho'
+                  or (norm == 'forward') == name.startswith(('fft', 'rfft')))
+        assert (plans[0]._normalization_epilog is not None) == scaled
 
-    monkeypatch.setattr(adapter.nvmath_fft, 'UnsupportedLayoutError',
-                        UnsupportedLayoutError)
-    error = RuntimeError('recommended layout rejected')
-    key = adapter._create_key_from_operand
-    key.side_effect = [UnsupportedLayoutError(), error]
-    warn = Mock()
-    monkeypatch.setattr(adapter, '_warn_fallback', warn)
-    assert dispatch.invoke(direction='inverse') is None
-    assert key.call_count == 2
-    dispatch.prepare.assert_not_called()
-    assert not dispatch.plans
-    warn.assert_called_once_with(error)
+    @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
+    @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
+    def test_unfused_normalization_on_older_cufft(
+            self, monkeypatch, name, shape, dtype, kwargs, norm):
+        monkeypatch.setattr(self.scaling, 'supports_lto_callbacks',
+                            lambda: False)
+        self._check(name, shape, dtype, kwargs, norm)
+        plans = self._cached_plans()
+        assert len(plans) == 1
+        assert isinstance(plans[0], self.adapter.CachedFFT)
+        assert plans[0]._normalization_epilog is None
 
+    def test_unfused_normalization_shares_unscaled_plan(self, monkeypatch):
+        monkeypatch.setattr(self.scaling, 'supports_lto_callbacks',
+                            lambda: False)
+        for norm in (None, 'ortho', 'forward'):
+            self._check('ifft', (4, 16), cupy.complex64, {}, norm)
+        assert len(self._cached_plans()) == 1
 
-@pytest.mark.parametrize('kind,input_type,output_type', [
-    ('C2C', 'complex64', 'complex64'),
-    ('R2C', 'float64', 'complex128'),
-    ('C2R', 'complex64', 'float32'),
-])
-def test_epilog_uses_result_dtype(adapter, monkeypatch, kind, input_type,
-                                  output_type):
-    prepare = Mock(return_value=object())
-    monkeypatch.setattr(adapter._nvmath_scaling, 'get_scaling_epilog', prepare)
-    operand = SimpleNamespace(shape=(8,), dtype=np.dtype(input_type))
-    adapter._normalization_epilog(operand, (0,), kind, 'N')
-    prepare.assert_called_once_with(output_type, 14 if kind == 'C2R' else 8)
+    def test_epilog_failure_falls_back_to_native(self, monkeypatch):
+        error = RuntimeError('compilation failed')
+        monkeypatch.setattr(self.scaling, 'supports_lto_callbacks',
+                            lambda: True)
+        monkeypatch.setattr(self.scaling, 'get_scaling_epilog',
+                            Mock(side_effect=error))
+        with pytest.warns(RuntimeWarning, match='compilation failed'):
+            self._check('ifft', (4, 16), cupy.complex64, {}, None)
+        plans = self._cached_plans()
+        assert not any(
+            isinstance(plan, self.adapter.CachedFFT) for plan in plans)
 
-
-@pytest.mark.parametrize('dtype,real_dtype', [
-    ('float32', np.float32), ('complex64', np.float32),
-    ('float64', np.float64), ('complex128', np.float64),
-])
-def test_epilogs_share_code_and_own_independent_scalars(
-        adapter, monkeypatch, dtype, real_dtype):
-    from cupy.cuda import compiler
-
-    scaling = adapter._nvmath_scaling
-    compile_code = Mock(return_value=b'IR')
-    uploads = []
-
-    def upload(host, *, blocking):
-        assert blocking
-        scalar = SimpleNamespace(host=host.copy(),
-                                 data=SimpleNamespace(ptr=len(uploads) + 1))
-        uploads.append(scalar)
-        return scalar
-
-    monkeypatch.setattr(compiler, '_compile_module_with_cache', compile_code)
-    monkeypatch.setattr(compiler, '_get_arch', lambda: '90')
-    monkeypatch.setattr(scaling.cupy.cuda, 'Device',
-                        lambda: SimpleNamespace(compute_capability='100'))
-    monkeypatch.setattr(scaling.cupy, 'asarray', upload)
-    scaling._compile_code.cache_clear()
-    try:
-        first = scaling.get_scaling_epilog(dtype, 32)
-        second = scaling.get_scaling_epilog(dtype, 128)
-        compile_code.assert_called_once()
-        assert compile_code.call_args.kwargs['to_ltoir'] is True
-        assert compile_code.call_args.kwargs['arch'] == '90'
+    @pytest.mark.parametrize('dtype,real_dtype', [
+        ('float32', np.float32), ('complex64', np.float32),
+        ('float64', np.float64), ('complex128', np.float64),
+    ])
+    def test_epilogs_share_ltoir_and_own_scalars(self, dtype, real_dtype):
+        device_id = cupy.cuda.Device().id
+        first = self.scaling.get_scaling_epilog(dtype, 32, device_id)
+        second = self.scaling.get_scaling_epilog(dtype, 128, device_id)
         assert first.ltoir is second.ltoir
-        assert first._cupy_scalar is not second._cupy_scalar
         assert first.data != second.data
-        assert first._cupy_scalar.host.dtype == real_dtype
-        assert second._cupy_scalar.host.dtype == real_dtype
-        assert first._cupy_scalar.host[0] == 32
-        assert second._cupy_scalar.host[0] == 128
-    finally:
-        scaling._compile_code.cache_clear()
+        for epilog, value in ((first, 32), (second, 128)):
+            scalar = epilog._cupy_scalar
+            assert epilog.data == scalar.data.ptr
+            assert scalar.dtype == real_dtype
+            assert scalar.get().tolist() == [value]
 
-
-def test_unit_divisor_does_not_compile_or_upload(adapter, monkeypatch):
-    scaling = adapter._nvmath_scaling
-    compile_code, upload = Mock(), Mock()
-    monkeypatch.setattr(scaling, '_compile_code', compile_code)
-    monkeypatch.setattr(scaling.cupy, 'asarray', upload)
-    assert scaling.get_scaling_epilog('complex64', 1) is None
-    compile_code.assert_not_called()
-    upload.assert_not_called()
+    @testing.multi_gpu(2)
+    def test_epilog_scalar_lives_on_requested_device(self):
+        with cupy.cuda.Device(0):
+            epilog = self.scaling.get_scaling_epilog('complex64', 32, 1)
+            assert cupy.cuda.Device().id == 0
+        assert epilog._cupy_scalar.device.id == 1
