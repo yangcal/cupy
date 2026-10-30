@@ -29,6 +29,7 @@ cupy_package_data = [
     'cupy/cuda/cupy_thrust.cu',
     'cupy/cuda/cupy_cub.cu',
     'cupy/cuda/cupy_cufftXt.cu',  # for cuFFT callback
+    'cupy/fft/_nvmath_scaling.cu',  # for nvmath normalization callbacks
     'cupy/cuda/cupy_cufftXt.h',  # for cuFFT callback
     'cupy/cuda/cupy_cufft.h',  # for cuFFT callback
     'cupy/cuda/cufft.pxd',  # for cuFFT callback
