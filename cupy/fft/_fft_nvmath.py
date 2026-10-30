@@ -20,17 +20,18 @@ _DIRECTIONS = {
     'forward': nvmath_fft.FFTDirection.FORWARD,
     'inverse': nvmath_fft.FFTDirection.INVERSE,
 }
-# The options only vary with the FFT type, and nvmath never mutates these
-# options, so it's safe to reuse the same options across different FFT plans.
-_FFT_OPTIONS = {
-    fft_type: nvmath_fft.FFTOptions(
+
+
+@cache
+def _get_fft_options(fft_type, inplace):
+    # nvmath never mutates these options, so it's safe to reuse the same
+    # options across different FFT plans.
+    return nvmath_fft.FFTOptions(
         fft_type=fft_type,
-        inplace=False,
+        inplace=inplace,
         last_axis_parity='even',
         result_layout='optimized',
     )
-    for fft_type in ('C2C', 'R2C', 'C2R')
-}
 
 
 class _Scaling(enum.IntEnum):
@@ -215,7 +216,7 @@ def _try_use_nvmath(
         raise ValueError(
             f'Unsupported FFT direction: {fft_direction!r}') from None
 
-    options = _FFT_OPTIONS[fft_type]
+    options = _get_fft_options(fft_type, inplace=False)
     scaling = _Scaling.from_norm(norm, fft_direction)
     permutation = None
     result_permutation = None

@@ -85,7 +85,7 @@ def test_lto_support_follows_loaded_cufft_version(
 
 @testing.multi_gpu(2)
 def test_keys_distinguish_operand_devices(adapter):
-    options = adapter._FFT_OPTIONS['C2C']
+    options = adapter._get_fft_options('C2C', inplace=False)
     keys = []
     for device_id in (0, 1):
         with cupy.cuda.Device(device_id):
