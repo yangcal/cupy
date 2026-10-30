@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from functools import lru_cache
+import enum
+from functools import cache, lru_cache
 import math
 import warnings
 
@@ -30,6 +31,33 @@ _FFT_OPTIONS = {
     )
     for fft_type in ('C2C', 'R2C', 'C2R')
 }
+
+
+class _Scaling(enum.IntEnum):
+    NONE = 0
+    N = 1
+    SQRT_N = 2
+
+    @classmethod
+    def from_norm(cls, norm, fft_direction):
+        if norm == 'ortho':
+            return cls.SQRT_N
+        # 'forward' scales forward transforms, 'backward' inverse ones.
+        if (norm == 'forward') == (fft_direction == 'forward'):
+            return cls.N
+        return cls.NONE
+
+    def get_normalization_divisor(self, fft_type, shape, axes):
+        """Normalize over logical transform axes, excluding batches."""
+        if self == _Scaling.NONE:
+            return 1
+        size = math.prod(shape[axis] for axis in axes)
+        if fft_type == 'C2R':
+            # With no requested shape and even parity, m packed values
+            # encode a real axis of length 2 * (m - 1).
+            packed = shape[axes[-1]]
+            size = size // packed * (2 * (packed - 1))
+        return math.sqrt(size) if self == _Scaling.SQRT_N else size
 
 
 class CachedFFT(nvmath_fft.FFT):
@@ -80,22 +108,9 @@ def _warn_fallback(exc):
     )
 
 
-def _normalization_divisor(operand, axes, fft_type, policy):
-    """Compute normalization over logical transform axes, excluding batches."""
-    if policy is None:
-        return 1
-    size = math.prod(operand.shape[axis] for axis in axes)
-    if fft_type == 'C2R':
-        # With no requested shape and even parity, m packed values encode
-        # a real axis of length 2 * (m - 1).
-        packed = operand.shape[axes[-1]]
-        size = size // packed * (2 * (packed - 1))
-    return math.sqrt(size) if policy == 'sqrtN' else size
-
-
-def _normalization_epilog(operand, axes, fft_type, policy):
+def _normalization_epilog(operand, axes, fft_type, scaling):
     """Prepare a plan-owned scaling callback only on a plan-cache miss."""
-    divisor = _normalization_divisor(operand, axes, fft_type, policy)
+    divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
     if divisor == 1:
         return None
     dtype = operand.dtype
@@ -107,7 +122,7 @@ def _normalization_epilog(operand, axes, fft_type, policy):
         dtype, divisor, operand.data.device_id)
 
 
-@lru_cache(maxsize=None)
+@cache
 def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
 
@@ -156,7 +171,7 @@ def _try_use_nvmath(
     nvmath's to decide and changes between versions. Failures once the plan is
     live propagate instead: see the comments on those blocks.
 
-    The plan key describes the fixed built-in scaling policy. Divisor
+    The plan key describes the fused built-in scaling. Divisor
     resolution and callback preparation happen only on a plan miss; compiled
     code is reusable across divisors. User callback contexts remain native.
     """
@@ -201,14 +216,7 @@ def _try_use_nvmath(
             f'Unsupported FFT direction: {fft_direction!r}') from None
 
     options = _FFT_OPTIONS[fft_type]
-    if norm == 'ortho':
-        scaling_policy = 'sqrtN'
-    elif (norm == 'backward' and fft_direction == 'inverse'
-            or norm == 'forward' and fft_direction == 'forward'):
-        scaling_policy = 'N'
-    else:
-        scaling_policy = None
-    post_scale_policy = None
+    scaling = _Scaling.from_norm(norm, fft_direction)
     permutation = None
     result_permutation = None
 
@@ -224,20 +232,20 @@ def _try_use_nvmath(
             # contiguous input, which must never be overwritten.
             nvmath_key = _create_key_from_operand(
                 operand, axes, options, permutation)
-        if (scaling_policy is not None
-                and not _nvmath_scaling.supports_lto_callbacks()):
-            post_scale_policy, scaling_policy = scaling_policy, None
+        # Without LTO callbacks, scale the output after execution instead.
+        fused = bool(scaling) and _nvmath_scaling.supports_lto_callbacks()
     except Exception as e:
         _warn_fallback(e)
         return None
 
     # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
     # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
-    # Metadata and scaling policy identify this built-in callback without
-    # resolving code or allocating its scalar on warm hits.
+    # Metadata and scaling identify this built-in callback without resolving
+    # code or allocating its scalar on warm hits. Unfused scaling shares the
+    # unscaled plan.
     key = ('nvmath', stream.ptr, nvmath_key)
-    if scaling_policy is not None:
-        key += (('normalization', scaling_policy),)
+    if fused:
+        key += (scaling,)
     cache = get_plan_cache()
     plan = cache.get(key)
     cache_miss = plan is None
@@ -250,9 +258,10 @@ def _try_use_nvmath(
 
     if cache_miss:
         try:
-            epilog = (_normalization_epilog(
-                operand, axes, fft_type, scaling_policy)
-                if scaling_policy is not None else None)
+            epilog = None
+            if fused:
+                epilog = _normalization_epilog(
+                    operand, axes, fft_type, scaling)
             plan = CachedFFT(
                 operand,
                 axes=axes,
@@ -280,9 +289,9 @@ def _try_use_nvmath(
             )
         finally:
             plan.release_operand()
-        if post_scale_policy is not None:
-            divisor = _normalization_divisor(
-                operand, axes, fft_type, post_scale_policy)
+        if not fused:
+            divisor = scaling.get_normalization_divisor(
+                fft_type, operand.shape, axes)
             if divisor != 1:
                 out /= divisor
     except Exception:

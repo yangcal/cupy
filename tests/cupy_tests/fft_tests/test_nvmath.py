@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -42,18 +41,31 @@ def test_normalize_axes(adapter, ndim, axes, expected):
     assert adapter._normalize_axes(ndim, axes) == expected
 
 
-@pytest.mark.parametrize('shape,axes,kind,policy,expected', [
+@pytest.mark.parametrize('shape,axes,kind,scaling,expected', [
     ((4, 8, 16), (1, 2), 'C2C', 'N', 128),
     ((4, 8, 16), (0, 2), 'R2C', 'N', 64),
     ((4, 8, 9), (1, 2), 'C2R', 'N', 128),
     ((4, 8, 9), (2, 0), 'C2R', 'N', 54),
-    ((4, 8, 9), (1, 2), 'C2R', 'sqrtN', np.sqrt(128)),
-    ((4, 8, 9), (1, 2), 'C2R', None, 1),
+    ((4, 8, 9), (1, 2), 'C2R', 'SQRT_N', np.sqrt(128)),
+    ((4, 8, 9), (1, 2), 'C2R', 'NONE', 1),
 ])
-def test_normalization_divisor(adapter, shape, axes, kind, policy, expected):
-    operand = SimpleNamespace(shape=shape)
-    assert adapter._normalization_divisor(
-        operand, axes, kind, policy) == expected
+def test_normalization_divisor(adapter, shape, axes, kind, scaling, expected):
+    divisor = adapter._Scaling[scaling].get_normalization_divisor(
+        kind, shape, axes)
+    assert divisor == expected
+
+
+@pytest.mark.parametrize('norm,direction,expected', [
+    ('backward', 'forward', 'NONE'),
+    ('backward', 'inverse', 'N'),
+    ('forward', 'forward', 'N'),
+    ('forward', 'inverse', 'NONE'),
+    ('ortho', 'forward', 'SQRT_N'),
+    ('ortho', 'inverse', 'SQRT_N'),
+])
+def test_scaling_from_norm(adapter, norm, direction, expected):
+    scaling = adapter._Scaling.from_norm(norm, direction)
+    assert scaling is adapter._Scaling[expected]
 
 
 @pytest.mark.parametrize('version,expected', [

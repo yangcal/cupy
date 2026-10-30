@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache, lru_cache
 from pathlib import Path
 import threading
 
@@ -28,7 +28,7 @@ def supports_lto_callbacks():
     return cufft.get_version() >= 11300
 
 
-@lru_cache(maxsize=None)
+@cache
 def get_scaling_ltoir(dtype, device_id):
     """Return the store callback's LTO-IR for an output dtype and device."""
     from cupy.cuda import compiler
