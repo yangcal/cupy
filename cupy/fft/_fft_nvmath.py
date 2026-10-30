@@ -109,20 +109,6 @@ def _warn_fallback(exc):
     )
 
 
-def _normalization_epilog(operand, axes, fft_type, scaling):
-    """Prepare a plan-owned scaling callback only on a plan-cache miss."""
-    divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
-    if divisor == 1:
-        return None
-    dtype = operand.dtype
-    if fft_type == 'R2C':
-        dtype = numpy.dtype(f'c{dtype.itemsize * 2}')
-    elif fft_type == 'C2R':
-        dtype = numpy.dtype(f'f{dtype.itemsize // 2}')
-    return _nvmath_scaling.get_scaling_epilog(
-        dtype, divisor, operand.data.device_id)
-
-
 @cache
 def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
@@ -260,9 +246,18 @@ def _try_use_nvmath(
     if cache_miss:
         try:
             epilog = None
-            if fused:
-                epilog = _normalization_epilog(
-                    operand, axes, fft_type, scaling)
+            divisor = scaling.get_normalization_divisor(
+                fft_type, operand.shape, axes) if fused else 1
+            if divisor != 1:
+                result_dtype = operand.dtype
+                if fft_type == 'R2C':
+                    result_dtype = numpy.dtype(
+                        f'c{result_dtype.itemsize * 2}')
+                elif fft_type == 'C2R':
+                    result_dtype = numpy.dtype(
+                        f'f{result_dtype.itemsize // 2}')
+                epilog = _nvmath_scaling.get_scaling_epilog(
+                    result_dtype, divisor, operand.data.device_id)
             plan = CachedFFT(
                 operand,
                 axes=axes,
