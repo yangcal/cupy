@@ -5,6 +5,7 @@ from functools import lru_cache
 import math
 import warnings
 
+import numpy
 import nvmath.fft as nvmath_fft
 
 import cupy
@@ -97,11 +98,11 @@ def _normalization_epilog(operand, axes, fft_type, policy):
     divisor = _normalization_divisor(operand, axes, fft_type, policy)
     if divisor == 1:
         return None
-    dtype = operand.dtype.name
+    dtype = operand.dtype
     if fft_type == 'R2C':
-        dtype = {'float32': 'complex64', 'float64': 'complex128'}[dtype]
+        dtype = numpy.dtype(f'c{dtype.itemsize * 2}')
     elif fft_type == 'C2R':
-        dtype = {'complex64': 'float32', 'complex128': 'float64'}[dtype]
+        dtype = numpy.dtype(f'f{dtype.itemsize // 2}')
     return _nvmath_scaling.get_scaling_epilog(
         dtype, divisor, operand.data.device_id)
 

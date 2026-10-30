@@ -158,10 +158,11 @@ class TestNvmathNormalization:
             isinstance(plan, self.adapter.CachedFFT) for plan in plans)
 
     @pytest.mark.parametrize('dtype,real_dtype', [
-        ('float32', np.float32), ('complex64', np.float32),
-        ('float64', np.float64), ('complex128', np.float64),
+        (np.float32, np.float32), (np.complex64, np.float32),
+        (np.float64, np.float64), (np.complex128, np.float64),
     ])
     def test_epilogs_share_ltoir_and_own_scalars(self, dtype, real_dtype):
+        dtype = np.dtype(dtype)
         device_id = cupy.cuda.Device().id
         first = self.scaling.get_scaling_epilog(dtype, 32, device_id)
         second = self.scaling.get_scaling_epilog(dtype, 128, device_id)
@@ -176,6 +177,7 @@ class TestNvmathNormalization:
     @testing.multi_gpu(2)
     def test_epilog_scalar_lives_on_requested_device(self):
         with cupy.cuda.Device(0):
-            epilog = self.scaling.get_scaling_epilog('complex64', 32, 1)
+            epilog = self.scaling.get_scaling_epilog(
+                np.dtype(np.complex64), 32, 1)
             assert cupy.cuda.Device().id == 0
         assert epilog._cupy_scalar.device.id == 1
