@@ -145,7 +145,7 @@ def _create_key_from_operand(operand, axes, options, permutation=None):
         strides = None
     return nvmath_fft.FFT.create_key_from_metadata(
         shape,
-        operand.dtype.name,
+        operand.dtype,
         'cuda',
         strides=strides,
         strides_in_bytes=True,
