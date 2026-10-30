@@ -107,13 +107,6 @@ def _normalization_epilog(operand, axes, fft_type, policy):
         dtype, divisor, operand.data.device_id)
 
 
-def _c_contiguous_element_strides(shape):
-    strides = [1] * len(shape)
-    for axis in range(len(shape) - 1, 0, -1):
-        strides[axis - 1] = strides[axis] * shape[axis]
-    return tuple(strides)
-
-
 @lru_cache(maxsize=None)
 def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
@@ -128,17 +121,18 @@ def _create_key_from_operand(operand, axes, options, permutation=None):
     known to be usable.
     """
     if permutation is None:
-        shape = tuple(operand.shape)
-        element_strides = tuple(
-            stride // operand.itemsize for stride in operand.strides)
+        shape = operand.shape
+        strides = operand.strides
     else:
+        # Omitted strides describe a C-contiguous layout.
         shape = tuple(operand.shape[axis] for axis in permutation)
-        element_strides = _c_contiguous_element_strides(shape)
+        strides = None
     return nvmath_fft.FFT.create_key_from_metadata(
         shape,
         operand.dtype.name,
         'cuda',
-        strides=element_strides,
+        strides=strides,
+        strides_in_bytes=True,
         axes=axes,
         options=options,
         execution=_cuda_execution(operand.data.device_id),
