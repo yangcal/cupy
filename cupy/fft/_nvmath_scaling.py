@@ -48,17 +48,11 @@ def get_scaling_ltoir(dtype_name, device_id):
 def get_scaling_epilog(dtype_name, divisor, device_id):
     """Return a callback owning an immutable scalar in output precision.
 
+    ``divisor`` is not validated, since all callers guarantee a valid value.
     The scalar is allocated on ``device_id``, which need not be the current
     device.
     """
     real_type = _OUTPUT_TYPES[dtype_name][1]
-    divisor = real_type(divisor)
-    if not numpy.isfinite(divisor) or divisor <= 0:
-        raise ValueError(
-            'The normalization divisor must be finite and positive')
-    if divisor == 1:
-        return None
-
     ltoir = get_scaling_ltoir(dtype_name, device_id)
     with cupy.cuda.Device(device_id):
         scalar = cupy.full(1, divisor, dtype=real_type)

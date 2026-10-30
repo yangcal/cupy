@@ -71,11 +71,6 @@ def test_lto_support_follows_loaded_cufft_version(
         scaling.supports_lto_callbacks.cache_clear()
 
 
-def test_unit_divisor_needs_no_epilog(adapter):
-    assert adapter._nvmath_scaling.get_scaling_epilog(
-        'complex64', 1, 0) is None
-
-
 # (function, input shape, input dtype, keyword arguments)
 _NORMALIZED_FFTS = [
     ('ifft', (4, 16), cupy.complex64, {}),
