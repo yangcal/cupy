@@ -71,6 +71,19 @@ def test_lto_support_follows_loaded_cufft_version(
         scaling.supports_lto_callbacks.cache_clear()
 
 
+@testing.multi_gpu(2)
+def test_keys_distinguish_operand_devices(adapter):
+    options = adapter._FFT_OPTIONS['C2C']
+    keys = []
+    for device_id in (0, 1):
+        with cupy.cuda.Device(device_id):
+            operand = cupy.empty((4, 16), dtype=cupy.complex64)
+        with cupy.cuda.Device(0):
+            keys.append(
+                adapter._create_key_from_operand(operand, (1,), options))
+    assert keys[0] != keys[1]
+
+
 # (function, input shape, input dtype, keyword arguments)
 _NORMALIZED_FFTS = [
     ('ifft', (4, 16), cupy.complex64, {}),

@@ -114,6 +114,11 @@ def _c_contiguous_element_strides(shape):
     return tuple(strides)
 
 
+@lru_cache(maxsize=None)
+def _cuda_execution(device_id):
+    return nvmath_fft.ExecutionCUDA(device_id=device_id)
+
+
 def _create_key_from_operand(operand, axes, options, permutation=None):
     """Build the nvmath key from operand metadata.
 
@@ -136,7 +141,7 @@ def _create_key_from_operand(operand, axes, options, permutation=None):
         strides=element_strides,
         axes=axes,
         options=options,
-        execution='cuda',
+        execution=_cuda_execution(operand.data.device_id),
     )
 
 
