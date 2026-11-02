@@ -106,6 +106,15 @@ _NORMALIZED_FFTS = [
     ('irfftn', (4, 6, 9), cupy.complex128, {'axes': (1, 2)}),
 ]
 
+# Layouts nvmath rejects, so they run on a permuted copy: in place for C2C,
+# out of place for R2C and C2R.
+_PERMUTED_FFTS = [
+    ('fftn', (8, 12, 16, 20), cupy.complex64, {'axes': (0, 2)}),
+    ('ifft', (16, 24, 32), cupy.complex128, {'axis': 1}),
+    ('rfftn', (8, 12, 16, 20), cupy.float32, {'axes': (0, 2)}),
+    ('irfftn', (8, 12, 16, 11), cupy.complex64, {'axes': (0, 2)}),
+]
+
 
 @pytest.mark.skipif(
     not is_cuda_python, reason='requires a CUDA-Python build')
@@ -133,10 +142,15 @@ class TestNvmathNormalization:
 
     def _check(self, name, shape, dtype, kwargs, norm):
         a = testing.shaped_random(shape, cupy, dtype)
+        self._check_operand(name, a, kwargs, norm)
+
+    def _check_operand(self, name, a, kwargs, norm):
+        before = a.copy()
         out = getattr(cupy.fft, name)(a, norm=norm, **kwargs)
         expected = getattr(np.fft, name)(a.get(), norm=norm, **kwargs)
-        tol = 1e-4 if dtype in (cupy.complex64, cupy.float32) else 1e-10
+        tol = 1e-4 if a.dtype in (cupy.complex64, cupy.float32) else 1e-10
         testing.assert_allclose(out, expected, rtol=tol, atol=tol)
+        testing.assert_array_equal(a, before)
 
     @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
     @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
@@ -169,6 +183,26 @@ class TestNvmathNormalization:
         for norm in (None, 'ortho', 'forward'):
             self._check('ifft', (4, 16), cupy.complex64, {}, norm)
         assert len(self._cached_plans()) == 1
+
+    def test_cached_layout_keeps_each_norms_divisor(self):
+        for norm in (None, 'ortho', 'forward', None, 'ortho'):
+            self._check('ifft', (4, 16), cupy.complex64, {}, norm)
+
+    @pytest.mark.parametrize('name,shape,dtype,kwargs', _PERMUTED_FFTS)
+    def test_permuted_layouts(self, name, shape, dtype, kwargs):
+        for norm in (None, 'ortho', None):
+            self._check(name, shape, dtype, kwargs, norm)
+
+    def test_direct_call_on_permuted_copys_layout_keeps_its_input(self):
+        a = testing.shaped_random((8, 12, 16, 20), cupy, cupy.complex64)
+        adapter = self.adapter
+        options = adapter._get_fft_options('C2C', inplace=False)
+        with pytest.raises(adapter.nvmath_fft.UnsupportedLayoutError) as e:
+            adapter._create_key_from_operand(a, (0, 2), options)
+        self._check_operand('fftn', a, {'axes': (0, 2)}, None)
+        # Laid out like the private copy the call above transformed in place.
+        b = a.transpose(e.value.permutation).copy()
+        self._check_operand('fftn', b, {'axes': tuple(e.value.axes)}, None)
 
     def test_epilog_failure_falls_back_to_native(self, monkeypatch):
         error = RuntimeError('compilation failed')

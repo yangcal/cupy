@@ -50,15 +50,17 @@ class _Scaling(enum.IntEnum):
 
     def get_normalization_divisor(self, fft_type, shape, axes):
         """Normalize over logical transform axes, excluding batches."""
-        if self == _Scaling.NONE:
+        if self is _Scaling.NONE:
             return 1
-        size = math.prod(shape[axis] for axis in axes)
+        size = 1
+        for axis in axes:
+            size *= shape[axis]
         if fft_type == 'C2R':
             # With no requested shape and even parity, m packed values
             # encode a real axis of length 2 * (m - 1).
             packed = shape[axes[-1]]
             size = size // packed * (2 * (packed - 1))
-        return math.sqrt(size) if self == _Scaling.SQRT_N else size
+        return math.sqrt(size) if self is _Scaling.SQRT_N else size
 
 
 class CachedFFT(nvmath_fft.FFT):
@@ -158,9 +160,10 @@ def _try_use_nvmath(
     nvmath's to decide and changes between versions. Failures once the plan is
     live propagate instead: see the comments on those blocks.
 
-    The plan key describes the fused built-in scaling. Divisor
-    resolution and callback preparation happen only on a plan miss; compiled
-    code is reusable across divisors. User callback contexts remain native.
+    Fused plans are keyed by their divisor, so plans are shared only when they
+    scale identically. Callback preparation happens only on a plan miss;
+    compiled code is reusable across divisors. User callback contexts remain
+    native.
     """
     if not config.use_nvmath:
         return None
@@ -204,6 +207,7 @@ def _try_use_nvmath(
 
     options = _get_fft_options(fft_type, inplace=False)
     scaling = _Scaling.from_norm(norm, fft_direction)
+    divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
     permutation = None
     result_permutation = None
 
@@ -215,24 +219,25 @@ def _try_use_nvmath(
             permutation = tuple(e.permutation)
             axes = tuple(e.axes)
             result_permutation = _invert_permutation(permutation)
-            # Stay out-of-place: the copy's key may also describe a caller's
-            # contiguous input, which must never be overwritten.
+            if fft_type == 'C2C':
+                # Only C2C runs in place, on the private copy made below.
+                options = _get_fft_options(fft_type, inplace=True)
             nvmath_key = _create_key_from_operand(
                 operand, axes, options, permutation)
         # Without LTO callbacks, scale the output after execution instead.
-        fused = bool(scaling) and _nvmath_scaling.supports_lto_callbacks()
+        fused = divisor != 1 and _nvmath_scaling.supports_lto_callbacks()
     except Exception as e:
         _warn_fallback(e)
         return None
 
     # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
     # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
-    # Metadata and scaling identify this built-in callback without resolving
-    # code or allocating its scalar on warm hits. Unfused scaling shares the
-    # unscaled plan.
+    # Metadata and the divisor identify this built-in callback without
+    # resolving code or allocating its scalar on warm hits. Unfused scaling
+    # shares the unscaled plan.
     key = ('nvmath', stream.ptr, nvmath_key)
     if fused:
-        key += (scaling,)
+        key += (divisor,)
     cache = get_plan_cache()
     plan = cache.get(key)
     cache_miss = plan is None
@@ -246,9 +251,7 @@ def _try_use_nvmath(
     if cache_miss:
         try:
             epilog = None
-            divisor = scaling.get_normalization_divisor(
-                fft_type, operand.shape, axes) if fused else 1
-            if divisor != 1:
+            if fused:
                 result_dtype = operand.dtype
                 if fft_type == 'R2C':
                     result_dtype = numpy.dtype(
@@ -285,11 +288,8 @@ def _try_use_nvmath(
             )
         finally:
             plan.release_operand()
-        if not fused:
-            divisor = scaling.get_normalization_divisor(
-                fft_type, operand.shape, axes)
-            if divisor != 1:
-                out /= divisor
+        if not fused and divisor != 1:
+            out /= divisor
     except Exception:
         if cache_miss:
             plan.free()
