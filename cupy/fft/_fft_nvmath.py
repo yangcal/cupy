@@ -4,14 +4,16 @@ from collections.abc import Sequence
 import enum
 from functools import cache, lru_cache
 import math
+from pathlib import Path
+import threading
 import warnings
 
 import numpy
+from nvmath.bindings import cufft as nvmath_cufft
 import nvmath.fft as nvmath_fft
 
 import cupy
 from cupy.fft import config
-from cupy.fft import _nvmath_scaling
 from cupy.fft._cache import get_plan_cache
 
 
@@ -20,6 +22,13 @@ _DIRECTIONS = {
     'forward': nvmath_fft.FFTDirection.FORWARD,
     'inverse': nvmath_fft.FFTDirection.INVERSE,
 }
+_CALLBACK_TYPES = {
+    numpy.dtype(numpy.float32): 0,
+    numpy.dtype(numpy.float64): 1,
+    numpy.dtype(numpy.complex64): 2,
+    numpy.dtype(numpy.complex128): 3,
+}
+_compile_lock = threading.Lock()
 
 
 @cache
@@ -61,6 +70,47 @@ class _Scaling(enum.IntEnum):
             packed = shape[axes[-1]]
             size = size // packed * (2 * (packed - 1))
         return math.sqrt(size) if self is _Scaling.SQRT_N else size
+
+
+@cache
+def _supports_lto_callbacks():
+    """Standard LTO callbacks require cuFFT 11.3 (CUDA 12.6U2)."""
+    return nvmath_cufft.get_version() >= 11300
+
+
+@cache
+def _get_scaling_ltoir(dtype, device_id):
+    """Return the store callback's LTO-IR for an output dtype and device."""
+    from cupy.cuda import compiler
+
+    with cupy.cuda.Device(device_id):
+        arch = compiler._get_arch()
+    source = Path(__file__).with_name('_nvmath_scaling.cu').read_text()
+    options = (
+        '--std=c++17',
+        f'-DCUPY_FFT_CALLBACK_TYPE={_CALLBACK_TYPES[dtype]}',
+    )
+    with _compile_lock:
+        return compiler._compile_module_with_cache(
+            source, options, arch=arch, to_ltoir=True)
+
+
+def _get_scaling_epilog(dtype, divisor, device_id):
+    """Return a callback and the immutable scalar in output precision it
+    divides by.
+
+    The callback only holds a raw pointer to the scalar, so the caller must
+    keep the scalar alive for as long as the callback is in use.
+
+    ``divisor`` is not validated, since all callers guarantee a valid value.
+    The scalar is allocated on ``device_id``, which need not be the current
+    device.
+    """
+    ltoir = _get_scaling_ltoir(dtype, device_id)
+    with cupy.cuda.Device(device_id):
+        scalar = cupy.full(1, divisor, dtype=numpy.finfo(dtype).dtype)
+    epilog = nvmath_fft.DeviceCallable(ltoir=ltoir, data=scalar.data.ptr)
+    return epilog, scalar
 
 
 class CachedFFT(nvmath_fft.FFT):
@@ -225,7 +275,7 @@ def _try_use_nvmath(
             nvmath_key = _create_key_from_operand(
                 operand, axes, options, permutation)
         # Without LTO callbacks, scale the output after execution instead.
-        fused = divisor != 1 and _nvmath_scaling.supports_lto_callbacks()
+        fused = divisor != 1 and _supports_lto_callbacks()
     except Exception as e:
         _warn_fallback(e)
         return None
@@ -250,7 +300,7 @@ def _try_use_nvmath(
 
     if cache_miss:
         try:
-            epilog = None
+            epilog = scalar = None
             if fused:
                 result_dtype = operand.dtype
                 if fft_type == 'R2C':
@@ -259,7 +309,7 @@ def _try_use_nvmath(
                 elif fft_type == 'C2R':
                     result_dtype = numpy.dtype(
                         f'f{result_dtype.itemsize // 2}')
-                epilog = _nvmath_scaling.get_scaling_epilog(
+                epilog, scalar = _get_scaling_epilog(
                     result_dtype, divisor, operand.data.device_id)
             plan = CachedFFT(
                 operand,
@@ -268,8 +318,8 @@ def _try_use_nvmath(
                 execution='cuda',
                 stream=stream,
             )
-            # DeviceCallable.data is a raw pointer; retain its scalar owner.
-            plan._normalization_epilog = epilog
+            # DeviceCallable.data is a raw pointer to the scalar.
+            plan._normalization_scalar = scalar
             plan.plan(stream=stream, epilog=epilog)
         except Exception as e:
             if plan is not None:

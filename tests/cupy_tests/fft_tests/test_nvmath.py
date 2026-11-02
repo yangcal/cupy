@@ -73,14 +73,13 @@ def test_scaling_from_norm(adapter, norm, direction, expected):
 ])
 def test_lto_support_follows_loaded_cufft_version(
         adapter, monkeypatch, version, expected):
-    scaling = adapter._nvmath_scaling
-    monkeypatch.setattr(scaling.cufft, 'get_version',
+    monkeypatch.setattr(adapter.nvmath_cufft, 'get_version',
                         Mock(return_value=version))
-    scaling.supports_lto_callbacks.cache_clear()
+    adapter._supports_lto_callbacks.cache_clear()
     try:
-        assert scaling.supports_lto_callbacks() is expected
+        assert adapter._supports_lto_callbacks() is expected
     finally:
-        scaling.supports_lto_callbacks.cache_clear()
+        adapter._supports_lto_callbacks.cache_clear()
 
 
 @testing.multi_gpu(2)
@@ -123,7 +122,6 @@ class TestNvmathNormalization:
     @pytest.fixture(autouse=True)
     def prepare_cache(self, adapter):
         self.adapter = adapter
-        self.scaling = adapter._nvmath_scaling
         cache = config.get_plan_cache()
         old_size = cache.get_size()
         old_memsize = cache.get_memsize()
@@ -155,7 +153,7 @@ class TestNvmathNormalization:
     @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
     @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
     def test_fused_normalization(self, name, shape, dtype, kwargs, norm):
-        if not self.scaling.supports_lto_callbacks():
+        if not self.adapter._supports_lto_callbacks():
             pytest.skip('cuFFT does not support LTO callbacks')
         self._check(name, shape, dtype, kwargs, norm)
         plans = self._cached_plans()
@@ -163,22 +161,22 @@ class TestNvmathNormalization:
         assert isinstance(plans[0], self.adapter.CachedFFT)
         scaled = (norm == 'ortho'
                   or (norm == 'forward') == name.startswith(('fft', 'rfft')))
-        assert (plans[0]._normalization_epilog is not None) == scaled
+        assert (plans[0]._normalization_scalar is not None) == scaled
 
     @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
     @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
     def test_unfused_normalization_on_older_cufft(
             self, monkeypatch, name, shape, dtype, kwargs, norm):
-        monkeypatch.setattr(self.scaling, 'supports_lto_callbacks',
+        monkeypatch.setattr(self.adapter, '_supports_lto_callbacks',
                             lambda: False)
         self._check(name, shape, dtype, kwargs, norm)
         plans = self._cached_plans()
         assert len(plans) == 1
         assert isinstance(plans[0], self.adapter.CachedFFT)
-        assert plans[0]._normalization_epilog is None
+        assert plans[0]._normalization_scalar is None
 
     def test_unfused_normalization_shares_unscaled_plan(self, monkeypatch):
-        monkeypatch.setattr(self.scaling, 'supports_lto_callbacks',
+        monkeypatch.setattr(self.adapter, '_supports_lto_callbacks',
                             lambda: False)
         for norm in (None, 'ortho', 'forward'):
             self._check('ifft', (4, 16), cupy.complex64, {}, norm)
@@ -206,9 +204,9 @@ class TestNvmathNormalization:
 
     def test_epilog_failure_falls_back_to_native(self, monkeypatch):
         error = RuntimeError('compilation failed')
-        monkeypatch.setattr(self.scaling, 'supports_lto_callbacks',
+        monkeypatch.setattr(self.adapter, '_supports_lto_callbacks',
                             lambda: True)
-        monkeypatch.setattr(self.scaling, 'get_scaling_epilog',
+        monkeypatch.setattr(self.adapter, '_get_scaling_epilog',
                             Mock(side_effect=error))
         with pytest.warns(RuntimeWarning, match='compilation failed'):
             self._check('ifft', (4, 16), cupy.complex64, {}, None)
@@ -223,12 +221,11 @@ class TestNvmathNormalization:
     def test_epilogs_share_ltoir_and_own_scalars(self, dtype, real_dtype):
         dtype = np.dtype(dtype)
         device_id = cupy.cuda.Device().id
-        first = self.scaling.get_scaling_epilog(dtype, 32, device_id)
-        second = self.scaling.get_scaling_epilog(dtype, 128, device_id)
-        assert first.ltoir is second.ltoir
-        assert first.data != second.data
-        for epilog, value in ((first, 32), (second, 128)):
-            scalar = epilog._cupy_scalar
+        first = self.adapter._get_scaling_epilog(dtype, 32, device_id)
+        second = self.adapter._get_scaling_epilog(dtype, 128, device_id)
+        assert first[0].ltoir is second[0].ltoir
+        assert first[0].data != second[0].data
+        for (epilog, scalar), value in ((first, 32), (second, 128)):
             assert epilog.data == scalar.data.ptr
             assert scalar.dtype == real_dtype
             assert scalar.get().tolist() == [value]
@@ -236,7 +233,8 @@ class TestNvmathNormalization:
     @testing.multi_gpu(2)
     def test_epilog_scalar_lives_on_requested_device(self):
         with cupy.cuda.Device(0):
-            epilog = self.scaling.get_scaling_epilog(
+            epilog, scalar = self.adapter._get_scaling_epilog(
                 np.dtype(np.complex64), 32, 1)
             assert cupy.cuda.Device().id == 0
-        assert epilog._cupy_scalar.device.id == 1
+        assert scalar.device.id == 1
+        assert epilog.data == scalar.data.ptr
