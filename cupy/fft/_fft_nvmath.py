@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+import enum
+from functools import cache, lru_cache
 import math
-import operator
+from pathlib import Path
+import threading
 import warnings
 
+import numpy
+from nvmath.bindings import cufft as nvmath_cufft
 import nvmath.fft as nvmath_fft
 
 import cupy
@@ -16,17 +22,95 @@ _DIRECTIONS = {
     'forward': nvmath_fft.FFTDirection.FORWARD,
     'inverse': nvmath_fft.FFTDirection.INVERSE,
 }
-# The options only vary with the FFT type, and nvmath never mutates these
-# options, so it's safe to reuse the same options across different FFT plans.
-_FFT_OPTIONS = {
-    fft_type: nvmath_fft.FFTOptions(
+_CALLBACK_TYPES = {
+    numpy.dtype(numpy.float32): 0,
+    numpy.dtype(numpy.float64): 1,
+    numpy.dtype(numpy.complex64): 2,
+    numpy.dtype(numpy.complex128): 3,
+}
+_compile_lock = threading.Lock()
+
+
+@cache
+def _get_fft_options(fft_type, inplace):
+    # nvmath never mutates these options, so it's safe to reuse the same
+    # options across different FFT plans.
+    return nvmath_fft.FFTOptions(
         fft_type=fft_type,
-        inplace=False,
+        inplace=inplace,
         last_axis_parity='even',
         result_layout='optimized',
     )
-    for fft_type in ('C2C', 'R2C', 'C2R')
-}
+
+
+class _Scaling(enum.IntEnum):
+    NONE = 0
+    N = 1
+    SQRT_N = 2
+
+    @classmethod
+    def from_norm(cls, norm, fft_direction):
+        if norm == 'ortho':
+            return cls.SQRT_N
+        # 'forward' scales forward transforms, 'backward' inverse ones.
+        if (norm == 'forward') == (fft_direction == 'forward'):
+            return cls.N
+        return cls.NONE
+
+    def get_normalization_divisor(self, fft_type, shape, axes):
+        """Normalize over logical transform axes, excluding batches."""
+        if self is _Scaling.NONE:
+            return 1
+        size = 1
+        for axis in axes:
+            size *= shape[axis]
+        if fft_type == 'C2R':
+            # With no requested shape and even parity, m packed values
+            # encode a real axis of length 2 * (m - 1).
+            packed = shape[axes[-1]]
+            size = size // packed * (2 * (packed - 1))
+        return math.sqrt(size) if self is _Scaling.SQRT_N else size
+
+
+@cache
+def _supports_lto_callbacks():
+    """Standard LTO callbacks require cuFFT 11.3 (CUDA 12.6U2)."""
+    return nvmath_cufft.get_version() >= 11300
+
+
+@cache
+def _get_scaling_ltoir(dtype, device_id):
+    """Return the store callback's LTO-IR for an output dtype and device."""
+    from cupy.cuda import compiler
+
+    with cupy.cuda.Device(device_id):
+        arch = compiler._get_arch()
+    source = Path(__file__).with_name('_nvmath_scaling.cu').read_text()
+    options = (
+        '--std=c++17',
+        f'-DCUPY_FFT_CALLBACK_TYPE={_CALLBACK_TYPES[dtype]}',
+    )
+    with _compile_lock:
+        return compiler._compile_module_with_cache(
+            source, options, arch=arch, to_ltoir=True)
+
+
+def _get_scaling_epilog(dtype, divisor, device_id):
+    """Return a callback and the immutable scalar in output precision it
+    divides by.
+
+    The callback only holds a raw pointer to the scalar, so the caller must
+    keep the scalar alive for as long as the callback is in use.
+
+    ``divisor`` is not validated, since all callers guarantee a valid value.
+    The scalar is allocated on ``device_id``, which need not be the current
+    device.
+    """
+    ltoir = _get_scaling_ltoir(dtype, device_id)
+    with cupy.cuda.Device(device_id):
+        scalar = cupy.full(1, divisor, dtype=numpy.finfo(dtype).dtype)
+    epilog = nvmath_fft.DeviceCallable(ltoir=ltoir, data=scalar.data.ptr)
+    return epilog, scalar
 
 
 class CachedFFT(nvmath_fft.FFT):
@@ -50,23 +134,19 @@ class CachedFFT(nvmath_fft.FFT):
 
 
 def _normalize_axes(ndim, axes):
+    if isinstance(axes, Sequence):
+        axes = tuple(axes)
+    return _normalize_axes_cached(ndim, axes)
+
+
+@lru_cache(maxsize=128)
+def _normalize_axes_cached(ndim, axes):
     if axes is None:
-        axes = tuple(range(ndim))
-    else:
-        try:
-            axis = operator.index(axes)
-        except TypeError:
-            axes = tuple(axes)
-        else:
-            axes = (axis,)
-
-    if not axes:
-        return axes
-    if len(axes) > 3:
+        return tuple(range(ndim)) if ndim <= 3 else None
+    if isinstance(axes, int):
+        return (axes % ndim,) if -ndim <= axes < ndim else None
+    if len(axes) > 3 or any(not -ndim <= axis < ndim for axis in axes):
         return None
-    if any(axis >= ndim or axis < -ndim for axis in axes):
-        return None
-
     axes = tuple(axis % ndim for axis in axes)
     return axes if len(set(axes)) == len(axes) else None
 
@@ -81,22 +161,9 @@ def _warn_fallback(exc):
     )
 
 
-def _scale_result(out, operand, axes, norm, fft_type, fft_direction):
-    shape = operand.shape if fft_type == 'R2C' else out.shape
-    size = math.prod(shape[axis] for axis in axes)
-    if norm == 'backward' and fft_direction == 'inverse':
-        out /= size
-    elif norm == 'ortho':
-        out /= math.sqrt(size)
-    elif norm == 'forward' and fft_direction == 'forward':
-        out /= size
-
-
-def _c_contiguous_element_strides(shape):
-    strides = [1] * len(shape)
-    for axis in range(len(shape) - 1, 0, -1):
-        strides[axis - 1] = strides[axis] * shape[axis]
-    return tuple(strides)
+@cache
+def _cuda_execution(device_id):
+    return nvmath_fft.ExecutionCUDA(device_id=device_id)
 
 
 def _create_key_from_operand(operand, axes, options, permutation=None):
@@ -108,20 +175,21 @@ def _create_key_from_operand(operand, axes, options, permutation=None):
     known to be usable.
     """
     if permutation is None:
-        shape = tuple(operand.shape)
-        element_strides = tuple(
-            stride // operand.itemsize for stride in operand.strides)
+        shape = operand.shape
+        strides = operand.strides
     else:
+        # Omitted strides describe a C-contiguous layout.
         shape = tuple(operand.shape[axis] for axis in permutation)
-        element_strides = _c_contiguous_element_strides(shape)
+        strides = None
     return nvmath_fft.FFT.create_key_from_metadata(
         shape,
-        operand.dtype.name,
+        operand.dtype,
         'cuda',
-        strides=element_strides,
+        strides=strides,
+        strides_in_bytes=True,
         axes=axes,
         options=options,
-        execution='cuda',
+        execution=_cuda_execution(operand.data.device_id),
     )
 
 
@@ -134,13 +202,18 @@ def _invert_permutation(permutation):
 
 def _try_use_nvmath(
         operand, requested_shape, axes, norm, *, fft_type, fft_direction):
-    """Execute with nvmath, or return None to use CuPy's native path.
+    """Execute with an NVRTC normalization epilog, or use CuPy's native path.
 
     Shape changes, multi-GPU execution, callbacks and explicit plans fall back
     silently. Anything nvmath rejects while building or planning also falls
     back, but warns, since which operands, dtypes and layouts nvmath accepts is
     nvmath's to decide and changes between versions. Failures once the plan is
     live propagate instead: see the comments on those blocks.
+
+    Fused plans are keyed by their divisor, so plans are shared only when they
+    scale identically. Callback preparation happens only on a plan miss;
+    compiled code is reusable across divisors. User callback contexts remain
+    native.
     """
     if not config.use_nvmath:
         return None
@@ -153,13 +226,14 @@ def _try_use_nvmath(
         # CuPy's configured multi-GPU execution remains on the native path.
         return None
     if config.get_current_callback_manager() is not None:
-        # cuFFT callbacks are supported only by CuPy's native plans.
+        # CuPy user callback contexts remain on native plans.
         return None
 
     from cupy.cuda import cufft
     if cufft.get_current_plan() is not None:
         return None
 
+    operand_device = operand.data.device_id
     axes = _normalize_axes(operand.ndim, axes)
     if axes is None:
         return None
@@ -181,31 +255,39 @@ def _try_use_nvmath(
         raise ValueError(
             f'Unsupported FFT direction: {fft_direction!r}') from None
 
-    options = _FFT_OPTIONS[fft_type]
+    options = _get_fft_options(fft_type, inplace=False)
+    scaling = _Scaling.from_norm(norm, fft_direction)
+    divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
     permutation = None
     result_permutation = None
 
+    stream = cupy.cuda.get_current_stream(operand_device)
     try:
-        nvmath_key = _create_key_from_operand(operand, axes, options)
-    except nvmath_fft.UnsupportedLayoutError as e:
-        permutation = tuple(e.permutation)
-        axes = tuple(e.axes)
-        result_permutation = _invert_permutation(permutation)
-        # The copy below could be transformed in place, but nvmath's key does
-        # not encode `inplace`: for a dense C2C layout the in-place and
-        # out-of-place keys are identical, so an in-place plan would share a
-        # cache entry with the out-of-place plan for the same layout and could
-        # later be handed a caller's array to overwrite. Stay out-of-place.
-        nvmath_key = _create_key_from_operand(
-            operand, axes, options, permutation)
+        try:
+            nvmath_key = _create_key_from_operand(operand, axes, options)
+        except nvmath_fft.UnsupportedLayoutError as e:
+            permutation = tuple(e.permutation)
+            axes = tuple(e.axes)
+            result_permutation = _invert_permutation(permutation)
+            if fft_type == 'C2C':
+                # Only C2C runs in place, on the private copy made below.
+                options = _get_fft_options(fft_type, inplace=True)
+            nvmath_key = _create_key_from_operand(
+                operand, axes, options, permutation)
+        # Without LTO callbacks, scale the output after execution instead.
+        fused = divisor != 1 and _supports_lto_callbacks()
     except Exception as e:
         _warn_fallback(e)
         return None
 
-    stream = cupy.cuda.get_current_stream()
     # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
     # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
+    # Metadata and the divisor identify this built-in callback without
+    # resolving code or allocating its scalar on warm hits. Unfused scaling
+    # shares the unscaled plan.
     key = ('nvmath', stream.ptr, nvmath_key)
+    if fused:
+        key += (divisor,)
     cache = get_plan_cache()
     plan = cache.get(key)
     cache_miss = plan is None
@@ -218,6 +300,17 @@ def _try_use_nvmath(
 
     if cache_miss:
         try:
+            epilog = scalar = None
+            if fused:
+                result_dtype = operand.dtype
+                if fft_type == 'R2C':
+                    result_dtype = numpy.dtype(
+                        f'c{result_dtype.itemsize * 2}')
+                elif fft_type == 'C2R':
+                    result_dtype = numpy.dtype(
+                        f'f{result_dtype.itemsize // 2}')
+                epilog, scalar = _get_scaling_epilog(
+                    result_dtype, divisor, operand.data.device_id)
             plan = CachedFFT(
                 operand,
                 axes=axes,
@@ -225,7 +318,9 @@ def _try_use_nvmath(
                 execution='cuda',
                 stream=stream,
             )
-            plan.plan(stream=stream)
+            # DeviceCallable.data is a raw pointer to the scalar.
+            plan._cupy_normalization_scalar = scalar
+            plan.plan(stream=stream, epilog=epilog)
         except Exception as e:
             if plan is not None:
                 plan.free()
@@ -241,10 +336,10 @@ def _try_use_nvmath(
                 stream=stream,
                 release_workspace=True,
             )
-            _scale_result(
-                out, operand, axes, norm, fft_type, fft_direction)
         finally:
             plan.release_operand()
+        if not fused and divisor != 1:
+            out /= divisor
     except Exception:
         if cache_miss:
             plan.free()
