@@ -319,7 +319,7 @@ def _try_use_nvmath(
                 stream=stream,
             )
             # DeviceCallable.data is a raw pointer to the scalar.
-            plan._normalization_scalar = scalar
+            plan._cupy_normalization_scalar = scalar
             plan.plan(stream=stream, epilog=epilog)
         except Exception as e:
             if plan is not None:

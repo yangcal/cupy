@@ -161,7 +161,7 @@ class TestNvmathNormalization:
         assert isinstance(plans[0], self.adapter.CachedFFT)
         scaled = (norm == 'ortho'
                   or (norm == 'forward') == name.startswith(('fft', 'rfft')))
-        assert (plans[0]._normalization_scalar is not None) == scaled
+        assert (plans[0]._cupy_normalization_scalar is not None) == scaled
 
     @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
     @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
@@ -173,7 +173,7 @@ class TestNvmathNormalization:
         plans = self._cached_plans()
         assert len(plans) == 1
         assert isinstance(plans[0], self.adapter.CachedFFT)
-        assert plans[0]._normalization_scalar is None
+        assert plans[0]._cupy_normalization_scalar is None
 
     def test_unfused_normalization_shares_unscaled_plan(self, monkeypatch):
         monkeypatch.setattr(self.adapter, '_supports_lto_callbacks',
