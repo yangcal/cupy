@@ -49,9 +49,6 @@ def _convert_dtype(a, value_type):
     return a
 
 
-# Imported after _convert_dtype so the adapter can import it at module scope:
-# this module is still initializing when it pulls in the adapter, so the name
-# must already be defined here.
 if _is_cuda_python_build:
     from cupy.fft._fft_nvmath import _try_use_nvmath
 
