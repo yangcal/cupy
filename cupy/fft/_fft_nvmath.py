@@ -15,6 +15,7 @@ import nvmath.fft as nvmath_fft
 import cupy
 from cupy.fft import config
 from cupy.fft._cache import get_plan_cache
+from cupy.fft._fft import _convert_dtype
 
 
 _VALID_NORMS = ('backward', 'ortho', 'forward')
@@ -241,6 +242,11 @@ def _try_use_nvmath(
         return operand if fft_type == 'C2C' else None
     if operand.size == 0:
         return None
+
+    # Apply CuPy's public dtype promotion before keying. Real, integer,
+    # boolean and float16 inputs are promoted to the complex (C2C/C2R) or
+    # real (R2C) operand nvmath supports.
+    operand = _convert_dtype(operand, fft_type)
 
     if norm is None:
         norm = 'backward'

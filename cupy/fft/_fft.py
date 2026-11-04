@@ -15,9 +15,6 @@ _reduce = functools.reduce
 _prod = cupy._core.internal.prod
 _is_cuda_python_build = driver._is_cuda_python()
 
-if _is_cuda_python_build:
-    from cupy.fft._fft_nvmath import _try_use_nvmath
-
 _R2C_OUTPUT_DTYPES = {
     np.dtype(np.float32): np.dtype(np.complex64),
     np.dtype(np.float64): np.dtype(np.complex128),
@@ -50,6 +47,13 @@ def _convert_dtype(a, value_type):
     if out_dtype != a.dtype:
         a = a.astype(out_dtype)
     return a
+
+
+# Imported after _convert_dtype so the adapter can import it at module scope:
+# this module is still initializing when it pulls in the adapter, so the name
+# must already be defined here.
+if _is_cuda_python_build:
+    from cupy.fft._fft_nvmath import _try_use_nvmath
 
 
 def _cook_shape(a, s, axes, value_type, order='C'):
@@ -960,7 +964,7 @@ def irfft(a, n=None, axis=-1, norm=None):
         out = _try_use_nvmath(
             a, n, axis, norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
-            return out
+            return _compat_caster(a, (axis,))(out)
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, (axis,))
@@ -1026,7 +1030,7 @@ def irfft2(a, s=None, axes=(-2, -1), norm=None):
         out = _try_use_nvmath(
             a, s, axes, norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
-            return out
+            return _compat_caster(a, axes)(out)
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, axes)
@@ -1102,7 +1106,7 @@ def irfftn(a, s=None, axes=None, norm=None):
         out = _try_use_nvmath(
             a, s, axes, norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
-            return out
+            return _compat_caster(a, axes)(out)
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, axes)
