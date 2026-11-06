@@ -166,24 +166,33 @@ def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
 
 
-def _create_key_from_operand(operand, axes, options, permutation=None):
-    """Build the nvmath key from operand metadata.
-
-    When ``permutation`` is given, the key describes the not-yet-materialized
-    ``operand.transpose(permutation).copy()`` instead of ``operand`` itself, so
-    that the recommended layout only has to be materialized once the key is
-    known to be usable.
-    """
+def _create_key_from_operand(
+        operand, axes, options, permutation=None, dtype=None):
+    """Build the key for the operand after dtype and layout conversion."""
+    if dtype is None:
+        dtype = operand.dtype
     if permutation is None:
         shape = operand.shape
-        strides = operand.strides
+        if dtype == operand.dtype:
+            strides = operand.strides
+        elif operand.flags.c_contiguous:
+            strides = None
+        elif operand.flags.f_contiguous:
+            strides = []
+            stride = dtype.itemsize
+            for extent in shape:
+                strides.append(stride)
+                stride *= extent
+        else:
+            strides = cupy._core.internal._get_strides_for_order_K(
+                operand, dtype)
     else:
         # Omitted strides describe a C-contiguous layout.
         shape = tuple(operand.shape[axis] for axis in permutation)
         strides = None
     return nvmath_fft.FFT.create_key_from_metadata(
         shape,
-        operand.dtype,
+        dtype,
         'cuda',
         strides=strides,
         strides_in_bytes=True,
@@ -246,10 +255,8 @@ def _try_use_nvmath(
     if fft_type == 'C2R':
         caster = _fft._compat_caster(operand, original_axes)
 
-    # Apply CuPy's public dtype promotion before keying. Real, integer,
-    # boolean and float16 inputs are promoted to the complex (C2C/C2R) or
-    # real (R2C) operand nvmath supports.
-    operand = _fft._convert_dtype(operand, fft_type)
+    input_dtype = numpy.dtype(_fft._output_dtype(operand.dtype, fft_type))
+    dtype_promotion = input_dtype != operand.dtype
 
     if norm is None:
         norm = 'backward'
@@ -264,7 +271,8 @@ def _try_use_nvmath(
         raise ValueError(
             f'Unsupported FFT direction: {fft_direction!r}') from None
 
-    options = _get_fft_options(fft_type, inplace=False)
+    options = _get_fft_options(
+        fft_type, inplace=dtype_promotion and fft_type == 'C2C')
     scaling = _Scaling.from_norm(norm, fft_direction)
     divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
     permutation = None
@@ -273,7 +281,8 @@ def _try_use_nvmath(
     stream = cupy.cuda.get_current_stream(operand_device)
     try:
         try:
-            nvmath_key = _create_key_from_operand(operand, axes, options)
+            nvmath_key = _create_key_from_operand(
+                operand, axes, options, dtype=input_dtype)
         except nvmath_fft.UnsupportedLayoutError as e:
             permutation = tuple(e.permutation)
             axes = tuple(e.axes)
@@ -282,7 +291,7 @@ def _try_use_nvmath(
                 # Only C2C runs in place, on the private copy made below.
                 options = _get_fft_options(fft_type, inplace=True)
             nvmath_key = _create_key_from_operand(
-                operand, axes, options, permutation)
+                operand, axes, options, permutation, dtype=input_dtype)
         # Without LTO callbacks, scale the output after execution instead.
         fused = divisor != 1 and _supports_lto_callbacks()
     except Exception as e:
@@ -302,10 +311,13 @@ def _try_use_nvmath(
     cache_miss = plan is None
 
     if permutation is not None:
-        # Materialize the layout nvmath recommended, matching the C-contiguous
-        # metadata the key was built from. This has to happen before the
-        # operand is bound to a plan on either the hit or the miss path.
-        operand = operand.transpose(permutation).copy()
+        operand = operand.transpose(permutation)
+    if dtype_promotion:
+        operand = operand.astype(
+            input_dtype, order='C' if permutation is not None else 'K',
+            copy=True)
+    elif permutation is not None:
+        operand = operand.copy()
 
     if cache_miss:
         try:
