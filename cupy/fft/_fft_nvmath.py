@@ -13,9 +13,8 @@ from nvmath.bindings import cufft as nvmath_cufft
 import nvmath.fft as nvmath_fft
 
 import cupy
-from cupy.fft import config
+from cupy.fft import _fft, config
 from cupy.fft._cache import get_plan_cache
-from cupy.fft._fft import _convert_dtype
 
 
 _VALID_NORMS = ('backward', 'ortho', 'forward')
@@ -235,6 +234,7 @@ def _try_use_nvmath(
         return None
 
     operand_device = operand.data.device_id
+    original_axes = axes
     axes = _normalize_axes(operand.ndim, axes)
     if axes is None:
         return None
@@ -243,10 +243,13 @@ def _try_use_nvmath(
     if operand.size == 0:
         return None
 
+    if fft_type == 'C2R':
+        caster = _fft._compat_caster(operand, original_axes)
+
     # Apply CuPy's public dtype promotion before keying. Real, integer,
     # boolean and float16 inputs are promoted to the complex (C2C/C2R) or
     # real (R2C) operand nvmath supports.
-    operand = _convert_dtype(operand, fft_type)
+    operand = _fft._convert_dtype(operand, fft_type)
 
     if norm is None:
         norm = 'backward'
@@ -365,4 +368,6 @@ def _try_use_nvmath(
 
     if result_permutation is not None:
         out = out.transpose(result_permutation)
+    if fft_type == 'C2R':
+        out = caster(out)
     return out

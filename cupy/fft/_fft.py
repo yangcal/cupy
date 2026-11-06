@@ -959,9 +959,9 @@ def irfft(a, n=None, axis=-1, norm=None):
     """
     if _is_cuda_python_build:
         out = _try_use_nvmath(
-            a, n, axis, norm, fft_type='C2R', fft_direction='inverse')
+            a, n, (axis,), norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
-            return _compat_caster(a, (axis,))(out)
+            return out
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, (axis,))
@@ -1027,7 +1027,7 @@ def irfft2(a, s=None, axes=(-2, -1), norm=None):
         out = _try_use_nvmath(
             a, s, axes, norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
-            return _compat_caster(a, axes)(out)
+            return out
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, axes)
@@ -1103,7 +1103,7 @@ def irfftn(a, s=None, axes=None, norm=None):
         out = _try_use_nvmath(
             a, s, axes, norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
-            return _compat_caster(a, axes)(out)
+            return out
     from cupy.cuda import cufft
 
     caster = _compat_caster(a, axes)
