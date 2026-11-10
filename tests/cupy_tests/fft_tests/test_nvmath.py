@@ -84,15 +84,34 @@ def test_lto_support_follows_loaded_cufft_version(
 
 @testing.multi_gpu(2)
 def test_keys_distinguish_operand_devices(adapter):
-    options = adapter._get_fft_options('C2C', inplace=False)
     keys = []
     for device_id in (0, 1):
         with cupy.cuda.Device(device_id):
             operand = cupy.empty((4, 16), dtype=cupy.complex64)
         with cupy.cuda.Device(0):
             keys.append(
-                adapter._create_key_from_operand(operand, (1,), options))
+                adapter._create_key_from_operand(operand, (1,), 'C2C')[0])
     assert keys[0] != keys[1]
+
+
+@pytest.mark.parametrize('shape,order,dtype,axes,fft_type,expected', [
+    # Accepted layouts are used as is.
+    ((4, 16), 'C', np.complex64, (1,), 'C2C', (None, (1,), False)),
+    ((16, 4), 'F', np.complex64, (0,), 'C2C', (None, (0,), False)),
+    # Promotion copies into C order, permuted only if nvmath rejects that.
+    ((4, 16), 'C', np.float32, (1,), 'C2C', (None, (1,), True)),
+    ((16, 4), 'F', np.float32, (0,), 'C2C', (None, (0,), True)),
+    ((8, 6, 4), 'C', np.float16, (2, 0), 'R2C', ((1, 2, 0), (1, 2), False)),
+    # Rejected layouts are copied as nvmath recommends.
+    ((8, 12, 16, 20), 'C', np.complex64, (0, 2), 'C2C',
+     ((1, 3, 0, 2), (2, 3), True)),
+])
+def test_create_key_layouts(
+        adapter, shape, order, dtype, axes, fft_type, expected):
+    operand = cupy.empty(shape, dtype=dtype, order=order)
+    _, _, permutation, new_axes, options = adapter._create_key_from_operand(
+        operand, axes, fft_type)
+    assert (permutation, new_axes, options.inplace) == expected
 
 
 # (function, input shape, input dtype, keyword arguments)
@@ -112,6 +131,17 @@ _PERMUTED_FFTS = [
     ('ifft', (16, 24, 32), cupy.complex128, {'axis': 1}),
     ('rfftn', (8, 12, 16, 20), cupy.float32, {'axes': (0, 2)}),
     ('irfftn', (8, 12, 16, 11), cupy.complex64, {'axes': (0, 2)}),
+]
+
+# Inputs CuPy promotes before the transform, onto a C-contiguous copy that is
+# permuted when nvmath rejects it.
+_PROMOTED_FFTS = [
+    ('fft', (4, 16), cupy.float32, {}),
+    ('fft', (16, 4), cupy.float64, {'axis': 0}),
+    ('ifftn', (6, 4, 8), cupy.float16, {'axes': (0, 2)}),
+    ('rfftn', (8, 6, 4), cupy.float16, {'axes': (2, 0)}),
+    ('irfft', (4, 9), cupy.float32, {}),
+    ('irfftn', (6, 4, 5), cupy.float64, {'axes': (0, 2)}),
 ]
 
 
@@ -145,8 +175,12 @@ class TestNvmathNormalization:
     def _check_operand(self, name, a, kwargs, norm):
         before = a.copy()
         out = getattr(cupy.fft, name)(a, norm=norm, **kwargs)
-        expected = getattr(np.fft, name)(a.get(), norm=norm, **kwargs)
-        tol = 1e-4 if a.dtype in (cupy.complex64, cupy.float32) else 1e-10
+        host = a.get()
+        if host.dtype == np.float16:
+            # NumPy applies 'ortho' scaling to float16 in half precision.
+            host = host.astype(np.float32)
+        expected = getattr(np.fft, name)(host, norm=norm, **kwargs)
+        tol = 1e-4 if out.dtype in (cupy.complex64, cupy.float32) else 1e-10
         testing.assert_allclose(out, expected, rtol=tol, atol=tol)
         testing.assert_array_equal(a, before)
 
@@ -191,16 +225,35 @@ class TestNvmathNormalization:
         for norm in (None, 'ortho', None):
             self._check(name, shape, dtype, kwargs, norm)
 
+    @pytest.mark.parametrize('layout', ['C', 'F', 'reversed'])
+    @pytest.mark.parametrize('name,shape,dtype,kwargs', _PROMOTED_FFTS)
+    def test_promoted_dtypes(self, name, shape, dtype, kwargs, layout):
+        a = testing.shaped_random(shape, cupy, dtype)
+        if layout == 'F':
+            a = cupy.asfortranarray(a)
+        elif layout == 'reversed':
+            a = a[..., ::-1]
+        for norm in (None, 'ortho'):
+            self._check_operand(name, a, kwargs, norm)
+        plans = self._cached_plans()
+        assert plans
+        assert all(isinstance(plan, self.adapter.CachedFFT) for plan in plans)
+
+    def test_promoted_layouts_share_plan(self):
+        a = testing.shaped_random((8, 16), cupy, cupy.float32)
+        for operand in (a, cupy.asfortranarray(a), a[:, ::-1]):
+            self._check_operand('fft', operand, {}, None)
+        assert len(self._cached_plans()) == 1
+
     def test_direct_call_on_permuted_copys_layout_keeps_its_input(self):
         a = testing.shaped_random((8, 12, 16, 20), cupy, cupy.complex64)
-        adapter = self.adapter
-        options = adapter._get_fft_options('C2C', inplace=False)
-        with pytest.raises(adapter.nvmath_fft.UnsupportedLayoutError) as e:
-            adapter._create_key_from_operand(a, (0, 2), options)
+        _, _, permutation, axes, options = (
+            self.adapter._create_key_from_operand(a, (0, 2), 'C2C'))
+        assert options.inplace
         self._check_operand('fftn', a, {'axes': (0, 2)}, None)
         # Laid out like the private copy the call above transformed in place.
-        b = a.transpose(e.value.permutation).copy()
-        self._check_operand('fftn', b, {'axes': tuple(e.value.axes)}, None)
+        b = a.transpose(permutation).copy()
+        self._check_operand('fftn', b, {'axes': axes}, None)
 
     def test_epilog_failure_falls_back_to_native(self, monkeypatch):
         error = RuntimeError('compilation failed')

@@ -15,6 +15,9 @@ _reduce = functools.reduce
 _prod = cupy._core.internal.prod
 _is_cuda_python_build = driver._is_cuda_python()
 
+if _is_cuda_python_build:
+    from cupy.fft._fft_nvmath import _try_use_nvmath
+
 _R2C_OUTPUT_DTYPES = {
     np.dtype(np.float32): np.dtype(np.complex64),
     np.dtype(np.float64): np.dtype(np.complex128),
@@ -47,10 +50,6 @@ def _convert_dtype(a, value_type):
     if out_dtype != a.dtype:
         a = a.astype(out_dtype)
     return a
-
-
-if _is_cuda_python_build:
-    from cupy.fft._fft_nvmath import _try_use_nvmath
 
 
 def _cook_shape(a, s, axes, value_type, order='C'):
