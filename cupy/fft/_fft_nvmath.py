@@ -13,6 +13,7 @@ from nvmath.bindings import cufft as nvmath_cufft
 import nvmath.fft as nvmath_fft
 
 import cupy
+from cupy.cuda import cufft
 from cupy.fft import _fft, config
 from cupy.fft._cache import get_plan_cache
 
@@ -241,7 +242,6 @@ def _try_use_nvmath(
         # cuFFT callbacks are supported only by CuPy's native plans.
         return None
 
-    from cupy.cuda import cufft
     if cufft.get_current_plan() is not None:
         return None
 
