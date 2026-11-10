@@ -20,6 +20,12 @@ def adapter():
     return _fft_nvmath
 
 
+def _create_key(adapter, operand, axes, fft_type, execution_device_id):
+    return adapter._create_key_from_metadata(
+        operand.shape, operand.strides, operand.dtype,
+        operand.data.device_id, axes, fft_type, execution_device_id)
+
+
 @pytest.mark.parametrize('ndim,axes,expected', [
     (1, None, (0,)),
     (2, (0, 1), (0, 1)),
@@ -88,8 +94,8 @@ def test_keys_distinguish_execution_devices(adapter):
     for device_id in (0, 1):
         with cupy.cuda.Device(device_id):
             operand = cupy.empty((4, 16), dtype=cupy.complex64)
-            keys.append(adapter._create_key_from_operand(
-                operand, (1,), 'C2C', device_id)[0])
+            keys.append(_create_key(
+                adapter, operand, (1,), 'C2C', device_id)[0])
     assert keys[0] != keys[1]
 
 
@@ -97,8 +103,8 @@ def test_keys_distinguish_execution_devices(adapter):
 def test_key_copies_operand_from_other_device(adapter):
     with cupy.cuda.Device(1):
         operand = cupy.empty((16, 4), dtype=cupy.complex64, order='F')
-    _, dtype, permutation, axes, options = adapter._create_key_from_operand(
-        operand, (0,), 'C2C', 0)
+    _, dtype, permutation, axes, options = _create_key(
+        adapter, operand, (0,), 'C2C', 0)
     assert (dtype, permutation, axes, options.inplace) == (
         operand.dtype, None, (0,), True)
 
@@ -118,8 +124,8 @@ def test_key_copies_operand_from_other_device(adapter):
 def test_create_key_layouts(
         adapter, shape, order, dtype, axes, fft_type, expected):
     operand = cupy.empty(shape, dtype=dtype, order=order)
-    _, _, permutation, new_axes, options = adapter._create_key_from_operand(
-        operand, axes, fft_type, cupy.cuda.Device().id)
+    _, _, permutation, new_axes, options = _create_key(
+        adapter, operand, axes, fft_type, cupy.cuda.Device().id)
     assert (permutation, new_axes, options.inplace) == expected
 
 
@@ -256,9 +262,8 @@ class TestNvmathNormalization:
 
     def test_direct_call_on_permuted_copys_layout_keeps_its_input(self):
         a = testing.shaped_random((8, 12, 16, 20), cupy, cupy.complex64)
-        _, _, permutation, axes, options = (
-            self.adapter._create_key_from_operand(
-                a, (0, 2), 'C2C', a.device.id))
+        _, _, permutation, axes, options = _create_key(
+            self.adapter, a, (0, 2), 'C2C', a.device.id)
         assert options.inplace
         self._check_operand('fftn', a, {'axes': (0, 2)}, None)
         # Laid out like the private copy the call above transformed in place.

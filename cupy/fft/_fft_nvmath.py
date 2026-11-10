@@ -164,37 +164,33 @@ def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
 
 
-def _create_key_from_operand(operand, axes, fft_type, device_id):
-    """Build the key for the operand nvmath executes on ``device_id``.
+@lru_cache(maxsize=128)
+def _create_key_from_metadata(
+        operand_shape, operand_strides, operand_dtype, operand_device_id,
+        axes, fft_type, execution_device_id):
+    """Return ``(key, dtype, permutation, axes, options)`` for an operand.
 
-    Returns ``(key, dtype, permutation, axes, options)``. ``dtype`` is
-    promoted as on CuPy's native path. An operand that needs promotion or is
-    not on ``device_id`` is replaced by a private C-contiguous copy there. The
-    caller's layout, or that copy, is used as is when nvmath accepts it, with
-    ``permutation`` None. Otherwise the key describes a private C-contiguous
-    copy of ``transpose(permutation)`` in the promoted dtype, using the
-    permutation nvmath reports. C2C transforms private copies in place.
+    Promoted or cross-device operands are copied C-contiguous to the execution
+    device. Layouts nvmath rejects are copied as ``transpose(permutation)``;
+    otherwise ``permutation`` is None. C2C runs in place on copies.
     """
-    shape = operand.shape
-    strides = operand.strides
-    execution = _cuda_execution(device_id)
-    input_dtype = numpy.dtype(_fft._output_dtype(operand.dtype, fft_type))
-    copied = (input_dtype != operand.dtype
-              or operand.data.device_id != device_id)
-    if copied:
-        # Omitted strides describe a C-contiguous layout.
-        strides = None
+    execution = _cuda_execution(execution_device_id)
+    input_dtype = numpy.dtype(_fft._output_dtype(operand_dtype, fft_type))
+    copied = (input_dtype != operand_dtype
+              or operand_device_id != execution_device_id)
+    # Omitted strides describe a C-contiguous layout.
+    strides = None if copied else operand_strides
     options = _get_fft_options(
         fft_type, inplace=copied and fft_type == 'C2C')
     try:
         key = nvmath_fft.FFT.create_key_from_metadata(
-            shape, input_dtype, 'cuda', strides=strides,
+            operand_shape, input_dtype, 'cuda', strides=strides,
             strides_in_bytes=True, axes=axes, options=options,
             execution=execution)
         return key, input_dtype, None, axes, options
     except nvmath_fft.UnsupportedLayoutError as e:
         permutation = tuple(e.permutation)
-        shape = tuple(shape[axis] for axis in permutation)
+        shape = tuple(operand_shape[axis] for axis in permutation)
         axes = tuple(e.axes)
     # The rejected layout is always copied into a private operand, so C2C,
     # the only type nvmath runs in place, can overwrite it.
@@ -274,10 +270,12 @@ def _try_use_nvmath(
     divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
 
     # Execute on the current device, as CuPy's other functions do.
-    device_id = cupy.cuda.runtime.getDevice()
+    execution_device_id = cupy.cuda.runtime.getDevice()
     try:
         nvmath_key, dtype, permutation, axes, options = (
-            _create_key_from_operand(operand, axes, fft_type, device_id))
+            _create_key_from_metadata(
+                operand.shape, operand.strides, operand.dtype,
+                operand.data.device_id, axes, fft_type, execution_device_id))
     except Exception as e:
         _warn_fallback(e)
         return None
@@ -303,7 +301,8 @@ def _try_use_nvmath(
         # operand is bound to a plan on either the hit or the miss path.
         operand = operand.transpose(permutation).astype(
             dtype, order='C', copy=True)
-    elif operand.dtype != dtype or operand.data.device_id != device_id:
+    elif (operand.dtype != dtype
+          or operand.data.device_id != execution_device_id):
         operand = operand.astype(dtype, order='C')
 
     if cache_miss:
