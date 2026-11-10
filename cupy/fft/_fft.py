@@ -958,7 +958,7 @@ def irfft(a, n=None, axis=-1, norm=None):
     """
     if _is_cuda_python_build:
         out = _try_use_nvmath(
-            a, n, axis, norm, fft_type='C2R', fft_direction='inverse')
+            a, n, (axis,), norm, fft_type='C2R', fft_direction='inverse')
         if out is not None:
             return out
     from cupy.cuda import cufft

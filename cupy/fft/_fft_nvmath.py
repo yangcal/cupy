@@ -13,7 +13,8 @@ from nvmath.bindings import cufft as nvmath_cufft
 import nvmath.fft as nvmath_fft
 
 import cupy
-from cupy.fft import config
+from cupy.cuda import cufft
+from cupy.fft import _fft, config
 from cupy.fft._cache import get_plan_cache
 
 
@@ -79,12 +80,10 @@ def _supports_lto_callbacks():
 
 
 @cache
-def _get_scaling_ltoir(dtype, device_id):
-    """Return the store callback's LTO-IR for an output dtype and device."""
+def _get_scaling_ltoir(dtype, arch):
+    """Return the store callback's LTO-IR for an output dtype and arch."""
     from cupy.cuda import compiler
 
-    with cupy.cuda.Device(device_id):
-        arch = compiler._get_arch()
     source = Path(__file__).with_name('_nvmath_scaling.cu').read_text()
     options = (
         '--std=c++17',
@@ -95,20 +94,19 @@ def _get_scaling_ltoir(dtype, device_id):
             source, options, arch=arch, to_ltoir=True)
 
 
-def _get_scaling_epilog(dtype, divisor, device_id):
+def _get_scaling_epilog(dtype, divisor):
     """Return a callback and the immutable scalar in output precision it
-    divides by.
+    divides by, for the current device.
 
     The callback only holds a raw pointer to the scalar, so the caller must
     keep the scalar alive for as long as the callback is in use.
 
     ``divisor`` is not validated, since all callers guarantee a valid value.
-    The scalar is allocated on ``device_id``, which need not be the current
-    device.
     """
-    ltoir = _get_scaling_ltoir(dtype, device_id)
-    with cupy.cuda.Device(device_id):
-        scalar = cupy.full(1, divisor, dtype=numpy.finfo(dtype).dtype)
+    from cupy.cuda import compiler
+
+    ltoir = _get_scaling_ltoir(dtype, compiler._get_arch())
+    scalar = cupy.full(1, divisor, dtype=numpy.finfo(dtype).dtype)
     epilog = nvmath_fft.DeviceCallable(ltoir=ltoir, data=scalar.data.ptr)
     return epilog, scalar
 
@@ -166,31 +164,42 @@ def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
 
 
-def _create_key_from_operand(operand, axes, options, permutation=None):
-    """Build the nvmath key from operand metadata.
+@lru_cache(maxsize=128)
+def _create_key_from_metadata(
+        operand_shape, operand_strides, operand_dtype, operand_device_id,
+        axes, fft_type, execution_device_id):
+    """Return ``(key, dtype, permutation, axes, options)`` for an operand.
 
-    When ``permutation`` is given, the key describes the not-yet-materialized
-    ``operand.transpose(permutation).copy()`` instead of ``operand`` itself, so
-    that the recommended layout only has to be materialized once the key is
-    known to be usable.
+    Promoted or cross-device operands are copied C-contiguous to the execution
+    device. Layouts nvmath rejects are copied as ``transpose(permutation)``;
+    otherwise ``permutation`` is None. C2C runs in place on copies.
     """
-    if permutation is None:
-        shape = operand.shape
-        strides = operand.strides
-    else:
-        # Omitted strides describe a C-contiguous layout.
-        shape = tuple(operand.shape[axis] for axis in permutation)
-        strides = None
-    return nvmath_fft.FFT.create_key_from_metadata(
-        shape,
-        operand.dtype,
-        'cuda',
-        strides=strides,
-        strides_in_bytes=True,
-        axes=axes,
-        options=options,
-        execution=_cuda_execution(operand.data.device_id),
-    )
+    execution = _cuda_execution(execution_device_id)
+    input_dtype = numpy.dtype(_fft._output_dtype(operand_dtype, fft_type))
+    copied = (input_dtype != operand_dtype
+              or operand_device_id != execution_device_id)
+    # Omitted strides describe a C-contiguous layout.
+    strides = None if copied else operand_strides
+    options = _get_fft_options(
+        fft_type, inplace=copied and fft_type == 'C2C')
+    try:
+        key = nvmath_fft.FFT.create_key_from_metadata(
+            operand_shape, input_dtype, 'cuda', strides=strides,
+            strides_in_bytes=True, axes=axes, options=options,
+            execution=execution)
+        return key, input_dtype, None, axes, options
+    except nvmath_fft.UnsupportedLayoutError as e:
+        permutation = tuple(e.permutation)
+        shape = tuple(operand_shape[axis] for axis in permutation)
+        axes = tuple(e.axes)
+    # The rejected layout is always copied into a private operand, so C2C,
+    # the only type nvmath runs in place, can overwrite it.
+    options = _get_fft_options(fft_type, inplace=fft_type == 'C2C')
+    # Omitted strides describe a C-contiguous layout.
+    key = nvmath_fft.FFT.create_key_from_metadata(
+        shape, input_dtype, 'cuda', axes=axes, options=options,
+        execution=execution)
+    return key, input_dtype, permutation, axes, options
 
 
 def _invert_permutation(permutation):
@@ -202,7 +211,7 @@ def _invert_permutation(permutation):
 
 def _try_use_nvmath(
         operand, requested_shape, axes, norm, *, fft_type, fft_direction):
-    """Execute with an NVRTC normalization epilog, or use CuPy's native path.
+    """Execute with nvmath, or return None to use CuPy's native path.
 
     Shape changes, multi-GPU execution, callbacks and explicit plans fall back
     silently. Anything nvmath rejects while building or planning also falls
@@ -226,14 +235,13 @@ def _try_use_nvmath(
         # CuPy's configured multi-GPU execution remains on the native path.
         return None
     if config.get_current_callback_manager() is not None:
-        # CuPy user callback contexts remain on native plans.
+        # cuFFT callbacks are supported only by CuPy's native plans.
         return None
 
-    from cupy.cuda import cufft
     if cufft.get_current_plan() is not None:
         return None
 
-    operand_device = operand.data.device_id
+    original_axes = axes
     axes = _normalize_axes(operand.ndim, axes)
     if axes is None:
         return None
@@ -241,6 +249,9 @@ def _try_use_nvmath(
         return operand if fft_type == 'C2C' else None
     if operand.size == 0:
         return None
+
+    if fft_type == 'C2R':
+        caster = _fft._compat_caster(operand, original_axes)
 
     if norm is None:
         norm = 'backward'
@@ -255,31 +266,23 @@ def _try_use_nvmath(
         raise ValueError(
             f'Unsupported FFT direction: {fft_direction!r}') from None
 
-    options = _get_fft_options(fft_type, inplace=False)
     scaling = _Scaling.from_norm(norm, fft_direction)
     divisor = scaling.get_normalization_divisor(fft_type, operand.shape, axes)
-    permutation = None
-    result_permutation = None
 
-    stream = cupy.cuda.get_current_stream(operand_device)
+    # Execute on the current device, as CuPy's other functions do.
+    execution_device_id = cupy.cuda.runtime.getDevice()
     try:
-        try:
-            nvmath_key = _create_key_from_operand(operand, axes, options)
-        except nvmath_fft.UnsupportedLayoutError as e:
-            permutation = tuple(e.permutation)
-            axes = tuple(e.axes)
-            result_permutation = _invert_permutation(permutation)
-            if fft_type == 'C2C':
-                # Only C2C runs in place, on the private copy made below.
-                options = _get_fft_options(fft_type, inplace=True)
-            nvmath_key = _create_key_from_operand(
-                operand, axes, options, permutation)
-        # Without LTO callbacks, scale the output after execution instead.
-        fused = divisor != 1 and _supports_lto_callbacks()
+        nvmath_key, dtype, permutation, axes, options = (
+            _create_key_from_metadata(
+                operand.shape, operand.strides, operand.dtype,
+                operand.data.device_id, axes, fft_type, execution_device_id))
     except Exception as e:
         _warn_fallback(e)
         return None
+    # Without LTO callbacks, scale the output after execution instead.
+    fused = divisor != 1 and _supports_lto_callbacks()
 
+    stream = cupy.cuda.get_current_stream()
     # NOTE: Keep stateful plans stream-local to avoid concurrent plan/workspace
     # reuse, which is unsafe in CuPy's stream-agnostic cache (cupy/cupy#8079).
     # Metadata and the divisor identify this built-in callback without
@@ -296,7 +299,11 @@ def _try_use_nvmath(
         # Materialize the layout nvmath recommended, matching the C-contiguous
         # metadata the key was built from. This has to happen before the
         # operand is bound to a plan on either the hit or the miss path.
-        operand = operand.transpose(permutation).copy()
+        operand = operand.transpose(permutation).astype(
+            dtype, order='C', copy=True)
+    elif (operand.dtype != dtype
+          or operand.data.device_id != execution_device_id):
+        operand = operand.astype(dtype, order='C')
 
     if cache_miss:
         try:
@@ -309,8 +316,7 @@ def _try_use_nvmath(
                 elif fft_type == 'C2R':
                     result_dtype = numpy.dtype(
                         f'f{result_dtype.itemsize // 2}')
-                epilog, scalar = _get_scaling_epilog(
-                    result_dtype, divisor, operand.data.device_id)
+                epilog, scalar = _get_scaling_epilog(result_dtype, divisor)
             plan = CachedFFT(
                 operand,
                 axes=axes,
@@ -357,6 +363,8 @@ def _try_use_nvmath(
             # no owner and has to be released here.
             plan.free()
 
-    if result_permutation is not None:
-        out = out.transpose(result_permutation)
+    if permutation is not None:
+        out = out.transpose(_invert_permutation(permutation))
+    if fft_type == 'C2R':
+        out = caster(out)
     return out
