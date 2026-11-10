@@ -83,15 +83,24 @@ def test_lto_support_follows_loaded_cufft_version(
 
 
 @testing.multi_gpu(2)
-def test_keys_distinguish_operand_devices(adapter):
+def test_keys_distinguish_execution_devices(adapter):
     keys = []
     for device_id in (0, 1):
         with cupy.cuda.Device(device_id):
             operand = cupy.empty((4, 16), dtype=cupy.complex64)
-        with cupy.cuda.Device(0):
-            keys.append(
-                adapter._create_key_from_operand(operand, (1,), 'C2C')[0])
+            keys.append(adapter._create_key_from_operand(
+                operand, (1,), 'C2C', device_id)[0])
     assert keys[0] != keys[1]
+
+
+@testing.multi_gpu(2)
+def test_key_copies_operand_from_other_device(adapter):
+    with cupy.cuda.Device(1):
+        operand = cupy.empty((16, 4), dtype=cupy.complex64, order='F')
+    _, dtype, permutation, axes, options = adapter._create_key_from_operand(
+        operand, (0,), 'C2C', 0)
+    assert (dtype, permutation, axes, options.inplace) == (
+        operand.dtype, None, (0,), True)
 
 
 @pytest.mark.parametrize('shape,order,dtype,axes,fft_type,expected', [
@@ -110,7 +119,7 @@ def test_create_key_layouts(
         adapter, shape, order, dtype, axes, fft_type, expected):
     operand = cupy.empty(shape, dtype=dtype, order=order)
     _, _, permutation, new_axes, options = adapter._create_key_from_operand(
-        operand, axes, fft_type)
+        operand, axes, fft_type, cupy.cuda.Device().id)
     assert (permutation, new_axes, options.inplace) == expected
 
 
@@ -248,7 +257,8 @@ class TestNvmathNormalization:
     def test_direct_call_on_permuted_copys_layout_keeps_its_input(self):
         a = testing.shaped_random((8, 12, 16, 20), cupy, cupy.complex64)
         _, _, permutation, axes, options = (
-            self.adapter._create_key_from_operand(a, (0, 2), 'C2C'))
+            self.adapter._create_key_from_operand(
+                a, (0, 2), 'C2C', a.device.id))
         assert options.inplace
         self._check_operand('fftn', a, {'axes': (0, 2)}, None)
         # Laid out like the private copy the call above transformed in place.
@@ -273,9 +283,8 @@ class TestNvmathNormalization:
     ])
     def test_epilogs_share_ltoir_and_own_scalars(self, dtype, real_dtype):
         dtype = np.dtype(dtype)
-        device_id = cupy.cuda.Device().id
-        first = self.adapter._get_scaling_epilog(dtype, 32, device_id)
-        second = self.adapter._get_scaling_epilog(dtype, 128, device_id)
+        first = self.adapter._get_scaling_epilog(dtype, 32)
+        second = self.adapter._get_scaling_epilog(dtype, 128)
         assert first[0].ltoir is second[0].ltoir
         assert first[0].data != second[0].data
         for (epilog, scalar), value in ((first, 32), (second, 128)):
@@ -284,10 +293,22 @@ class TestNvmathNormalization:
             assert scalar.get().tolist() == [value]
 
     @testing.multi_gpu(2)
-    def test_epilog_scalar_lives_on_requested_device(self):
+    @pytest.mark.parametrize('name,dtype,kwargs', [
+        ('fft', cupy.complex64, {}),
+        ('fft', cupy.float32, {}),
+        ('fftn', cupy.complex64, {'axes': (0, 2)}),
+        ('irfft', cupy.complex64, {}),
+    ])
+    def test_operand_on_other_device_runs_on_current_device(
+            self, name, dtype, kwargs):
+        if not cupy.cuda.runtime.deviceCanAccessPeer(0, 1):
+            pytest.skip('requires peer access between devices 0 and 1')
+        with cupy.cuda.Device(1):
+            a = testing.shaped_random((4, 6, 9), cupy, dtype)
         with cupy.cuda.Device(0):
-            epilog, scalar = self.adapter._get_scaling_epilog(
-                np.dtype(np.complex64), 32, 1)
-            assert cupy.cuda.Device().id == 0
-        assert scalar.device.id == 1
-        assert epilog.data == scalar.data.ptr
+            out = getattr(cupy.fft, name)(a, norm='ortho', **kwargs)
+            assert out.device.id == 0
+            self._check_operand(name, a, kwargs, 'ortho')
+        plans = self._cached_plans()
+        assert plans
+        assert all(isinstance(plan, self.adapter.CachedFFT) for plan in plans)
