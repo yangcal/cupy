@@ -88,45 +88,57 @@ cdef _ndarray_base _ndarray_imag_setter(_ndarray_base self, value):
 
 cdef _ndarray_base _ndarray_prod(
         _ndarray_base self, axis, dtype, out, keepdims):
+    reduce_func = _prod_auto_dtype if dtype is None else _prod_keep_dtype
     for accelerator in _accelerator._routine_accelerators:
-        result = None
+        if accelerator == _accelerator.ACCELERATOR_CUDA_COMPUTE:
+            # result will be None if the reduction is not served by
+            # cuda.compute
+            result = reduce_func(self, axis, dtype, out, keepdims,
+                                 cuda_compute_only=True)
+            if result is not None:
+                return result
         if accelerator == _accelerator.ACCELERATOR_CUB:
             # result will be None if the reduction is not compatible with CUB
             result = cub.cub_reduction(
                 self, cub.CUPY_CUB_PROD, axis, dtype, out, keepdims)
+            if result is not None:
+                return result
         if (accelerator == _accelerator.ACCELERATOR_CUTENSOR and
                 cuda_cutensor is not None):
             from cupyx import cutensor
             result = cutensor._try_reduction_routine(
                 self, axis, dtype, out, keepdims, cuda_cutensor.OP_MUL, 1, 0)
-        if result is not None:
-            return result
-    if dtype is None:
-        return _prod_auto_dtype(self, axis, dtype, out, keepdims)
-    else:
-        return _prod_keep_dtype(self, axis, dtype, out, keepdims)
+            if result is not None:
+                return result
+    return reduce_func(self, axis, dtype, out, keepdims)
 
 
 cdef _ndarray_base _ndarray_sum(
         _ndarray_base self, axis, dtype, out, keepdims):
+    reduce_func = _sum_auto_dtype if dtype is None else _sum_keep_dtype
     for accelerator in _accelerator._routine_accelerators:
-        result = None
+        if accelerator == _accelerator.ACCELERATOR_CUDA_COMPUTE:
+            # result will be None if the reduction is not served by
+            # cuda.compute
+            result = reduce_func(self, axis, dtype, out, keepdims,
+                                 cuda_compute_only=True)
+            if result is not None:
+                return result
         if accelerator == _accelerator.ACCELERATOR_CUB:
             # result will be None if the reduction is not compatible with CUB
             result = cub.cub_reduction(
                 self, cub.CUPY_CUB_SUM, axis, dtype, out, keepdims)
+            if result is not None:
+                return result
         if (accelerator == _accelerator.ACCELERATOR_CUTENSOR and
                 cuda_cutensor is not None):
             from cupyx import cutensor
             result = cutensor._try_reduction_routine(
                 self, axis, dtype, out, keepdims, cuda_cutensor.OP_ADD, 1, 0)
-        if result is not None:
-            return result
+            if result is not None:
+                return result
 
-    if dtype is None:
-        return _sum_auto_dtype(self, axis, dtype, out, keepdims)
-    else:
-        return _sum_keep_dtype(self, axis, dtype, out, keepdims)
+    return reduce_func(self, axis, dtype, out, keepdims)
 
 
 cdef _ndarray_base _ndarray_cumsum(_ndarray_base self, axis, dtype, out):
@@ -637,7 +649,8 @@ def _add_scan_batch_blocked_sum_kernel(
         // The first block of a row has nothing to add and the last thread of
         // a block already holds the sum of its block.
         if (in_range && block_in_row != 0 && thid != ${block_size} - 1){
-            const index_t dst_idx[] = {row, block_start + thid};
+            const index_t dst_idx[] = {
+                row, block_start + static_cast<index_t>(thid)};
             const index_t src_idx[] = {row, block_start - 1};
             src_dst[dst_idx] ${op}= src_dst[src_idx];
         }
@@ -707,6 +720,12 @@ cdef _proc_as_batch(_ndarray_base x, int axis, scan_op op):
 
 cpdef scan_core(
         _ndarray_base a, axis, scan_op op, dtype=None, _ndarray_base out=None):
+    if axis is None:
+        a = a.ravel()
+        axis = 0
+    else:
+        axis = internal._normalize_axis_index(axis, a.ndim)
+
     if out is None:
         if dtype is None:
             kind = a.dtype.kind
@@ -726,7 +745,7 @@ cpdef scan_core(
         else:
             result = a.astype(out.dtype, order='C')
 
-    if axis is None:
+    if a.ndim == 1 and axis == 0:
         for accelerator in _accelerator._routine_accelerators:
             if accelerator == _accelerator.ACCELERATOR_CUDA_COMPUTE:
                 if op == scan_op.SCAN_SUM:
@@ -742,7 +761,7 @@ cpdef scan_core(
                     break
             if accelerator == _accelerator.ACCELERATOR_CUB:
                 if result is None:
-                    result = a.astype(dtype, order='C').ravel()
+                    result = a.astype(dtype, order='C')
                 # result will be None if the scan is not compatible with CUB
                 if op == scan_op.SCAN_SUM:
                     cub_op = cub.CUPY_CUB_CUMSUM
@@ -753,13 +772,12 @@ cpdef scan_core(
                     break
         else:
             if result is None:
-                result = scan(a.ravel(), op, dtype=dtype)
+                result = scan(a, op, dtype=dtype)
             else:
                 scan(result, op, dtype=dtype, out=result)
     else:
         if result is None:
             result = a.astype(dtype, order='C')
-        axis = internal._normalize_axis_index(axis, a.ndim)
         result = _proc_as_batch(result, axis, op)
     # This is for when the original out param was not contiguous
     if out is not None and out.data != result.data:
@@ -812,7 +830,8 @@ else:
 
 _sum_auto_dtype = create_reduction_func(
     'cupy_sum', _sumprod_types,
-    ('in0', 'a + b', 'out0 = type_out0_raw(a)', None), 0)
+    ('in0', 'a + b', 'out0 = type_out0_raw(a)', None), 0,
+    compute_opkind='PLUS')
 
 
 _sum_keep_dtype = create_reduction_func(
@@ -822,13 +841,14 @@ _sum_keep_dtype = create_reduction_func(
      ('e->e', (None, None, None, 'float')),
      *bf16_loop(code=(None, None, None, 'float')),
      'f->f', 'd->d', 'F->F', 'D->D'),
-    ('in0', 'a + b', 'out0 = type_out0_raw(a)', None), 0)
+    ('in0', 'a + b', 'out0 = type_out0_raw(a)', None), 0,
+    compute_opkind='PLUS')
 
 
 _nansum_auto_dtype = create_reduction_func(
     'cupy_nansum', _sumprod_types,
     ('(in0 == in0) ? in0 : type_in0_raw(0)',
-     'a + b', 'out0 = type_out0_raw(a)', None), 0)
+     'a + b', 'out0 = type_out0_raw(a)', None), 0, compute_opkind='PLUS')
 
 
 _nansum_keep_dtype = create_reduction_func(
@@ -839,7 +859,7 @@ _nansum_keep_dtype = create_reduction_func(
      *bf16_loop(code=(None, None, None, 'float')),
      'f->f', 'd->d', 'F->F', 'D->D'),
     ('(in0 == in0) ? in0 : type_in0_raw(0)',
-     'a + b', 'out0 = type_out0_raw(a)', None), 0)
+     'a + b', 'out0 = type_out0_raw(a)', None), 0, compute_opkind='PLUS')
 
 
 _nansum_complex_dtype = create_reduction_func(
@@ -849,12 +869,13 @@ _nansum_complex_dtype = create_reduction_func(
     type_in0_raw((in0.real() == in0.real()) ? in0.real() : 0,
                  (in0.imag() == in0.imag()) ? in0.imag() : 0)
     ''',
-     'a + b', 'out0 = type_out0_raw(a)', None), 0)
+     'a + b', 'out0 = type_out0_raw(a)', None), 0, compute_opkind='PLUS')
 
 
 _prod_auto_dtype = create_reduction_func(
     'cupy_prod', _sumprod_types,
-    ('in0', 'a * b', 'out0 = type_out0_raw(a)', None), 1)
+    ('in0', 'a * b', 'out0 = type_out0_raw(a)', None), 1,
+    compute_opkind='MULTIPLIES')
 
 
 _prod_keep_dtype = create_reduction_func(
@@ -864,13 +885,14 @@ _prod_keep_dtype = create_reduction_func(
      ('e->e', (None, None, None, 'float')),
      *bf16_loop(code=(None, None, None, 'float')),
      'f->f', 'd->d', 'F->F', 'D->D'),
-    ('in0', 'a * b', 'out0 = type_out0_raw(a)', None), 1)
+    ('in0', 'a * b', 'out0 = type_out0_raw(a)', None), 1,
+    compute_opkind='MULTIPLIES')
 
 
 _nanprod_auto_dtype = create_reduction_func(
     'cupy_nanprod', _sumprod_types,
     ('(in0 == in0) ? in0 : type_in0_raw(1)',
-     'a * b', 'out0 = type_out0_raw(a)', None), 1)
+     'a * b', 'out0 = type_out0_raw(a)', None), 1, compute_opkind='MULTIPLIES')
 
 
 _nanprod_keep_dtype = create_reduction_func(
@@ -881,7 +903,7 @@ _nanprod_keep_dtype = create_reduction_func(
      *bf16_loop(code=(None, None, None, 'float')),
      'f->f', 'd->d', 'F->F', 'D->D'),
     ('(in0 == in0) ? in0 : type_in0_raw(1)',
-     'a * b', 'out0 = type_out0_raw(a)', None), 1)
+     'a * b', 'out0 = type_out0_raw(a)', None), 1, compute_opkind='MULTIPLIES')
 
 
 _nanprod_complex_dtype = create_reduction_func(
@@ -891,7 +913,7 @@ _nanprod_complex_dtype = create_reduction_func(
     type_in0_raw((in0.real() == in0.real()) ? in0.real() : 1,
                  (in0.imag() == in0.imag()) ? in0.imag() : 1)
     ''',
-     'a * b', 'out0 = type_out0_raw(a)', None), 1)
+     'a * b', 'out0 = type_out0_raw(a)', None), 1, compute_opkind='MULTIPLIES')
 
 cdef create_arithmetic(
         name, op, boolop, doc, cutensor_op=None, scatter_op=None):
