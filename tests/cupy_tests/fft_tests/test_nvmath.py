@@ -95,19 +95,37 @@ def test_keys_distinguish_execution_devices(adapter):
     for device_id in (0, 1):
         with cupy.cuda.Device(device_id):
             operand = cupy.empty((4, 16), dtype=cupy.complex64)
-            keys.append(_create_key(
-                adapter, operand, (1,), 'C2C', device_id)[0])
+            key, _, _, axes, options = _create_key(
+                adapter, operand, (1,), 'C2C', device_id)
+            assert key == adapter.nvmath_fft.FFT.create_key(
+                operand, axes=axes, options=options,
+                execution=adapter._cuda_execution(device_id))
+            keys.append(key)
     assert keys[0] != keys[1]
 
 
 @testing.multi_gpu(2)
-def test_key_copies_operand_from_other_device(adapter):
-    with cupy.cuda.Device(1):
-        operand = cupy.empty((16, 4), dtype=cupy.complex64, order='F')
-    _, dtype, permutation, axes, options = _create_key(
-        adapter, operand, (0,), 'C2C', 0)
+@pytest.mark.parametrize('execution_device_id', [0, 1])
+@pytest.mark.parametrize('shape,axes,expected_permutation,expected_axes', [
+    ((16, 4), (0,), None, (0,)),
+    ((8, 12, 16, 20), (0, 2), (1, 3, 0, 2), (2, 3)),
+])
+def test_key_copies_operand_from_other_device(
+        adapter, execution_device_id, shape, axes,
+        expected_permutation, expected_axes):
+    with cupy.cuda.Device(1 - execution_device_id):
+        operand = cupy.empty(shape, dtype=cupy.complex64, order='F')
+    key, dtype, permutation, axes, options = _create_key(
+        adapter, operand, axes, 'C2C', execution_device_id)
     assert (dtype, permutation, axes, options.inplace) == (
-        operand.dtype, None, (0,), True)
+        operand.dtype, expected_permutation, expected_axes, True)
+    if permutation is not None:
+        shape = tuple(shape[axis] for axis in permutation)
+    with cupy.cuda.Device(execution_device_id):
+        copied = cupy.empty(shape, dtype=dtype)
+        assert key == adapter.nvmath_fft.FFT.create_key(
+            copied, axes=axes, options=options,
+            execution=adapter._cuda_execution(execution_device_id))
 
 
 @pytest.mark.parametrize('shape,order,dtype,axes,fft_type,expected', [
@@ -128,6 +146,34 @@ def test_create_key_layouts(
     _, _, permutation, new_axes, options = _create_key(
         adapter, operand, axes, fft_type, cupy.cuda.Device().id)
     assert (permutation, new_axes, options.inplace) == expected
+
+
+@pytest.mark.parametrize('order', ['C', 'F'])
+@pytest.mark.parametrize('shape,axes,dtype,fft_type', [
+    ((16,), (0,), np.complex64, 'C2C'),
+    ((4, 16), (1,), np.complex64, 'C2C'),
+    ((8, 12, 16, 20), (0, 2), np.complex64, 'C2C'),
+    ((4, 16), (1,), np.float32, 'R2C'),
+    ((8, 12, 16, 20), (0, 2), np.float32, 'R2C'),
+    ((4, 9), (1,), np.complex64, 'C2R'),
+    ((8, 12, 9, 20), (0, 2), np.complex64, 'C2R'),
+    ((4, 16), (1,), np.float32, 'C2C'),
+    ((4, 9), (1,), np.float32, 'C2R'),
+])
+def test_metadata_key_matches_operand(adapter, shape, axes, dtype,
+                                      fft_type, order):
+    operand = cupy.empty(shape, dtype=dtype, order=order)
+    device_id = operand.data.device_id
+    key, dtype, permutation, axes, options = _create_key(
+        adapter, operand, axes, fft_type, device_id)
+    if permutation is not None:
+        operand = operand.transpose(permutation).astype(
+            dtype, order='C', copy=True)
+    elif operand.dtype != dtype:
+        operand = operand.astype(dtype, order='C')
+    assert key == adapter.nvmath_fft.FFT.create_key(
+        operand, axes=axes, options=options,
+        execution=adapter._cuda_execution(device_id))
 
 
 @pytest.fixture
@@ -274,6 +320,32 @@ class TestNvmathNormalization:
     def test_cached_layout_keeps_each_norms_divisor(self):
         for norm in (None, 'ortho', 'forward', None, 'ortho'):
             self._check('ifft', (4, 16), cupy.complex64, {}, norm)
+
+    @pytest.mark.parametrize('name,shape,dtype', [
+        ('fft', (4, 16), cupy.complex64),
+        ('ifft', (4, 16), cupy.complex64),
+        ('rfft', (4, 16), cupy.float32),
+        ('irfft', (4, 9), cupy.complex64),
+    ])
+    @pytest.mark.parametrize('layout', ['transpose', 'reshape'])
+    def test_cached_plan_updates_axes(self, name, shape, dtype, layout):
+        a = testing.shaped_random(shape, cupy, dtype)
+        if layout == 'transpose':
+            rebound, axis = a.T, 0
+        else:
+            rebound, axis = a.reshape(2, 2, shape[-1]), 2
+        self._check_operand(name, a, {'axis': 1}, None)
+        plans = self._cached_plans()
+        assert len(plans) == 1
+        plan = plans[0]
+        assert isinstance(plan, self.adapter.CachedFFT)
+        for operand, axis in ((rebound, axis), (rebound, axis), (a, 1)):
+            self._check_operand(name, operand, {'axis': axis}, None)
+            plans = self._cached_plans()
+            assert len(plans) == 1
+            assert plans[0] is plan
+            assert plan.axes == (axis,)
+            assert plan.operand_dim == operand.ndim
 
     @pytest.mark.parametrize('name,shape,dtype,kwargs', _PERMUTED_FFTS)
     def test_permuted_layouts(self, name, shape, dtype, kwargs):

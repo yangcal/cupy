@@ -196,7 +196,8 @@ def _create_key_from_metadata_uncached(
         fft_type, inplace=copied and fft_type == 'C2C')
     try:
         key = nvmath_fft.FFT.create_key_from_metadata(
-            operand_shape, input_dtype, 'cuda', strides=strides,
+            'cupy', operand_shape, input_dtype, execution_device_id,
+            strides=strides,
             strides_in_bytes=True, axes=axes, options=options,
             execution=execution)
         return key, input_dtype, None, axes, options
@@ -209,7 +210,8 @@ def _create_key_from_metadata_uncached(
     options = _get_fft_options(fft_type, inplace=fft_type == 'C2C')
     # Omitted strides describe a C-contiguous layout.
     key = nvmath_fft.FFT.create_key_from_metadata(
-        shape, input_dtype, 'cuda', axes=axes, options=options,
+        'cupy', shape, input_dtype, execution_device_id,
+        axes=axes, options=options,
         execution=execution)
     return key, input_dtype, permutation, axes, options
 
@@ -349,7 +351,7 @@ def _try_use_nvmath(
                 stacklevel=3)
             return None
     else:
-        plan.reset_operand_unchecked(operand, stream=stream)
+        plan.reset_operand_unchecked(operand, axes=axes, stream=stream)
 
     try:
         try:
