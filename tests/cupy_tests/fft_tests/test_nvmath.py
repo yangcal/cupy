@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from unittest.mock import Mock
+import warnings
 
 import numpy as np
 import pytest
@@ -21,7 +22,7 @@ def adapter():
 
 
 def _create_key(adapter, operand, axes, fft_type, execution_device_id):
-    return adapter._create_key_from_metadata(
+    return adapter._create_key_from_metadata_uncached(
         operand.shape, operand.strides, operand.dtype,
         operand.data.device_id, axes, fft_type, execution_device_id)
 
@@ -127,6 +128,45 @@ def test_create_key_layouts(
     _, _, permutation, new_axes, options = _create_key(
         adapter, operand, axes, fft_type, cupy.cuda.Device().id)
     assert (permutation, new_axes, options.inplace) == expected
+
+
+@pytest.fixture
+def rejecting_adapter(adapter, monkeypatch):
+    create_key = Mock(side_effect=ValueError('unsupported operand'))
+    monkeypatch.setattr(
+        adapter.nvmath_fft.FFT, 'create_key_from_metadata', create_key)
+    adapter._create_key_from_metadata.cache_clear()
+    yield adapter, create_key
+    adapter._create_key_from_metadata.cache_clear()
+
+
+@pytest.mark.skipif(
+    not is_cuda_python, reason='requires a CUDA-Python build')
+@pytest.mark.thread_unsafe(reason='patches nvmath and clears a shared cache')
+class TestRejectedKeys:
+
+    def test_rejection_is_cached_and_warned_once(self, rejecting_adapter):
+        _, create_key = rejecting_adapter
+        a = testing.shaped_random((4, 16), cupy, cupy.complex64)
+
+        with pytest.warns(RuntimeWarning, match='nvmath-python') as record:
+            for _ in range(3):
+                cupy.fft.fft(a)
+        assert len(record) == 1
+        assert create_key.call_count == 1
+
+    def test_error_filter_raises_on_every_call(self, rejecting_adapter):
+        _, create_key = rejecting_adapter
+        a = testing.shaped_random((4, 16), cupy, cupy.complex64)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                'error', message='nvmath-python', category=RuntimeWarning)
+            for _ in range(2):
+                with pytest.raises(RuntimeWarning, match='nvmath-python'):
+                    cupy.fft.fft(a)
+        # A raising warning escapes the cache, so nothing is memoized.
+        assert create_key.call_count == 2
 
 
 # (function, input shape, input dtype, keyword arguments)

@@ -148,16 +148,6 @@ def _normalize_axes_cached(ndim, axes):
     return axes if len(set(axes)) == len(axes) else None
 
 
-def _warn_fallback(exc):
-    warnings.warn(
-        f'nvmath-python rejected this FFT, so it will run on CuPy native '
-        f'cuFFT plans instead: {exc!r}',
-        RuntimeWarning,
-        # 1 is this frame, 2 is _try_use_nvmath, 3 is the public API function.
-        stacklevel=4,
-    )
-
-
 @cache
 def _cuda_execution(device_id):
     return nvmath_fft.ExecutionCUDA(device_id=device_id)
@@ -172,7 +162,30 @@ def _create_key_from_metadata(
     Promoted or cross-device operands are copied C-contiguous to the execution
     device. Layouts nvmath rejects are copied as ``transpose(permutation)``;
     otherwise ``permutation`` is None. C2C runs in place on copies.
+
+    Returns None, after warning, if nvmath does not support the operand. Key
+    creation depends only on these arguments, so caching the None warns once
+    per operand kind. A warning filter that raises skips the cache instead.
     """
+    try:
+        return _create_key_from_metadata_uncached(
+            operand_shape, operand_strides, operand_dtype, operand_device_id,
+            axes, fft_type, execution_device_id)
+    except Exception as e:
+        warnings.warn(
+            f'nvmath-python rejected this FFT, so it will run on CuPy native '
+            f'cuFFT plans instead: {e!r}. Later calls with the same shape, '
+            f'strides and dtype will use the native path without warning.',
+            RuntimeWarning,
+            # 1 is this frame (lru_cache adds none), 2 is _try_use_nvmath and
+            # 3 is the public API function, so 4 points at the user's call.
+            stacklevel=4)
+        return None
+
+
+def _create_key_from_metadata_uncached(
+        operand_shape, operand_strides, operand_dtype, operand_device_id,
+        axes, fft_type, execution_device_id):
     execution = _cuda_execution(execution_device_id)
     input_dtype = numpy.dtype(_fft._output_dtype(operand_dtype, fft_type))
     copied = (input_dtype != operand_dtype
@@ -270,14 +283,12 @@ def _try_use_nvmath(
 
     # Execute on the current device, as CuPy's other functions do.
     execution_device_id = cupy.cuda.runtime.getDevice()
-    try:
-        nvmath_key, dtype, permutation, axes, options = (
-            _create_key_from_metadata(
-                operand.shape, operand.strides, operand.dtype,
-                operand.data.device_id, axes, fft_type, execution_device_id))
-    except Exception as e:
-        _warn_fallback(e)
+    result = _create_key_from_metadata(
+        operand.shape, operand.strides, operand.dtype,
+        operand.data.device_id, axes, fft_type, execution_device_id)
+    if result is None:
         return None
+    nvmath_key, dtype, permutation, axes, options = result
     # Without LTO callbacks, scale the output after execution instead.
     fused = divisor != 1 and _supports_lto_callbacks()
 
@@ -329,7 +340,13 @@ def _try_use_nvmath(
         except Exception as e:
             if plan is not None:
                 plan.free()
-            _warn_fallback(e)
+            warnings.warn(
+                f'nvmath-python rejected this FFT, so it will run on CuPy '
+                f'native cuFFT plans instead: {e!r}',
+                RuntimeWarning,
+                # 1 is this frame and 2 is the public API function, so 3
+                # points at the user's call.
+                stacklevel=3)
             return None
     else:
         plan.reset_operand_unchecked(operand, stream=stream)
