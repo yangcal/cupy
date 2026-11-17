@@ -161,7 +161,7 @@ def test_create_key_layouts(
     ((4, 9), (1,), np.float32, 'C2R'),
 ])
 def test_metadata_key_matches_operand(adapter, shape, axes, dtype,
-                                     fft_type, order):
+                                      fft_type, order):
     operand = cupy.empty(shape, dtype=dtype, order=order)
     device_id = operand.data.device_id
     key, dtype, permutation, axes, options = _create_key(
