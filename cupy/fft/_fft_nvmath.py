@@ -246,6 +246,8 @@ def _try_use_nvmath(
     if requested_shape is not None:
         # Keep CuPy's existing padding and truncation behavior for now.
         return None
+    # cuFFT R2C requires alignment to the complex element size (2 * itemsize):
+    # 8 bytes for float32 input, 16 bytes for float64 input.
     if (fft_type == 'R2C'
             and operand.dtype == _fft._output_dtype(operand.dtype, fft_type)
             and operand.data.ptr % (2 * operand.itemsize)):
