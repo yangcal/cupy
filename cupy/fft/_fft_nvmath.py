@@ -227,11 +227,12 @@ def _try_use_nvmath(
         operand, requested_shape, axes, norm, *, fft_type, fft_direction):
     """Execute with nvmath, or return None to use CuPy's native path.
 
-    Shape changes, multi-GPU execution, callbacks and explicit plans fall back
-    silently. Anything nvmath rejects while building or planning also falls
-    back, but warns, since which operands, dtypes and layouts nvmath accepts is
-    nvmath's to decide and changes between versions. Failures once the plan is
-    live propagate instead: see the comments on those blocks.
+    Shape changes, misaligned real inputs, multi-GPU execution, callbacks and
+    explicit plans fall back silently. Anything nvmath rejects while building
+    or planning also falls back, but warns, since which operands, dtypes and
+    layouts nvmath accepts is nvmath's to decide and changes between versions.
+    Failures once the plan is live propagate instead: see the comments on those
+    blocks.
 
     Fused plans are keyed by their divisor, so plans are shared only when they
     scale identically. Callback preparation happens only on a plan miss;
@@ -244,6 +245,11 @@ def _try_use_nvmath(
         return None
     if requested_shape is not None:
         # Keep CuPy's existing padding and truncation behavior for now.
+        return None
+    if (fft_type == 'R2C'
+            and operand.dtype == _fft._output_dtype(operand.dtype, fft_type)
+            and operand.data.ptr % (2 * operand.itemsize)):
+        # Native CuPy copies misaligned real inputs before execution; nvmath does not.
         return None
     if config.devices is not None:
         # CuPy's configured multi-GPU execution remains on the native path.
