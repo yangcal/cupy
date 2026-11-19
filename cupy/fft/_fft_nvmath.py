@@ -249,7 +249,8 @@ def _try_use_nvmath(
     if (fft_type == 'R2C'
             and operand.dtype == _fft._output_dtype(operand.dtype, fft_type)
             and operand.data.ptr % (2 * operand.itemsize)):
-        # Native CuPy copies misaligned real inputs before execution; nvmath does not.
+        # Native CuPy copies misaligned real inputs before execution;
+        # nvmath does not.
         return None
     if config.devices is not None:
         # CuPy's configured multi-GPU execution remains on the native path.
