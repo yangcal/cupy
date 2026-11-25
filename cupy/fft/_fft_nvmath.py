@@ -4,7 +4,9 @@ from collections.abc import Sequence
 import enum
 from functools import cache, lru_cache
 import math
+import operator
 from pathlib import Path
+import sys
 import threading
 import warnings
 
@@ -133,16 +135,18 @@ class CachedFFT(nvmath_fft.FFT):
 def _normalize_axes(ndim, axes):
     if isinstance(axes, Sequence):
         axes = tuple(axes)
+    elif axes is not None:
+        axes = operator.index(axes)
     return _normalize_axes_cached(ndim, axes)
 
 
 @lru_cache(maxsize=128)
 def _normalize_axes_cached(ndim, axes):
     if axes is None:
-        return tuple(range(ndim)) if ndim <= 3 else None
+        return tuple(range(ndim))
     if isinstance(axes, int):
         return (axes % ndim,) if -ndim <= axes < ndim else None
-    if len(axes) > 3 or any(not -ndim <= axis < ndim for axis in axes):
+    if any(not -ndim <= axis < ndim for axis in axes):
         return None
     axes = tuple(axis % ndim for axis in axes)
     return axes if len(set(axes)) == len(axes) else None
@@ -156,12 +160,14 @@ def _cuda_execution(device_id):
 @lru_cache(maxsize=128)
 def _create_key_from_metadata(
         operand_shape, operand_strides, operand_dtype, operand_device_id,
-        axes, fft_type, execution_device_id):
+        axes, fft_type, execution_device_id, overwrite):
     """Return ``(key, dtype, permutation, axes, options)`` for an operand.
 
-    Promoted or cross-device operands are copied C-contiguous to the execution
-    device. Layouts nvmath rejects are copied as ``transpose(permutation)``;
-    otherwise ``permutation`` is None. C2C runs in place on copies.
+    Promoted or cross-device operands, and layouts nvmath rejects, are copied
+    C-contiguous as ``transpose(permutation)`` to the execution device, with
+    the FFT axes innermost; ``permutation`` is None when no transpose is
+    needed. C2C runs in place on copies, and on operands that ``overwrite``
+    allows to be overwritten.
 
     Returns None, after warning, if nvmath does not support the operand. Key
     creation depends only on these arguments, so caching the None warns once
@@ -170,43 +176,64 @@ def _create_key_from_metadata(
     try:
         return _create_key_from_metadata_uncached(
             operand_shape, operand_strides, operand_dtype, operand_device_id,
-            axes, fft_type, execution_device_id)
+            axes, fft_type, execution_device_id, overwrite)
     except Exception as e:
-        warnings.warn(
+        _warn_fallback(
             f'nvmath-python rejected this FFT, so it will run on CuPy native '
             f'cuFFT plans instead: {e!r}. Later calls with the same shape, '
-            f'strides and dtype will use the native path without warning.',
-            RuntimeWarning,
-            # 1 is this frame (lru_cache adds none), 2 is _try_use_nvmath and
-            # 3 is the public API function, so 4 points at the user's call.
-            stacklevel=4)
+            f'strides and dtype will use the native path without warning.')
         return None
+
+
+_FFT_DIR = Path(__file__).parent
+
+
+def _warn_fallback(message):
+    # Chunked execution nests calls, so no fixed stacklevel reaches the
+    # caller; point at the first frame outside cupy.fft instead.
+    frame = sys._getframe(1)
+    stacklevel = 2
+    while (frame is not None
+           and Path(frame.f_code.co_filename).parent == _FFT_DIR):
+        frame = frame.f_back
+        stacklevel += 1
+    warnings.warn(message, RuntimeWarning, stacklevel=stacklevel)
 
 
 def _create_key_from_metadata_uncached(
         operand_shape, operand_strides, operand_dtype, operand_device_id,
-        axes, fft_type, execution_device_id):
+        axes, fft_type, execution_device_id, overwrite):
     execution = _cuda_execution(execution_device_id)
     input_dtype = numpy.dtype(_fft._output_dtype(operand_dtype, fft_type))
-    copied = (input_dtype != operand_dtype
-              or operand_device_id != execution_device_id)
-    # Omitted strides describe a C-contiguous layout.
-    strides = None if copied else operand_strides
-    options = _get_fft_options(
-        fft_type, inplace=copied and fft_type == 'C2C')
-    try:
-        key = nvmath_fft.FFT.create_key_from_metadata(
-            'cupy', operand_shape, input_dtype, execution_device_id,
-            strides=strides,
-            strides_in_bytes=True, axes=axes, options=options,
-            execution=execution)
-        return key, input_dtype, None, axes, options
-    except nvmath_fft.UnsupportedLayoutError as e:
-        permutation = tuple(e.permutation)
-        shape = tuple(operand_shape[axis] for axis in permutation)
-        axes = tuple(e.axes)
-    # The rejected layout is always copied into a private operand, so C2C,
-    # the only type nvmath runs in place, can overwrite it.
+    if (input_dtype == operand_dtype
+            and operand_device_id == execution_device_id):
+        options = _get_fft_options(
+            fft_type, inplace=overwrite and fft_type == 'C2C')
+        try:
+            key = nvmath_fft.FFT.create_key_from_metadata(
+                'cupy', operand_shape, input_dtype, execution_device_id,
+                strides=operand_strides,
+                strides_in_bytes=True, axes=axes, options=options,
+                execution=execution)
+            return key, input_dtype, None, axes, options
+        except nvmath_fft.UnsupportedLayoutError as e:
+            permutation = tuple(e.permutation)
+            axes = tuple(e.axes)
+    else:
+        # The operand is copied anyway, so lay the copy out like nvmath's
+        # suggested permutation: batch axes, then the FFT axes. The batch
+        # axes keep their memory order so the copy stays cheap.
+        ndim = len(operand_shape)
+        batch = sorted((axis for axis in range(ndim) if axis not in axes),
+                       key=lambda axis: -abs(operand_strides[axis]))
+        permutation = (*batch, *axes)
+        axes = tuple(range(len(batch), ndim))
+        if permutation == tuple(range(ndim)):
+            permutation = None
+    shape = (operand_shape if permutation is None
+             else tuple(operand_shape[axis] for axis in permutation))
+    # The copy is private, so C2C, the only type nvmath runs in place, can
+    # overwrite it.
     options = _get_fft_options(fft_type, inplace=fft_type == 'C2C')
     # Omitted strides describe a C-contiguous layout.
     key = nvmath_fft.FFT.create_key_from_metadata(
@@ -223,9 +250,39 @@ def _invert_permutation(permutation):
     return tuple(inverse)
 
 
+def _execute_in_chunks(operand, axes, norm, fft_direction):
+    """Run a C2C FFT over more than 3 axes as batched FFTs of up to 3 axes.
+
+    The norm applies per chunk, since chunk divisors multiply to the total.
+    Axes are taken innermost first. The first chunk writes a private result,
+    which later chunks transform in place.
+    """
+    axes = sorted(axes, key=lambda axis: abs(operand.strides[axis]))
+    out = operand
+    for start in range(0, len(axes), 3):
+        result = _try_use_nvmath(
+            out, None, tuple(sorted(axes[start:start + 3])), norm,
+            fft_type='C2C', fft_direction=fft_direction,
+            overwrite_operand=out is not operand)
+        if result is None:
+            if out is operand:
+                return None
+            # Finish natively, which also applies the norm per axis.
+            cufft = cupy.cuda.cufft  # lazy import
+            direction = (cufft.CUFFT_FORWARD if fft_direction == 'forward'
+                         else cufft.CUFFT_INVERSE)
+            return _fft._fft(out, None, tuple(axes[start:]), norm, direction)
+        out = result
+    return out
+
+
 def _try_use_nvmath(
-        operand, requested_shape, axes, norm, *, fft_type, fft_direction):
+        operand, requested_shape, axes, norm, *, fft_type, fft_direction,
+        overwrite_operand=False):
     """Execute with nvmath, or return None to use CuPy's native path.
+
+    ``overwrite_operand`` lets C2C run in place on ``operand``; only private
+    intermediates may set it.
 
     Shape changes, misaligned real inputs, multi-GPU execution, callbacks and
     explicit plans fall back silently. Anything nvmath rejects while building
@@ -272,6 +329,11 @@ def _try_use_nvmath(
         return operand if fft_type == 'C2C' else None
     if operand.size == 0:
         return None
+    if len(axes) > 3:
+        # cuFFT plans have rank at most 3, so C2C runs as batched chunks.
+        if fft_type != 'C2C':
+            return None
+        return _execute_in_chunks(operand, axes, norm, fft_direction)
 
     if fft_type == 'C2R':
         caster = _fft._compat_caster(operand, original_axes)
@@ -296,7 +358,8 @@ def _try_use_nvmath(
     execution_device_id = cupy.cuda.runtime.getDevice()
     result = _create_key_from_metadata(
         operand.shape, operand.strides, operand.dtype,
-        operand.data.device_id, axes, fft_type, execution_device_id)
+        operand.data.device_id, axes, fft_type, execution_device_id,
+        overwrite_operand)
     if result is None:
         return None
     nvmath_key, dtype, permutation, axes, options = result
@@ -317,9 +380,10 @@ def _try_use_nvmath(
     cache_miss = plan is None
 
     if permutation is not None:
-        # Materialize the layout nvmath recommended, matching the C-contiguous
-        # metadata the key was built from. This has to happen before the
-        # operand is bound to a plan on either the hit or the miss path.
+        # Materialize the copy's layout in one pass with any promotion,
+        # matching the C-contiguous metadata the key was built from. This
+        # has to happen before the operand is bound to a plan on either the
+        # hit or the miss path.
         operand = operand.transpose(permutation).astype(
             dtype, order='C', copy=True)
     elif (operand.dtype != dtype
@@ -351,13 +415,9 @@ def _try_use_nvmath(
         except Exception as e:
             if plan is not None:
                 plan.free()
-            warnings.warn(
+            _warn_fallback(
                 f'nvmath-python rejected this FFT, so it will run on CuPy '
-                f'native cuFFT plans instead: {e!r}',
-                RuntimeWarning,
-                # 1 is this frame and 2 is the public API function, so 3
-                # points at the user's call.
-                stacklevel=3)
+                f'native cuFFT plans instead: {e!r}')
             return None
     else:
         plan.reset_operand_unchecked(operand, axes=axes, stream=stream)
