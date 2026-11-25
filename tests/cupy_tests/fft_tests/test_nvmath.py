@@ -21,10 +21,12 @@ def adapter():
     return _fft_nvmath
 
 
-def _create_key(adapter, operand, axes, fft_type, execution_device_id):
+def _create_key(adapter, operand, axes, fft_type, execution_device_id,
+                overwrite=False):
     return adapter._create_key_from_metadata_uncached(
         operand.shape, operand.strides, operand.dtype,
-        operand.data.device_id, axes, fft_type, execution_device_id)
+        operand.data.device_id, axes, fft_type, execution_device_id,
+        overwrite)
 
 
 @pytest.mark.parametrize('ndim,axes,expected', [
@@ -33,14 +35,15 @@ def _create_key(adapter, operand, axes, fft_type, execution_device_id):
     (3, (-3, -2, -1), (0, 1, 2)),
     (2, [-2, -1], (0, 1)),
     (3, -1, (2,)),
+    (3, np.int64(-1), (2,)),
     (3, (2, 0), (2, 0)),
     (3, (), ()),
     (3, (0, -3), None),
     (2, (2,), None),
     (2, (-3,), None),
     (2, 2, None),
-    (4, None, None),
-    (4, (0, 1, 2, 3), None),
+    (4, None, (0, 1, 2, 3)),
+    (5, (4, 0, -2, 1), (4, 0, 3, 1)),
     (0, None, ()),
     (0, 0, None),
 ])
@@ -107,8 +110,8 @@ def test_keys_distinguish_execution_devices(adapter):
 @testing.multi_gpu(2)
 @pytest.mark.parametrize('execution_device_id', [0, 1])
 @pytest.mark.parametrize('shape,axes,expected_permutation,expected_axes', [
-    ((16, 4), (0,), None, (0,)),
-    ((8, 12, 16, 20), (0, 2), (1, 3, 0, 2), (2, 3)),
+    ((16, 4), (0,), (1, 0), (1,)),
+    ((8, 12, 16, 20), (0, 2), (3, 1, 0, 2), (2, 3)),
 ])
 def test_key_copies_operand_from_other_device(
         adapter, execution_device_id, shape, axes,
@@ -132,13 +135,11 @@ def test_key_copies_operand_from_other_device(
     # Accepted layouts are used as is.
     ((4, 16), 'C', np.complex64, (1,), 'C2C', (None, (1,), False)),
     ((16, 4), 'F', np.complex64, (0,), 'C2C', (None, (0,), False)),
-    # Promotion copies into C order, permuted only if nvmath rejects that.
+    # Promotion copies with the batch axes outermost and the FFT axes last.
     ((4, 16), 'C', np.float32, (1,), 'C2C', (None, (1,), True)),
-    ((16, 4), 'F', np.float32, (0,), 'C2C', (None, (0,), True)),
+    ((16, 4), 'F', np.float32, (0,), 'C2C', ((1, 0), (1,), True)),
+    ((4, 6, 8), 'C', np.float32, (0, 1), 'C2C', ((2, 0, 1), (1, 2), True)),
     ((8, 6, 4), 'C', np.float16, (2, 0), 'R2C', ((1, 2, 0), (1, 2), False)),
-    # Rejected layouts are copied as nvmath recommends.
-    ((8, 12, 16, 20), 'C', np.complex64, (0, 2), 'C2C',
-     ((1, 3, 0, 2), (2, 3), True)),
 ])
 def test_create_key_layouts(
         adapter, shape, order, dtype, axes, fft_type, expected):
@@ -146,6 +147,30 @@ def test_create_key_layouts(
     _, _, permutation, new_axes, options = _create_key(
         adapter, operand, axes, fft_type, cupy.cuda.Device().id)
     assert (permutation, new_axes, options.inplace) == expected
+
+
+@pytest.mark.parametrize('dtype,fft_type,inplace', [
+    (np.complex64, 'C2C', True),
+    (np.float32, 'R2C', False),
+])
+def test_rejected_layout_is_copied_as_nvmath_recommends(
+        adapter, monkeypatch, dtype, fft_type, inplace):
+    # Which layouts nvmath rejects may change, so the rejection is simulated.
+    create_key = adapter.nvmath_fft.FFT.create_key_from_metadata
+
+    def reject_strided(*args, strides=None, **kwargs):
+        if strides is not None:
+            raise adapter.nvmath_fft.UnsupportedLayoutError(
+                'unsupported layout', permutation=[1, 3, 0, 2], axes=[2, 3])
+        return create_key(*args, **kwargs)
+
+    monkeypatch.setattr(
+        adapter.nvmath_fft.FFT, 'create_key_from_metadata', reject_strided)
+    operand = cupy.empty((8, 12, 16, 20), dtype=dtype)
+    _, _, permutation, axes, options = _create_key(
+        adapter, operand, (0, 2), fft_type, cupy.cuda.Device().id)
+    assert (permutation, axes, options.inplace) == (
+        (1, 3, 0, 2), (2, 3), inplace)
 
 
 @pytest.mark.parametrize('order', ['C', 'F'])
@@ -201,6 +226,17 @@ class TestRejectedKeys:
         assert len(record) == 1
         assert create_key.call_count == 1
 
+    @pytest.mark.parametrize('name,shape', [
+        ('fft', (4, 16)),
+        ('fftn', (2, 3, 4, 5)),  # Chunked execution nests the rejection.
+    ])
+    def test_rejection_warns_at_callers_line(
+            self, rejecting_adapter, name, shape):
+        a = testing.shaped_random(shape, cupy, cupy.complex64)
+        with pytest.warns(RuntimeWarning, match='nvmath-python') as record:
+            getattr(cupy.fft, name)(a)
+        assert record[0].filename == __file__
+
     def test_error_filter_raises_on_every_call(self, rejecting_adapter):
         _, create_key = rejecting_adapter
         a = testing.shaped_random((4, 16), cupy, cupy.complex64)
@@ -245,6 +281,13 @@ _PROMOTED_FFTS = [
     ('irfftn', (6, 4, 5), cupy.float64, {'axes': (0, 2)}),
 ]
 
+# C2C transforms over more than 3 axes, which run as chunks of up to 3 axes.
+_CHUNKED_FFTS = [
+    ('fftn', (4, 6, 8, 10), cupy.complex64, {}),
+    ('ifftn', (3, 4, 5, 6, 7), cupy.complex128, {'axes': (4, 0, 2, 1)}),
+    ('fftn', (2, 3, 4, 5, 6, 7), cupy.float32, {}),
+]
+
 
 @pytest.mark.skipif(
     not is_cuda_python, reason='requires a CUDA-Python build')
@@ -284,6 +327,14 @@ class TestNvmathNormalization:
         tol = 1e-4 if out.dtype in (cupy.complex64, cupy.float32) else 1e-10
         testing.assert_allclose(out, expected, rtol=tol, atol=tol)
         testing.assert_array_equal(a, before)
+
+    def test_numpy_integer_axis(self):
+        self._check(
+            'fft', (4, 16), cupy.complex64,
+            {'axis': np.int64(-1)}, None)
+        assert all(
+            isinstance(plan, self.adapter.CachedFFT)
+            for plan in self._cached_plans())
 
     @pytest.mark.parametrize('norm', [None, 'ortho', 'forward'])
     @pytest.mark.parametrize('name,shape,dtype,kwargs', _NORMALIZED_FFTS)
@@ -366,6 +417,54 @@ class TestNvmathNormalization:
         assert plans
         assert all(isinstance(plan, self.adapter.CachedFFT) for plan in plans)
 
+    @pytest.mark.parametrize('layout', ['C', 'F'])
+    @pytest.mark.parametrize('name,shape,dtype,kwargs', _CHUNKED_FFTS)
+    def test_chunked_axes(self, name, shape, dtype, kwargs, layout):
+        a = testing.shaped_random(shape, cupy, dtype)
+        if layout == 'F':
+            a = cupy.asfortranarray(a)
+        for norm in (None, 'ortho', 'forward'):
+            self._check_operand(name, a, kwargs, norm)
+        plans = self._cached_plans()
+        assert len(plans) >= 2
+        assert all(isinstance(plan, self.adapter.CachedFFT) for plan in plans)
+
+    @pytest.mark.thread_unsafe(reason='clears a shared cache')
+    @pytest.mark.parametrize('name,shape,dtype,kwargs', _CHUNKED_FFTS)
+    def test_chunked_negative_strides(self, name, shape, dtype, kwargs):
+        # Whether nvmath accepts negative strides is up to nvmath. Either way,
+        # a rejection must warn once and run the whole transform natively.
+        a = testing.shaped_random(shape, cupy, dtype)[..., ::-1]
+        self.adapter._create_key_from_metadata.cache_clear()
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter('always')
+            for norm in (None, 'ortho', 'forward'):
+                self._check_operand(name, a, kwargs, norm)
+        self.adapter._create_key_from_metadata.cache_clear()
+        rejections = [w for w in record if 'nvmath-python' in str(w.message)]
+        assert len(rejections) <= 1
+        plans = self._cached_plans()
+        assert plans
+        uses_nvmath = [
+            isinstance(plan, self.adapter.CachedFFT) for plan in plans]
+        assert not any(uses_nvmath) if rejections else all(uses_nvmath)
+
+    def test_rejected_later_chunk_finishes_natively(self, monkeypatch):
+        try_use_nvmath = self.adapter._try_use_nvmath
+        calls = []
+
+        def reject_second_chunk(operand, *args, **kwargs):
+            calls.append((args[1], kwargs['overwrite_operand']))
+            if len(calls) == 2:
+                return None
+            return try_use_nvmath(operand, *args, **kwargs)
+
+        monkeypatch.setattr(
+            self.adapter, '_try_use_nvmath', reject_second_chunk)
+        self._check('fftn', (2, 3, 4, 5, 6), cupy.complex64, {}, 'ortho')
+        # Innermost axes first; only the private intermediate is overwritten.
+        assert calls == [((2, 3, 4), False), ((0, 1), True)]
+
     def test_promoted_layouts_share_plan(self):
         a = testing.shaped_random((8, 16), cupy, cupy.float32)
         for operand in (a, cupy.asfortranarray(a), a[:, ::-1]):
@@ -388,8 +487,10 @@ class TestNvmathNormalization:
                             lambda: True)
         monkeypatch.setattr(self.adapter, '_get_scaling_epilog',
                             Mock(side_effect=error))
-        with pytest.warns(RuntimeWarning, match='compilation failed'):
+        with pytest.warns(
+                RuntimeWarning, match='compilation failed') as record:
             self._check('ifft', (4, 16), cupy.complex64, {}, None)
+        assert record[0].filename == __file__
         plans = self._cached_plans()
         assert not any(
             isinstance(plan, self.adapter.CachedFFT) for plan in plans)
